@@ -1,0 +1,21 @@
+[project]
+name = "claudemonitor"
+version = "0.1.0"
+description = "Windows system tray app to track Claude usage"
+requires-python = ">=3.14"
+dependencies = [
+    "pystray>=0.19.5",
+    "pillow>=10.4.0",
+]
+
+[project.scripts]
+dev = "main:main"
+build = "_scripts:build"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.15.0",
+]
