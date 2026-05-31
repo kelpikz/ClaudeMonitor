@@ -8,10 +8,12 @@ dependencies = [
     "pillow>=10.4.0",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
+    "httpx>=0.28.1",
 ]
 
 [project.scripts]
-dev = "main:main"
+dev = "claudemonitor.main:main"
+poll = "claudemonitor.main:poll"
 build = "_scripts:build"
 
 [tool.uv]
@@ -22,7 +24,7 @@ py-modules = ["main", "_scripts"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["domain*", "ports*", "infrastructure*"]
+include = ["claudemonitor*"]
 
 [dependency-groups]
 dev = [
