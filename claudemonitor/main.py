@@ -57,8 +57,8 @@ def main() -> None:
                 log.exception("unhandled error in poll loop")
                 state = processor.internal_error_state(now=datetime.now(timezone.utc))
             tray.apply(icon, state)
-            manual_refresh.wait(timeout=cfg.polling.interval_seconds)
             manual_refresh.clear()
+            manual_refresh.wait(timeout=cfg.polling.interval_seconds)
 
     icon = pystray.Icon(
         "ClaudeMonitor",

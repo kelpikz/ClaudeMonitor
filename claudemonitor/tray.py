@@ -37,7 +37,7 @@ def init(manual_refresh: threading.Event, log_dir: Path) -> None:
 
 def loading_icon() -> Image.Image:
     if not _icons:
-        _build_icons()
+        raise RuntimeError("tray.init() must be called before loading_icon()")
     return _icons["grey"]
 
 

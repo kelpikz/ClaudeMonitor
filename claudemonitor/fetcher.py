@@ -58,8 +58,12 @@ def fetch() -> AnthropicUsageData:
     five_hour_raw = body.get("five_hour")
     seven_day_raw = body.get("seven_day")
 
-    five_hour = UsageWindow(**five_hour_raw) if five_hour_raw else None
-    seven_day = UsageWindow(**seven_day_raw) if seven_day_raw else None
+    try:
+        five_hour = UsageWindow(**five_hour_raw) if five_hour_raw else None
+        seven_day = UsageWindow(**seven_day_raw) if seven_day_raw else None
+    except Exception as exc:
+        log.warning("unexpected API response shape: %r — body: %r", exc, body)
+        return AnthropicUsageData(fetch_error="bad_response", fetched_at=now)
 
     log.info(
         "fetched 5h=%s%% 7d=%s%%",

@@ -42,8 +42,12 @@ def _menu_label(data: AnthropicUsageData, now: datetime) -> str:
     elapsed_str = _format_elapsed(max(0, elapsed))
     if data.fetch_error in ("timeout", "offline"):
         return f"Offline — last update {elapsed_str} ago"
+    if data.fetch_error == "token_expired":
+        return f"Token expired — last update {elapsed_str} ago"
+    if data.fetch_error == "no_credentials":
+        return f"Not logged in — last update {elapsed_str} ago"
     if data.fetch_error:
-        return f"Offline — last update {elapsed_str} ago"
+        return f"Error — last update {elapsed_str} ago"
     return f"Updated {elapsed_str} ago"
 
 
@@ -99,6 +103,8 @@ def _error_tooltip(error: str, data: AnthropicUsageData, now: datetime) -> str:
         return f"Offline — last update {_format_elapsed(max(0, elapsed))} ago"
     if error == "no_credentials":
         return "Claude credentials not found — log in via Claude Code"
+    if error == "bad_response":
+        return "Unexpected API response — see log for details"
     return "Internal error — see log"
 
 

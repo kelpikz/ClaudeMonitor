@@ -43,7 +43,10 @@ def load_config() -> Config:
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_DEFAULT_TOML, encoding="utf-8")
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        toml_text = _DEFAULT_TOML
+    else:
+        toml_text = path.read_text(encoding="utf-8")
+    raw = tomllib.loads(toml_text)
     polling = PollingConfig(**raw.get("polling", {}))
     thresholds = ThresholdsConfig(**raw.get("thresholds", {}))
     return Config(polling=polling, thresholds=thresholds)
