@@ -6,5 +6,6 @@ def build():
         "--onefile",
         "--windowed",
         "--name", "ClaudeMonitor",
-        "main.py",
+        "--collect-submodules", "claudemonitor",
+        "run.py",
     ])
