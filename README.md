@@ -16,6 +16,21 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 Logs are written to `%APPDATA%\claudemonitor\claudemonitor.log` (rotating, 1 MB × 3 files).
 
+## Testing
+
+Tests live in `tests/` and use [pytest](https://docs.pytest.org/).
+
+```
+uv run pytest
+```
+
+Run a single file or test:
+
+```
+uv run pytest tests/test_processor.py
+uv run pytest tests/test_processor.py::TestProcessColors
+```
+
 ## Running the built executable
 
 After `uv run build`, launch the app:

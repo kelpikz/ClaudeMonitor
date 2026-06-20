@@ -30,4 +30,8 @@ include = ["claudemonitor*"]
 dev = [
     "mypy>=2.1.0",
     "pyinstaller>=6.15.0",
+    "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

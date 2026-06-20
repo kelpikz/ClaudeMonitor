@@ -13,6 +13,7 @@ claudemonitor/
   models.py     — Pydantic models shared between layers: UsageWindow, AnthropicUsageData, DisplayState
   config.py     — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config
 
+tests/          — pytest suite (run via uv run pytest)
 run.py          — one-liner PyInstaller entry point (don't run directly; use uv run dev)
 _scripts.py     — build script called by uv run build
 design-v1.md    — full product + architecture spec for v1
@@ -30,6 +31,23 @@ docs/
 | `uv run dev`   | Run the tray app in the foreground with console output   |
 | `uv run poll`  | Fetch from Anthropic API once, print JSON response, exit |
 | `uv run build` | Build `dist/ClaudeMonitor.exe` via PyInstaller           |
+| `uv run pytest`| Run the test suite in `tests/`                           |
+
+## Development process
+
+### Development method
+- Follow a red green TDD (Test Driven Development) mode of architecture. 
+- You should always write / modify tests first. And verify if everything the tests are failing before starting to implment the feature
+- There are 2 types of tests which you  should write. 
+  - 1. Test for the whole feature - This test should test every possible case for the given end to end path. When I say "end to end path" I mean, the it is from one end "data received from the api" to the other end "what is shown to the user". It should first test the happy path and then edge cases like api failure or wrong format. 
+  - 2. Unit tests for each function which is created. 
+- After implementing you should make sure the the tests pass.
+- 
+
+### Code Structure
+- The code written should be modular and easy to test. Every function should do one thing and one thing only
+- Variable and funciton names should be descriptive and every function should contain a comment on what it does
+
 
 ## Debugging
 
