@@ -43,6 +43,9 @@ def fetch() -> AnthropicUsageData:
         if response.status_code == 401:
             log.warning("API returned 401 — token expired")
             return AnthropicUsageData(fetch_error="token_expired", fetched_at=now)
+        if response.status_code == 429:
+            log.warning("API returned 429 — rate limited")
+            return AnthropicUsageData(fetch_error="rate_limited", fetched_at=now)
         response.raise_for_status()
         body = response.json()
     except httpx.TimeoutException as exc:

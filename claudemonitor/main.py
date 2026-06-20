@@ -49,10 +49,17 @@ def main() -> None:
 
     def setup(icon: pystray.Icon) -> None:
         icon.visible = True
+        # Remember the most recent successful fetch so a later rate-limit (429)
+        # can keep showing real usage instead of a grey "offline" icon.
+        last_good: fetcher.AnthropicUsageData | None = None
         while True:
             try:
                 data = fetcher.fetch()
-                state = processor.process(data, now=datetime.now(timezone.utc), config=cfg)
+                if data.fetch_error is None and data.five_hour is not None:
+                    last_good = data
+                state = processor.process(
+                    data, now=datetime.now(timezone.utc), config=cfg, last_good=last_good
+                )
             except Exception:
                 log.exception("unhandled error in poll loop")
                 state = processor.internal_error_state(now=datetime.now(timezone.utc))

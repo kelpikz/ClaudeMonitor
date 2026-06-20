@@ -11,8 +11,10 @@ from claudemonitor.processor import (
     _error_tooltip,
     _format_elapsed,
     _format_time_left,
+    _icon_color,
     _menu_label,
     _updated_at_line,
+    _usage_lines,
     internal_error_state,
     process,
 )
@@ -205,6 +207,91 @@ class TestProcessErrors:
         assert process(data, NOW, Config()).icon_color == "grey"
 
 
+class TestProcessRateLimited:
+    """HTTP 429 handling (fetch_error == "rate_limited").
+
+    Unlike other errors, a rate-limit does not mean our data is wrong — just
+    that we couldn't refresh it. So instead of going grey, process() falls back
+    to the last successful result and flags it as stale. Without any prior good
+    data it degrades to the same grey treatment as other errors."""
+
+    def _last_good(self):
+        # A fully-populated successful result captured two minutes before NOW.
+        return make_data(
+            five_hour=UsageWindow(
+                utilization=30.0, resets_at=NOW + timedelta(hours=2, minutes=15)
+            ),
+            seven_day=UsageWindow(
+                utilization=10.0, resets_at=NOW + timedelta(days=3, hours=4)
+            ),
+            fetched_at=NOW - timedelta(minutes=2),
+        )
+
+    def test_shows_last_good_usage_color(self):
+        # 70% remaining -> green, computed from last_good rather than greyed out.
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        state = process(data, NOW, Config(), last_good=self._last_good())
+        assert state.icon_color == "green"
+
+    def test_tooltip_shows_last_good_usage_lines(self):
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        lines = process(data, NOW, Config(), last_good=self._last_good()).tooltip.split("\n")
+        assert lines[0] == "Claude usage"
+        assert lines[1] == "5h:   70% left · resets in 2h 15m"
+        assert lines[2] == "Week: 90% left · resets in 3d 4h"
+
+    def test_tooltip_flags_unable_to_fetch_recent_data(self):
+        # The user-facing message requested in step 1.
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        tooltip = process(data, NOW, Config(), last_good=self._last_good()).tooltip
+        assert "Unable to fetch recent data" in tooltip
+
+    def test_stale_note_uses_last_good_fetch_time(self):
+        # The timestamp must reflect the last *successful* fetch, not the failed
+        # 429 attempt. Kept compact so the whole tooltip fits Windows' 128-char
+        # tray-tooltip limit.
+        last_good = self._last_good()
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        last_line = process(data, NOW, Config(), last_good=last_good).tooltip.split("\n")[-1]
+        expected_time = last_good.fetched_at.astimezone().strftime("%H:%M:%S")
+        assert last_line == f"Unable to fetch recent data ({expected_time})"
+
+    def test_stale_tooltip_fits_windows_tooltip_limit(self):
+        # Worst case: 3-digit percentages and wide reset strings. Must stay
+        # within the 128-char NOTIFYICONDATAW.szTip buffer.
+        last_good = make_data(
+            five_hour=UsageWindow(utilization=100.0, resets_at=NOW + timedelta(hours=2, minutes=15)),
+            seven_day=UsageWindow(utilization=100.0, resets_at=NOW + timedelta(days=6, hours=23)),
+            fetched_at=NOW - timedelta(minutes=2),
+        )
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        tooltip = process(data, NOW, Config(), last_good=last_good).tooltip
+        assert len(tooltip) <= 128
+
+    def test_menu_label_reports_rate_limited_since_last_good(self):
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        state = process(data, NOW, Config(), last_good=self._last_good())
+        assert state.menu_status_label == "Rate limited — last update 2m ago"
+
+    def test_without_last_good_falls_back_to_grey(self):
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW - timedelta(seconds=5))
+        state = process(data, NOW, Config(), last_good=None)
+        assert state.icon_color == "grey"
+
+    def test_without_last_good_uses_rate_limited_messaging(self):
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW - timedelta(seconds=5))
+        state = process(data, NOW, Config(), last_good=None)
+        assert state.menu_status_label == "Rate limited — last update 5s ago"
+        assert state.tooltip.split("\n")[0] == "Rate limited — too many requests, will retry"
+
+    def test_last_good_without_usage_window_falls_back_to_grey(self):
+        # A "successful" fetch that returned no five_hour window isn't useful
+        # enough to display, so we treat it as if we had nothing.
+        last_good = make_data(five_hour=None, fetched_at=NOW - timedelta(minutes=1))
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW)
+        assert process(data, NOW, Config(), last_good=last_good).icon_color == "grey"
+
+
 # ===========================================================================
 # internal_error_state — the hard-coded fallback used when process() itself
 # (or its caller) blows up. No inputs beyond `now`, so just two assertions.
@@ -229,6 +316,77 @@ class TestInternalErrorState:
 # arithmetic-heavy edge cases (unit boundaries, clamping, None handling) that
 # would be tedious and noisy to enumerate through process().
 # ===========================================================================
+
+
+class TestIconColor:
+    """_icon_color: maps a 5h utilization (used %) to a color via the configured
+    thresholds on the *remaining* percentage. The comparisons are asymmetric:
+        remaining >  amber_below -> green
+        remaining >= red_below   -> amber
+        otherwise                -> red
+    so the boundary values are the interesting cases."""
+
+    @pytest.mark.parametrize(
+        "utilization,expected",
+        [
+            (0.0, "green"),    # 100% remaining
+            (49.0, "green"),   # 51% remaining, strictly > 50
+            (50.0, "amber"),   # exactly 50% remaining: NOT > 50 -> amber
+            (50.1, "amber"),   # 49.9% remaining
+            (80.0, "amber"),   # exactly 20% remaining == red_below -> amber
+            (80.1, "red"),     # 19.9% remaining -> red
+            (100.0, "red"),    # 0% remaining
+        ],
+    )
+    def test_color_by_remaining(self, utilization, expected):
+        assert _icon_color(utilization, Config()) == expected
+
+    def test_reads_custom_thresholds(self):
+        # amber_below=80/red_below=40: 30% remaining falls below 40 -> red,
+        # proving the helper uses config rather than hardcoding 50/20.
+        config = Config(thresholds=ThresholdsConfig(amber_below=80, red_below=40))
+        assert _icon_color(70.0, config) == "red"
+
+
+class TestUsageLines:
+    """_usage_lines: builds the 'Claude usage' header plus the 5h (and optional
+    weekly) "% left · resets in ..." lines, without the trailing status line."""
+
+    def test_five_hour_only_has_header_and_one_window(self):
+        data = make_data(
+            five_hour=UsageWindow(utilization=30.0, resets_at=NOW + timedelta(hours=2, minutes=15))
+        )
+        assert _usage_lines(data, NOW) == [
+            "Claude usage",
+            "5h:   70% left · resets in 2h 15m",
+        ]
+
+    def test_includes_week_line_when_seven_day_present(self):
+        data = make_data(
+            five_hour=UsageWindow(utilization=30.0, resets_at=NOW + timedelta(hours=2, minutes=15)),
+            seven_day=UsageWindow(utilization=10.0, resets_at=NOW + timedelta(days=3, hours=4)),
+        )
+        assert _usage_lines(data, NOW)[2] == "Week: 90% left · resets in 3d 4h"
+
+    def test_omits_week_line_when_no_seven_day(self):
+        data = make_data(
+            five_hour=UsageWindow(utilization=30.0, resets_at=NOW + timedelta(hours=2))
+        )
+        assert not any(line.startswith("Week:") for line in _usage_lines(data, NOW))
+
+    def test_does_not_append_updated_line(self):
+        # The caller owns the trailing status line; this helper must not add one.
+        data = make_data(
+            five_hour=UsageWindow(utilization=30.0, resets_at=NOW + timedelta(hours=2))
+        )
+        assert not any(line.startswith("Updated at") for line in _usage_lines(data, NOW))
+
+    def test_percentage_is_rounded_to_whole_number(self):
+        # 100 - 33.6 = 66.4 -> "66%".
+        data = make_data(
+            five_hour=UsageWindow(utilization=33.6, resets_at=NOW + timedelta(hours=1))
+        )
+        assert _usage_lines(data, NOW)[1] == "5h:   66% left · resets in 1h 0m"
 
 
 class TestFormatTimeLeft:
@@ -337,6 +495,10 @@ class TestMenuLabel:
         data = make_data(fetch_error="no_credentials", fetched_at=NOW - timedelta(hours=1))
         assert _menu_label(data, NOW) == "Not logged in — last update 1h ago"
 
+    def test_rate_limited(self):
+        data = make_data(fetch_error="rate_limited", fetched_at=NOW - timedelta(seconds=30))
+        assert _menu_label(data, NOW) == "Rate limited — last update 30s ago"
+
     def test_unrecognized_error_uses_generic_wording(self):
         # Any error string we don't special-case falls back to "Error".
         data = make_data(fetch_error="bad_response", fetched_at=NOW - timedelta(seconds=5))
@@ -363,6 +525,10 @@ class TestErrorTooltip:
     def test_bad_response(self):
         data = make_data(fetch_error="bad_response")
         assert _error_tooltip("bad_response", data, NOW) == "Unexpected API response — see log for details"
+
+    def test_rate_limited(self):
+        data = make_data(fetch_error="rate_limited")
+        assert _error_tooltip("rate_limited", data, NOW) == "Rate limited — too many requests, will retry"
 
     def test_unknown_error_falls_back_to_internal(self):
         # Defense in depth: an unmapped code still yields a sane message.

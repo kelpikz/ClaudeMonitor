@@ -23,6 +23,12 @@ _COLORS: dict[str, tuple[int, int, int]] = {
 
 _CONSOLE_URL = "https://console.anthropic.com/settings/usage"
 
+# Windows' NOTIFYICONDATAW.szTip is a 128-WCHAR buffer; pystray raises
+# ValueError above that, which would kill the poll thread. Cap below it (leaving
+# room for the ellipsis marker) so an over-long tooltip degrades instead of
+# crashing.
+_MAX_TOOLTIP_LEN = 127
+
 _icons: dict[str, Image.Image] = {}
 _manual_refresh: threading.Event | None = None
 _log_dir: Path | None = None
@@ -50,9 +56,17 @@ def _build_icons() -> None:
         _icons[name] = img
 
 
+def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
+    """Clip a tooltip to the Windows tray limit, appending an ellipsis when cut,
+    so pystray never raises 'string too long' and kills the poll thread."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def apply(icon: pystray.Icon, state: DisplayState) -> None:
     icon.icon = _icons[state.icon_color]
-    icon.title = state.tooltip
+    icon.title = _truncate_tooltip(state.tooltip)
     icon.menu = _build_menu(state.menu_status_label)
 
 
