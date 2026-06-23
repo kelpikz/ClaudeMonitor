@@ -40,3 +40,10 @@ dist\ClaudeMonitor.exe
 ```
 
 The icon appears in the system tray (Windows taskbar notification area).
+
+## Contributors
+
+| Avatar | Name | Role |
+| ------ | ---- | ---- |
+| <img src="https://avatars.githubusercontent.com/u/59395177?v=4" width="40" height="40" alt="kelpikz"> | [kelpikz](https://github.com/kelpikz) | Creator & maintainer |
+| 🤖 | Claude (Sonnet 4.6, Opus 4.8) | AI pair programmer |
