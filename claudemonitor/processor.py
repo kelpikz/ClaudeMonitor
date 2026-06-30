@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .config import Config
-from .models import AnthropicUsageData, DisplayState
+from .models import AnthropicUsageData, DisplayState, UsageWindow
 
 
 def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
@@ -64,14 +64,27 @@ def _icon_color(utilization: float, config: Config) -> str:
     return "red"
 
 
+def _five_hour_not_started(window: UsageWindow) -> bool:
+    """The 5h rolling window only begins counting once the user sends their
+    first message. Until then the API reports 0% utilization with no reset
+    timestamp — distinct from an active window that simply has usage to spare."""
+    return window.utilization == 0.0 and window.resets_at is None
+
+
 def _usage_lines(data: AnthropicUsageData, now: datetime) -> list[str]:
     """Build the 'Claude usage' header plus the 5h (and optional weekly) "% left
     · resets in ..." lines. The caller appends a trailing status line."""
-    five_remaining = 100.0 - data.five_hour.utilization
-    five_reset = _format_time_left(data.five_hour.resets_at, now)
+    if _five_hour_not_started(data.five_hour):
+        # No countdown to show yet — explain that it begins on the first message
+        # rather than surfacing a misleading "100% left · resets in unknown".
+        five_hour_line = "5h:   not started — send a message to begin"
+    else:
+        five_remaining = 100.0 - data.five_hour.utilization
+        five_reset = _format_time_left(data.five_hour.resets_at, now)
+        five_hour_line = f"5h:   {five_remaining:.0f}% left · resets in {five_reset}"
     lines = [
         "Claude usage",
-        f"5h:   {five_remaining:.0f}% left · resets in {five_reset}",
+        five_hour_line,
     ]
     if data.seven_day is not None:
         week_remaining = 100.0 - data.seven_day.utilization
@@ -86,9 +99,8 @@ def _stale_state(last_good: AnthropicUsageData, now: datetime, config: Config) -
     absolute timestamps); only the freshness note reflects the older fetch."""
     color = _icon_color(last_good.five_hour.utilization, config)
     lines = _usage_lines(last_good, now)
-    last_updated = last_good.fetched_at.astimezone().strftime("%H:%M:%S")
-    lines.append(f"Unable to fetch recent data ({last_updated})")
     elapsed = _format_elapsed(max(0, int((now - last_good.fetched_at).total_seconds())))
+    lines.append(f"Unable to fetch recent data ({elapsed} ago)")
     return DisplayState(
         icon_color=color,
         tooltip="\n".join(lines),

@@ -9,6 +9,7 @@ from claudemonitor.config import Config, ThresholdsConfig
 from claudemonitor.models import AnthropicUsageData, UsageWindow
 from claudemonitor.processor import (
     _error_tooltip,
+    _five_hour_not_started,
     _format_elapsed,
     _format_time_left,
     _icon_color,
@@ -18,6 +19,11 @@ from claudemonitor.processor import (
     internal_error_state,
     process,
 )
+
+# The 5h rolling window only begins once the user sends their first message;
+# until then the API reports utilization 0.0 with resets_at=None. This is the
+# exact line we surface in place of a bogus "100% left · resets in unknown".
+NOT_STARTED_LINE = "5h:   not started — send a message to begin"
 
 # A fixed, timezone-aware "current time" shared by every test. Using a constant
 # (rather than datetime.now()) keeps all elapsed/remaining calculations
@@ -161,6 +167,53 @@ class TestProcessTooltipDetails:
         assert "resets in unknown" in process(data, NOW, Config()).tooltip
 
 
+class TestProcessFiveHourNotStarted:
+    """The 5h window has not started yet. Before the user's first message the
+    API returns the five_hour window with utilization 0.0 and resets_at=None.
+    Treating that literally produced a misleading "100% left · resets in
+    unknown"; instead we tell the user the countdown hasn't started.
+
+    Mirrors the real API payload: a not-started 5h window alongside a live
+    weekly window."""
+
+    def _data(self, fetched_at=NOW):
+        return make_data(
+            five_hour=UsageWindow(utilization=0.0, resets_at=None),
+            seven_day=UsageWindow(
+                utilization=5.0, resets_at=NOW + timedelta(days=4, hours=3)
+            ),
+            fetched_at=fetched_at,
+        )
+
+    def test_five_hour_line_explains_countdown_not_started(self):
+        lines = process(self._data(), NOW, Config()).tooltip.split("\n")
+        assert lines[0] == "Claude usage"
+        assert lines[1] == NOT_STARTED_LINE
+
+    def test_does_not_show_bogus_full_window(self):
+        # The old behavior leaked through as "100% left" / "resets in unknown".
+        tooltip = process(self._data(), NOW, Config()).tooltip
+        assert "100% left" not in tooltip
+        assert "resets in unknown" not in tooltip
+
+    def test_weekly_window_still_shown_normally(self):
+        # Only the 5h line changes; the live weekly window renders as usual.
+        lines = process(self._data(), NOW, Config()).tooltip.split("\n")
+        assert lines[2] == "Week: 95% left · resets in 4d 3h"
+
+    def test_icon_is_green_because_full_usage_is_available(self):
+        # Nothing has been spent yet, so the user has their whole 5h budget.
+        assert process(self._data(), NOW, Config()).icon_color == "green"
+
+    def test_tooltip_still_ends_with_updated_line(self):
+        data = self._data(fetched_at=NOW - timedelta(seconds=15))
+        last = process(data, NOW, Config()).tooltip.split("\n")[-1]
+        assert last.startswith("Updated at ")
+
+    def test_tooltip_fits_windows_tooltip_limit(self):
+        assert len(process(self._data(), NOW, Config()).tooltip) <= 128
+
+
 class TestProcessNoData:
     """No fetch error, but the API returned no 5h window — a distinct grey
     state separate from the error states."""
@@ -246,15 +299,15 @@ class TestProcessRateLimited:
         tooltip = process(data, NOW, Config(), last_good=self._last_good()).tooltip
         assert "Unable to fetch recent data" in tooltip
 
-    def test_stale_note_uses_last_good_fetch_time(self):
-        # The timestamp must reflect the last *successful* fetch, not the failed
+    def test_stale_note_uses_elapsed_since_last_good_fetch(self):
+        # The note shows how long ago the last *successful* fetch was (relative,
+        # not an absolute clock time), measured from that fetch — not the failed
         # 429 attempt. Kept compact so the whole tooltip fits Windows' 128-char
         # tray-tooltip limit.
-        last_good = self._last_good()
+        last_good = self._last_good()  # fetched 2 minutes before NOW
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
         last_line = process(data, NOW, Config(), last_good=last_good).tooltip.split("\n")[-1]
-        expected_time = last_good.fetched_at.astimezone().strftime("%H:%M:%S")
-        assert last_line == f"Unable to fetch recent data ({expected_time})"
+        assert last_line == "Unable to fetch recent data (2m ago)"
 
     def test_stale_tooltip_fits_windows_tooltip_limit(self):
         # Worst case: 3-digit percentages and wide reset strings. Must stay
@@ -387,6 +440,37 @@ class TestUsageLines:
             five_hour=UsageWindow(utilization=33.6, resets_at=NOW + timedelta(hours=1))
         )
         assert _usage_lines(data, NOW)[1] == "5h:   66% left · resets in 1h 0m"
+
+    def test_not_started_window_uses_explanatory_five_hour_line(self):
+        data = make_data(five_hour=UsageWindow(utilization=0.0, resets_at=None))
+        assert _usage_lines(data, NOW)[1] == NOT_STARTED_LINE
+
+    def test_not_started_does_not_affect_week_line(self):
+        data = make_data(
+            five_hour=UsageWindow(utilization=0.0, resets_at=None),
+            seven_day=UsageWindow(utilization=10.0, resets_at=NOW + timedelta(days=3, hours=4)),
+        )
+        lines = _usage_lines(data, NOW)
+        assert lines[1] == NOT_STARTED_LINE
+        assert lines[2] == "Week: 90% left · resets in 3d 4h"
+
+
+class TestFiveHourNotStarted:
+    """_five_hour_not_started: the predicate that recognizes a 5h window the
+    user has not begun yet (utilization 0.0 and no reset timestamp)."""
+
+    def test_true_when_zero_utilization_and_no_reset(self):
+        assert _five_hour_not_started(UsageWindow(utilization=0.0, resets_at=None)) is True
+
+    def test_false_when_window_is_active(self):
+        window = UsageWindow(utilization=0.0, resets_at=NOW + timedelta(hours=5))
+        assert _five_hour_not_started(window) is False
+
+    def test_false_when_usage_has_accrued_even_without_reset(self):
+        # A window with real usage but a missing reset time is a different
+        # (degenerate) case — it should still report its percentage, not be
+        # mistaken for a not-yet-started window.
+        assert _five_hour_not_started(UsageWindow(utilization=10.0, resets_at=None)) is False
 
 
 class TestFormatTimeLeft:
