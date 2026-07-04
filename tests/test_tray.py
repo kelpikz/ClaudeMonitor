@@ -15,6 +15,10 @@ class _FakeIcon:
         self.icon = None
         self.title = None
         self.menu = None
+        self.notifications = []
+
+    def notify(self, message, title=None):
+        self.notifications.append((title, message))
 
 
 class TestTruncateTooltip:
@@ -56,3 +60,15 @@ class TestApplyNeverExceedsTooltipLimit:
         )
         tray.apply(icon, state)
         assert len(icon.title) <= _MAX_TOOLTIP_LEN
+
+
+class TestNotify:
+    """Desktop notifications are passed through to the pystray icon."""
+
+    def test_notify_uses_title_and_message(self):
+        icon = _FakeIcon()
+        tray.notify(icon, title="Claude usage below 50%", message="5h usage has 49% remaining.")
+
+        assert icon.notifications == [
+            ("Claude usage below 50%", "5h usage has 49% remaining.")
+        ]

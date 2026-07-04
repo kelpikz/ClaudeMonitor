@@ -70,6 +70,11 @@ def apply(icon: pystray.Icon, state: DisplayState) -> None:
     icon.menu = _build_menu(state.menu_status_label)
 
 
+def notify(icon: pystray.Icon, title: str, message: str) -> None:
+    """Show a desktop notification through the active tray icon."""
+    icon.notify(message, title=title)
+
+
 def _build_menu(status_label: str) -> pystray.Menu:
     return pystray.Menu(
         pystray.MenuItem(status_label, None, enabled=False),

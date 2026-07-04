@@ -13,6 +13,7 @@ import pystray
 
 from . import fetcher, processor, tray
 from .config import load_config
+from .notifications import ThresholdNotifier
 
 _ERROR_ALREADY_EXISTS = 183
 
@@ -52,9 +53,12 @@ def main() -> None:
         # Remember the most recent successful fetch so a later rate-limit (429)
         # can keep showing real usage instead of a grey "offline" icon.
         last_good: fetcher.AnthropicUsageData | None = None
+        threshold_notifier = ThresholdNotifier()
         while True:
+            notifications = []
             try:
                 data = fetcher.fetch()
+                notifications = threshold_notifier.check(data)
                 if data.fetch_error is None and data.five_hour is not None:
                     last_good = data
                 state = processor.process(
@@ -64,6 +68,8 @@ def main() -> None:
                 log.exception("unhandled error in poll loop")
                 state = processor.internal_error_state(now=datetime.now(timezone.utc))
             tray.apply(icon, state)
+            for notification in notifications:
+                tray.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
             manual_refresh.wait(timeout=cfg.polling.interval_seconds)
 
