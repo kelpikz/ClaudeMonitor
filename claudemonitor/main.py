@@ -17,6 +17,37 @@ from .notifications import ThresholdNotifier
 
 _ERROR_ALREADY_EXISTS = 183
 
+_POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
+_POLL_INTERVAL_BACKOFF_FACTOR = 2
+_POLL_INTERVAL_CAP_SECONDS = 600
+
+
+def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
+    """Return whether a fetch completed successfully enough to update freshness."""
+    return data.fetch_error is None and data.status_code == 200
+
+
+def _next_poll_interval_seconds(
+    current_interval_seconds: int,
+    data: fetcher.AnthropicUsageData,
+    *,
+    baseline_seconds: int,
+) -> int:
+    """Honor a server Retry-After on rate-limit, else double the interval (capped); recover toward the configured baseline after a success."""
+    if data.status_code == 429 or data.fetch_error == "rate_limited":
+        if data.retry_after_seconds is not None:
+            return max(baseline_seconds, data.retry_after_seconds)
+        return min(
+            _POLL_INTERVAL_CAP_SECONDS,
+            current_interval_seconds * _POLL_INTERVAL_BACKOFF_FACTOR,
+        )
+    if _is_successful_fetch(data):
+        return max(
+            baseline_seconds,
+            current_interval_seconds - _POLL_INTERVAL_RECOVERY_STEP_SECONDS,
+        )
+    return current_interval_seconds
+
 
 def _acquire_single_instance(name: str = "ClaudeMonitor.SingleInstance") -> bool:
     kernel32 = ctypes.windll.kernel32
@@ -53,6 +84,7 @@ def main() -> None:
         # Remember the most recent successful fetch so a later rate-limit (429)
         # can keep showing real usage instead of a grey "offline" icon.
         last_good: fetcher.AnthropicUsageData | None = None
+        current_poll_interval_seconds = cfg.polling.interval_seconds
         threshold_notifier = ThresholdNotifier()
         while True:
             notifications = []
@@ -61,6 +93,11 @@ def main() -> None:
                 notifications = threshold_notifier.check(data)
                 if data.fetch_error is None and data.five_hour is not None:
                     last_good = data
+                current_poll_interval_seconds = _next_poll_interval_seconds(
+                    current_poll_interval_seconds,
+                    data,
+                    baseline_seconds=cfg.polling.interval_seconds,
+                )
                 state = processor.process(
                     data, now=datetime.now(timezone.utc), config=cfg, last_good=last_good
                 )
@@ -71,7 +108,7 @@ def main() -> None:
             for notification in notifications:
                 tray.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
-            manual_refresh.wait(timeout=cfg.polling.interval_seconds)
+            manual_refresh.wait(timeout=current_poll_interval_seconds)
 
     icon = pystray.Icon(
         "ClaudeMonitor",

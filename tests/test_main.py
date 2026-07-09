@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from claudemonitor import main
+from claudemonitor.models import AnthropicUsageData
+
+NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+
+
+def test_poll_interval_doubles_after_rate_limit():
+    data = AnthropicUsageData(
+        fetch_error="rate_limited",
+        fetched_at=NOW,
+        status_code=429,
+    )
+
+    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
+
+
+def test_poll_interval_backoff_is_capped():
+    data = AnthropicUsageData(
+        fetch_error="rate_limited",
+        fetched_at=NOW,
+        status_code=429,
+    )
+
+    assert main._next_poll_interval_seconds(400, data, baseline_seconds=60) == 600
+    assert main._next_poll_interval_seconds(600, data, baseline_seconds=60) == 600
+
+
+def test_poll_interval_honors_retry_after_on_rate_limit():
+    data = AnthropicUsageData(
+        fetch_error="rate_limited",
+        fetched_at=NOW,
+        status_code=429,
+        retry_after_seconds=224,
+    )
+
+    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 224
+
+
+def test_poll_interval_retry_after_is_floored_at_baseline():
+    data = AnthropicUsageData(
+        fetch_error="rate_limited",
+        fetched_at=NOW,
+        status_code=429,
+        retry_after_seconds=30,
+    )
+
+    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
+
+
+def test_poll_interval_falls_back_to_backoff_without_retry_after():
+    data = AnthropicUsageData(
+        fetch_error="rate_limited",
+        fetched_at=NOW,
+        status_code=429,
+        retry_after_seconds=None,
+    )
+
+    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
+
+
+def test_poll_interval_decreases_by_five_seconds_after_success():
+    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
+
+    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 85
+
+
+def test_poll_interval_never_drops_below_baseline_after_success():
+    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
+
+    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
+
+
+def test_poll_interval_clamps_to_baseline_when_less_than_step_above_it():
+    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
+
+    assert main._next_poll_interval_seconds(63, data, baseline_seconds=60) == 60
+
+
+def test_poll_interval_stays_same_after_non_rate_limit_error():
+    data = AnthropicUsageData(
+        fetch_error="token_expired",
+        fetched_at=NOW,
+        status_code=401,
+    )
+
+    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
+
+
+def test_poll_interval_stays_same_after_offline_error_without_status():
+    data = AnthropicUsageData(fetch_error="offline", fetched_at=NOW)
+
+    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90

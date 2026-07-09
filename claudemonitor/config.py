@@ -11,7 +11,7 @@ _DEFAULT_TOML = """\
 
 [polling]
 # How often to check Anthropic for usage updates, in seconds.
-interval_seconds = 30
+interval_seconds = 60
 
 [thresholds]
 # 5h-window % remaining at which the icon turns amber and red.
@@ -21,7 +21,7 @@ red_below   = 20
 
 
 class PollingConfig(BaseModel):
-    interval_seconds: int = 30
+    interval_seconds: int = 60
 
 
 class ThresholdsConfig(BaseModel):
