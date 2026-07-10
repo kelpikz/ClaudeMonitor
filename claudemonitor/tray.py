@@ -31,12 +31,19 @@ _MAX_TOOLTIP_LEN = 127
 
 _icons: dict[str, Image.Image] = {}
 _manual_refresh: threading.Event | None = None
+_shutdown_requested: threading.Event | None = None
 _log_dir: Path | None = None
 
 
-def init(manual_refresh: threading.Event, log_dir: Path) -> None:
-    global _manual_refresh, _log_dir
+def init(
+    manual_refresh: threading.Event,
+    log_dir: Path,
+    shutdown_requested: threading.Event | None = None,
+) -> None:
+    """Prepare tray dependencies, including the event that ends the poll loop."""
+    global _manual_refresh, _shutdown_requested, _log_dir
     _manual_refresh = manual_refresh
+    _shutdown_requested = shutdown_requested
     _log_dir = log_dir
     _build_icons()
 
@@ -102,4 +109,9 @@ def _on_open_log_folder(icon: pystray.Icon, item: pystray.MenuItem) -> None:
 
 
 def _on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    """End the poll loop before asking pystray to join its setup thread."""
+    if _shutdown_requested is not None:
+        _shutdown_requested.set()
+    if _manual_refresh is not None:
+        _manual_refresh.set()
     icon.stop()

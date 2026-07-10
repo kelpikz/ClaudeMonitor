@@ -23,6 +23,8 @@ _POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
 _POLL_INTERVAL_BACKOFF_FACTOR = 2
 _POLL_INTERVAL_CAP_SECONDS = 600
 _DISPLAY_REFRESH_INTERVAL_SECONDS = 1
+_CTRL_C_EVENT = 0
+_CTRL_BREAK_EVENT = 1
 
 
 def _wait_with_display_refresh(
@@ -31,16 +33,69 @@ def _wait_with_display_refresh(
     interval_seconds: int,
     refresh_display: Callable[[], None],
     clock: Callable[[], float] = time.monotonic,
+    shutdown_requested: threading.Event | None = None,
 ) -> bool:
     """Wait for the next fetch while refreshing relative display text each second."""
     deadline = clock() + interval_seconds
     while True:
+        if shutdown_requested is not None and shutdown_requested.is_set():
+            return False
         remaining = deadline - clock()
         if remaining <= 0:
             return False
         if manual_refresh.wait(timeout=min(_DISPLAY_REFRESH_INTERVAL_SECONDS, remaining)):
             return True
         refresh_display()
+
+
+def _handle_console_control_event(
+    control_type: int,
+    shutdown_requested: threading.Event,
+    manual_refresh: threading.Event,
+    icon: pystray.Icon,
+) -> bool:
+    """Convert Ctrl+C/Ctrl+Break into the same orderly shutdown as tray Quit."""
+    if control_type not in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT):
+        return False
+    shutdown_requested.set()
+    manual_refresh.set()
+    icon.stop()
+    return True
+
+
+def _install_console_shutdown_handler(
+    shutdown_requested: threading.Event,
+    manual_refresh: threading.Event,
+    icon: pystray.Icon,
+) -> ctypes._CFuncPtr:
+    """Install a Windows console handler that consumes Ctrl+C for clean shutdown."""
+    from ctypes import wintypes
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(control_type: int) -> bool:
+        return _handle_console_control_event(
+            control_type,
+            shutdown_requested,
+            manual_refresh,
+            icon,
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = (ctypes.c_void_p, wintypes.BOOL)
+    kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    if not kernel32.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), True):
+        logging.getLogger(__name__).warning("unable to register console shutdown handler")
+    return handler
+
+
+def _remove_console_shutdown_handler(handler: ctypes._CFuncPtr) -> None:
+    """Unregister the console handler once the pystray message loop has ended."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = (ctypes.c_void_p, wintypes.BOOL)
+    kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    kernel32.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), False)
 
 
 def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
@@ -98,7 +153,8 @@ def main() -> None:
 
     cfg = load_config()
     manual_refresh = threading.Event()
-    tray.init(manual_refresh, log_dir)
+    shutdown_requested = threading.Event()
+    tray.init(manual_refresh, log_dir, shutdown_requested)
 
     def setup(icon: pystray.Icon) -> None:
         icon.visible = True
@@ -107,7 +163,7 @@ def main() -> None:
         last_good: fetcher.AnthropicUsageData | None = None
         current_poll_interval_seconds = cfg.polling.interval_seconds
         threshold_notifier = ThresholdNotifier()
-        while True:
+        while not shutdown_requested.is_set():
             notifications = []
             try:
                 data = fetcher.fetch()
@@ -135,10 +191,13 @@ def main() -> None:
             for notification in notifications:
                 tray.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
+            if shutdown_requested.is_set():
+                break
             _wait_with_display_refresh(
                 manual_refresh,
                 interval_seconds=current_poll_interval_seconds,
                 refresh_display=lambda: tray.apply(icon, build_state()),
+                shutdown_requested=shutdown_requested,
             )
 
     icon = pystray.Icon(
@@ -147,7 +206,17 @@ def main() -> None:
         title="Claude Monitor — loading…",
         menu=pystray.Menu(),
     )
-    icon.run(setup=setup)
+    console_handler = _install_console_shutdown_handler(
+        shutdown_requested,
+        manual_refresh,
+        icon,
+    )
+    try:
+        icon.run(setup=setup)
+    finally:
+        shutdown_requested.set()
+        manual_refresh.set()
+        _remove_console_shutdown_handler(console_handler)
 
 
 def poll() -> None:

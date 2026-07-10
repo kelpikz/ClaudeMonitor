@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 
 from claudemonitor import main
@@ -16,6 +17,16 @@ class _FakeEvent:
     def wait(self, timeout: float) -> bool:
         self.timeouts.append(timeout)
         return next(self._results)
+
+
+class _FakeIcon:
+    """Records whether a console shutdown tells pystray to stop."""
+
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():
@@ -49,6 +60,40 @@ def test_wait_stops_immediately_for_manual_refresh():
 
     assert refreshed_manually is True
     assert refreshes == []
+
+
+def test_wait_returns_without_refresh_when_shutdown_is_already_requested():
+    shutdown_requested = threading.Event()
+    shutdown_requested.set()
+    refreshes: list[None] = []
+
+    refreshed_manually = main._wait_with_display_refresh(
+        threading.Event(),
+        interval_seconds=60,
+        refresh_display=lambda: refreshes.append(None),
+        shutdown_requested=shutdown_requested,
+    )
+
+    assert refreshed_manually is False
+    assert refreshes == []
+
+
+def test_ctrl_c_requests_shutdown_wakes_poll_and_stops_tray_icon():
+    shutdown_requested = threading.Event()
+    manual_refresh = threading.Event()
+    icon = _FakeIcon()
+
+    handled = main._handle_console_control_event(
+        main._CTRL_C_EVENT,
+        shutdown_requested,
+        manual_refresh,
+        icon,
+    )
+
+    assert handled is True
+    assert shutdown_requested.is_set()
+    assert manual_refresh.is_set()
+    assert icon.stop_calls == 1
 
 
 def test_poll_interval_doubles_after_rate_limit():
