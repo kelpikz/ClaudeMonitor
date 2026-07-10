@@ -22,9 +22,10 @@ def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
     return f"{seconds}s"
 
 
-def _updated_at_line(fetched_at: datetime) -> str:
-    local_time = fetched_at.astimezone().strftime("%H:%M:%S")
-    return f"Updated at {local_time}"
+def _updated_at_line(fetched_at: datetime, now: datetime) -> str:
+    """Return the time elapsed since the most recent fetch in whole seconds."""
+    elapsed = max(0, int((now - fetched_at).total_seconds()))
+    return f"Updated ({elapsed} seconds ago)"
 
 
 def _format_elapsed(seconds: int) -> str:
@@ -64,20 +65,23 @@ def _icon_color(utilization: float, config: Config) -> str:
     return "red"
 
 
-def _five_hour_not_started(window: UsageWindow) -> bool:
-    """The 5h rolling window only begins counting once the user sends their
-    first message. Until then the API reports 0% utilization with no reset
-    timestamp — distinct from an active window that simply has usage to spare."""
+def _window_not_started(window: UsageWindow) -> bool:
+    """Return whether an API usage window has not started its first session."""
     return window.utilization == 0.0 and window.resets_at is None
 
 
 def _usage_lines(data: AnthropicUsageData, now: datetime) -> list[str]:
     """Build the 'Claude usage' header plus the 5h (and optional weekly) "% left
     · resets in ..." lines. The caller appends a trailing status line."""
-    if _five_hour_not_started(data.five_hour):
+    if data.seven_day is not None and _window_not_started(data.seven_day):
+        # A weekly session cannot be unstarted while the 5h session is active,
+        # so showing both prompts would be redundant.
+        return ["Claude usage", "Week: send a message to start the session"]
+
+    if _window_not_started(data.five_hour):
         # No countdown to show yet — explain that it begins on the first message
         # rather than surfacing a misleading "100% left · resets in unknown".
-        five_hour_line = "5h:   not started — send a message to begin"
+        five_hour_line = "5h: send a message to start the session"
     else:
         five_remaining = 100.0 - data.five_hour.utilization
         five_reset = _format_time_left(data.five_hour.resets_at, now)
@@ -87,9 +91,12 @@ def _usage_lines(data: AnthropicUsageData, now: datetime) -> list[str]:
         five_hour_line,
     ]
     if data.seven_day is not None:
-        week_remaining = 100.0 - data.seven_day.utilization
-        week_reset = _format_time_left(data.seven_day.resets_at, now)
-        lines.append(f"Week: {week_remaining:.0f}% left · resets in {week_reset}")
+        if _window_not_started(data.seven_day):
+            lines.append("Week: send a message to start the session")
+        else:
+            week_remaining = 100.0 - data.seven_day.utilization
+            week_reset = _format_time_left(data.seven_day.resets_at, now)
+            lines.append(f"Week: {week_remaining:.0f}% left · resets in {week_reset}")
     return lines
 
 
@@ -127,18 +134,18 @@ def process(
 
     if data.fetch_error:
         tooltip = _error_tooltip(data.fetch_error, data, now)
-        tooltip += f"\n{_updated_at_line(data.fetched_at)}"
+        tooltip += f"\n{_updated_at_line(data.fetched_at, now)}"
         return DisplayState(icon_color="grey", tooltip=tooltip, menu_status_label=label)
 
     if data.five_hour is None:
         return DisplayState(
             icon_color="grey",
-            tooltip=f"Claude usage\nNo usage data available\n{_updated_at_line(data.fetched_at)}",
+            tooltip=f"Claude usage\nNo usage data available\n{_updated_at_line(data.fetched_at, now)}",
             menu_status_label=label,
         )
 
     lines = _usage_lines(data, now)
-    lines.append(_updated_at_line(data.fetched_at))
+    lines.append(_updated_at_line(data.fetched_at, now))
 
     return DisplayState(
         icon_color=_icon_color(data.five_hour.utilization, config),

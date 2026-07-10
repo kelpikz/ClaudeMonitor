@@ -9,7 +9,7 @@ from claudemonitor.config import Config, ThresholdsConfig
 from claudemonitor.models import AnthropicUsageData, UsageWindow
 from claudemonitor.processor import (
     _error_tooltip,
-    _five_hour_not_started,
+    _window_not_started,
     _format_elapsed,
     _format_time_left,
     _icon_color,
@@ -23,7 +23,8 @@ from claudemonitor.processor import (
 # The 5h rolling window only begins once the user sends their first message;
 # until then the API reports utilization 0.0 with resets_at=None. This is the
 # exact line we surface in place of a bogus "100% left · resets in unknown".
-NOT_STARTED_LINE = "5h:   not started — send a message to begin"
+FIVE_HOUR_NOT_STARTED_LINE = "5h: send a message to start the session"
+WEEK_NOT_STARTED_LINE = "Week: send a message to start the session"
 
 # A fixed, timezone-aware "current time" shared by every test. Using a constant
 # (rather than datetime.now()) keeps all elapsed/remaining calculations
@@ -97,7 +98,7 @@ class TestProcessHappyPath:
         assert lines[0] == "Claude usage"
         assert lines[1] == "5h:   70% left · resets in 2h 15m"
         assert lines[2] == "Week: 90% left · resets in 3d 4h"
-        assert re.fullmatch(r"Updated at \d{2}:\d{2}:\d{2}", lines[3])
+        assert lines[3] == "Updated (15 seconds ago)"
 
     def test_menu_label_reports_freshness(self):
         # On success the label is just how long ago we fetched, formatted by
@@ -188,7 +189,7 @@ class TestProcessFiveHourNotStarted:
     def test_five_hour_line_explains_countdown_not_started(self):
         lines = process(self._data(), NOW, Config()).tooltip.split("\n")
         assert lines[0] == "Claude usage"
-        assert lines[1] == NOT_STARTED_LINE
+        assert lines[1] == FIVE_HOUR_NOT_STARTED_LINE
 
     def test_does_not_show_bogus_full_window(self):
         # The old behavior leaked through as "100% left" / "resets in unknown".
@@ -201,6 +202,15 @@ class TestProcessFiveHourNotStarted:
         lines = process(self._data(), NOW, Config()).tooltip.split("\n")
         assert lines[2] == "Week: 95% left · resets in 4d 3h"
 
+    def test_week_line_explains_when_weekly_session_has_not_started(self):
+        data = make_data(
+            five_hour=UsageWindow(utilization=0.0, resets_at=None),
+            seven_day=UsageWindow(utilization=0.0, resets_at=None),
+        )
+        lines = process(data, NOW, Config()).tooltip.split("\n")
+        assert lines[1] == WEEK_NOT_STARTED_LINE
+        assert not any(line.startswith("5h:") for line in lines)
+
     def test_icon_is_green_because_full_usage_is_available(self):
         # Nothing has been spent yet, so the user has their whole 5h budget.
         assert process(self._data(), NOW, Config()).icon_color == "green"
@@ -208,7 +218,7 @@ class TestProcessFiveHourNotStarted:
     def test_tooltip_still_ends_with_updated_line(self):
         data = self._data(fetched_at=NOW - timedelta(seconds=15))
         last = process(data, NOW, Config()).tooltip.split("\n")[-1]
-        assert last.startswith("Updated at ")
+        assert last == "Updated (15 seconds ago)"
 
     def test_tooltip_fits_windows_tooltip_limit(self):
         assert len(process(self._data(), NOW, Config()).tooltip) <= 128
@@ -227,7 +237,7 @@ class TestProcessNoData:
     def test_no_data_tooltip_still_ends_with_updated_line(self):
         data = make_data(five_hour=None)
         last_line = process(data, NOW, Config()).tooltip.split("\n")[-1]
-        assert last_line.startswith("Updated at ")
+        assert last_line == "Updated (0 seconds ago)"
 
 
 class TestProcessErrors:
@@ -244,7 +254,7 @@ class TestProcessErrors:
         data = make_data(fetch_error="token_expired", fetched_at=NOW)
         lines = process(data, NOW, Config()).tooltip.split("\n")
         assert lines[0] == "Claude token expired — start Claude Code to refresh"
-        assert lines[-1].startswith("Updated at ")
+        assert lines[-1] == "Updated (0 seconds ago)"
 
     def test_error_sets_matching_menu_label(self):
         data = make_data(fetch_error="no_credentials", fetched_at=NOW - timedelta(minutes=2))
@@ -443,7 +453,7 @@ class TestUsageLines:
 
     def test_not_started_window_uses_explanatory_five_hour_line(self):
         data = make_data(five_hour=UsageWindow(utilization=0.0, resets_at=None))
-        assert _usage_lines(data, NOW)[1] == NOT_STARTED_LINE
+        assert _usage_lines(data, NOW)[1] == FIVE_HOUR_NOT_STARTED_LINE
 
     def test_not_started_does_not_affect_week_line(self):
         data = make_data(
@@ -451,26 +461,25 @@ class TestUsageLines:
             seven_day=UsageWindow(utilization=10.0, resets_at=NOW + timedelta(days=3, hours=4)),
         )
         lines = _usage_lines(data, NOW)
-        assert lines[1] == NOT_STARTED_LINE
+        assert lines[1] == FIVE_HOUR_NOT_STARTED_LINE
         assert lines[2] == "Week: 90% left · resets in 3d 4h"
 
 
-class TestFiveHourNotStarted:
-    """_five_hour_not_started: the predicate that recognizes a 5h window the
-    user has not begun yet (utilization 0.0 and no reset timestamp)."""
+class TestWindowNotStarted:
+    """_window_not_started recognizes a window with no active session."""
 
     def test_true_when_zero_utilization_and_no_reset(self):
-        assert _five_hour_not_started(UsageWindow(utilization=0.0, resets_at=None)) is True
+        assert _window_not_started(UsageWindow(utilization=0.0, resets_at=None)) is True
 
     def test_false_when_window_is_active(self):
         window = UsageWindow(utilization=0.0, resets_at=NOW + timedelta(hours=5))
-        assert _five_hour_not_started(window) is False
+        assert _window_not_started(window) is False
 
     def test_false_when_usage_has_accrued_even_without_reset(self):
         # A window with real usage but a missing reset time is a different
         # (degenerate) case — it should still report its percentage, not be
         # mistaken for a not-yet-started window.
-        assert _five_hour_not_started(UsageWindow(utilization=10.0, resets_at=None)) is False
+        assert _window_not_started(UsageWindow(utilization=10.0, resets_at=None)) is False
 
 
 class TestFormatTimeLeft:
@@ -540,16 +549,13 @@ class TestFormatElapsed:
 
 
 class TestUpdatedAtLine:
-    """_updated_at_line: renders the fetch time in the machine's *local* zone."""
+    """_updated_at_line: renders the fetch freshness in whole seconds."""
 
-    def test_format_is_updated_at_hh_mm_ss(self):
-        assert re.fullmatch(r"Updated at \d{2}:\d{2}:\d{2}", _updated_at_line(NOW))
+    def test_format_is_relative_seconds(self):
+        assert _updated_at_line(NOW - timedelta(seconds=15), NOW) == "Updated (15 seconds ago)"
 
-    def test_value_matches_local_conversion(self):
-        # Asserted against the same astimezone() conversion the function uses,
-        # so the test stays correct on any machine's timezone.
-        expected = NOW.astimezone().strftime("%H:%M:%S")
-        assert _updated_at_line(NOW) == f"Updated at {expected}"
+    def test_future_fetch_time_clamps_to_zero_seconds(self):
+        assert _updated_at_line(NOW + timedelta(seconds=30), NOW) == "Updated (0 seconds ago)"
 
 
 class TestMenuLabel:

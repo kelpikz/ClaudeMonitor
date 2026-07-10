@@ -5,9 +5,11 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Callable
 
 import pystray
 
@@ -20,6 +22,25 @@ _ERROR_ALREADY_EXISTS = 183
 _POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
 _POLL_INTERVAL_BACKOFF_FACTOR = 2
 _POLL_INTERVAL_CAP_SECONDS = 600
+_DISPLAY_REFRESH_INTERVAL_SECONDS = 1
+
+
+def _wait_with_display_refresh(
+    manual_refresh: threading.Event,
+    *,
+    interval_seconds: int,
+    refresh_display: Callable[[], None],
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Wait for the next fetch while refreshing relative display text each second."""
+    deadline = clock() + interval_seconds
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        if manual_refresh.wait(timeout=min(_DISPLAY_REFRESH_INTERVAL_SECONDS, remaining)):
+            return True
+        refresh_display()
 
 
 def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
@@ -98,17 +119,27 @@ def main() -> None:
                     data,
                     baseline_seconds=cfg.polling.interval_seconds,
                 )
-                state = processor.process(
-                    data, now=datetime.now(timezone.utc), config=cfg, last_good=last_good
-                )
+                def build_state() -> processor.DisplayState:
+                    return processor.process(
+                        data,
+                        now=datetime.now(timezone.utc),
+                        config=cfg,
+                        last_good=last_good,
+                    )
             except Exception:
                 log.exception("unhandled error in poll loop")
-                state = processor.internal_error_state(now=datetime.now(timezone.utc))
-            tray.apply(icon, state)
+                def build_state() -> processor.DisplayState:
+                    return processor.internal_error_state(now=datetime.now(timezone.utc))
+
+            tray.apply(icon, build_state())
             for notification in notifications:
                 tray.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
-            manual_refresh.wait(timeout=current_poll_interval_seconds)
+            _wait_with_display_refresh(
+                manual_refresh,
+                interval_seconds=current_poll_interval_seconds,
+                refresh_display=lambda: tray.apply(icon, build_state()),
+            )
 
     icon = pystray.Icon(
         "ClaudeMonitor",

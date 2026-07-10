@@ -8,6 +8,49 @@ from claudemonitor.models import AnthropicUsageData
 NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
 
 
+class _FakeEvent:
+    def __init__(self, results: list[bool]):
+        self._results = iter(results)
+        self.timeouts: list[float] = []
+
+    def wait(self, timeout: float) -> bool:
+        self.timeouts.append(timeout)
+        return next(self._results)
+
+
+def test_wait_refreshes_the_display_each_second_until_next_poll():
+    event = _FakeEvent([False, False])
+    clock = iter([0.0, 0.0, 1.0, 2.0])
+    refreshes: list[None] = []
+
+    refreshed_manually = main._wait_with_display_refresh(
+        event,
+        interval_seconds=2,
+        refresh_display=lambda: refreshes.append(None),
+        clock=lambda: next(clock),
+    )
+
+    assert refreshed_manually is False
+    assert event.timeouts == [1.0, 1.0]
+    assert len(refreshes) == 2
+
+
+def test_wait_stops_immediately_for_manual_refresh():
+    event = _FakeEvent([True])
+    clock = iter([0.0, 0.0])
+    refreshes: list[None] = []
+
+    refreshed_manually = main._wait_with_display_refresh(
+        event,
+        interval_seconds=60,
+        refresh_display=lambda: refreshes.append(None),
+        clock=lambda: next(clock),
+    )
+
+    assert refreshed_manually is True
+    assert refreshes == []
+
+
 def test_poll_interval_doubles_after_rate_limit():
     data = AnthropicUsageData(
         fetch_error="rate_limited",
