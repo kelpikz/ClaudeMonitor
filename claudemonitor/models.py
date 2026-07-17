@@ -24,3 +24,4 @@ class DisplayState(BaseModel):
     icon_color: Literal["green", "amber", "red", "grey"]
     tooltip: str
     menu_status_label: str
+    taskbar_text: str = "Claude: unavailable"

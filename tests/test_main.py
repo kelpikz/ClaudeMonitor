@@ -1,11 +1,125 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 
 from claudemonitor import main
 from claudemonitor.models import AnthropicUsageData
 
 NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+
+
+class _FakeEvent:
+    def __init__(self, results: list[bool]):
+        self._results = iter(results)
+        self.timeouts: list[float] = []
+
+    def wait(self, timeout: float) -> bool:
+        self.timeouts.append(timeout)
+        return next(self._results)
+
+
+class _FakeIcon:
+    """Records whether a console shutdown tells pystray to stop."""
+
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class _FakeCompanion:
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def update(self, text: str) -> None:
+        self.texts.append(text)
+
+
+def test_apply_display_updates_tray_and_taskbar(monkeypatch):
+    icon = _FakeIcon()
+    companion = _FakeCompanion()
+    state = main.processor.DisplayState(
+        icon_color="green",
+        tooltip="usage",
+        menu_status_label="updated",
+        taskbar_text="Claude: 80% (3 hours)",
+    )
+    applied: list[object] = []
+    monkeypatch.setattr(main.tray, "apply", lambda target, value: applied.append((target, value)))
+
+    main._apply_display(icon, state, companion)
+
+    assert applied == [(icon, state)]
+    assert companion.texts == ["Claude: 80% (3 hours)"]
+
+
+def test_wait_refreshes_the_display_each_second_until_next_poll():
+    event = _FakeEvent([False, False])
+    clock = iter([0.0, 0.0, 1.0, 2.0])
+    refreshes: list[None] = []
+
+    refreshed_manually = main._wait_with_display_refresh(
+        event,
+        interval_seconds=2,
+        refresh_display=lambda: refreshes.append(None),
+        clock=lambda: next(clock),
+    )
+
+    assert refreshed_manually is False
+    assert event.timeouts == [1.0, 1.0]
+    assert len(refreshes) == 2
+
+
+def test_wait_stops_immediately_for_manual_refresh():
+    event = _FakeEvent([True])
+    clock = iter([0.0, 0.0])
+    refreshes: list[None] = []
+
+    refreshed_manually = main._wait_with_display_refresh(
+        event,
+        interval_seconds=60,
+        refresh_display=lambda: refreshes.append(None),
+        clock=lambda: next(clock),
+    )
+
+    assert refreshed_manually is True
+    assert refreshes == []
+
+
+def test_wait_returns_without_refresh_when_shutdown_is_already_requested():
+    shutdown_requested = threading.Event()
+    shutdown_requested.set()
+    refreshes: list[None] = []
+
+    refreshed_manually = main._wait_with_display_refresh(
+        threading.Event(),
+        interval_seconds=60,
+        refresh_display=lambda: refreshes.append(None),
+        shutdown_requested=shutdown_requested,
+    )
+
+    assert refreshed_manually is False
+    assert refreshes == []
+
+
+def test_ctrl_c_requests_shutdown_wakes_poll_and_stops_tray_icon():
+    shutdown_requested = threading.Event()
+    manual_refresh = threading.Event()
+    icon = _FakeIcon()
+
+    handled = main._handle_console_control_event(
+        main._CTRL_C_EVENT,
+        shutdown_requested,
+        manual_refresh,
+        icon,
+    )
+
+    assert handled is True
+    assert shutdown_requested.is_set()
+    assert manual_refresh.is_set()
+    assert icon.stop_calls == 1
 
 
 def test_poll_interval_doubles_after_rate_limit():

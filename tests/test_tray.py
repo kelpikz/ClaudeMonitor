@@ -21,6 +21,16 @@ class _FakeIcon:
         self.notifications.append((title, message))
 
 
+class _QuitIcon:
+    """Records whether the tray Quit action asks pystray to stop."""
+
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+
 class TestTruncateTooltip:
     """The Windows tray tooltip (NOTIFYICONDATAW.szTip) is a fixed 128-WCHAR
     buffer; pystray raises ValueError above that, which would kill the poll
@@ -72,3 +82,33 @@ class TestNotify:
         assert icon.notifications == [
             ("Claude usage below 50%", "5h usage has 49% remaining.")
         ]
+
+
+class TestQuit:
+    """Quit must wake the background poll loop before stopping pystray."""
+
+    def test_quit_requests_shutdown_and_wakes_the_waiting_poll_loop(self):
+        manual_refresh = threading.Event()
+        shutdown_requested = threading.Event()
+        tray.init(manual_refresh, Path("."), shutdown_requested)
+        icon = _QuitIcon()
+
+        tray._on_quit(icon, None)
+
+        assert shutdown_requested.is_set()
+        assert manual_refresh.is_set()
+        assert icon.stop_calls == 1
+
+
+def test_toggle_taskbar_display_calls_configured_visibility_action():
+    toggles: list[None] = []
+    tray.init(
+        threading.Event(),
+        Path("."),
+        taskbar_visible=lambda: True,
+        toggle_taskbar=lambda: toggles.append(None),
+    )
+
+    tray._on_toggle_taskbar(_FakeIcon(), None)
+
+    assert toggles == [None]

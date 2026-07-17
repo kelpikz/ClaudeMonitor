@@ -5,26 +5,109 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Callable
 
 import pystray
 
 from . import fetcher, processor, tray
-from .config import load_config
+from .config import load_config, save_taskbar_enabled
 from .notifications import ThresholdNotifier
+from .taskbar_companion import TaskbarCompanion
 
 _ERROR_ALREADY_EXISTS = 183
+log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
 _POLL_INTERVAL_BACKOFF_FACTOR = 2
 _POLL_INTERVAL_CAP_SECONDS = 600
+_DISPLAY_REFRESH_INTERVAL_SECONDS = 1
+_CTRL_C_EVENT = 0
+_CTRL_BREAK_EVENT = 1
 
 
-def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
-    """Return whether a fetch completed successfully enough to update freshness."""
-    return data.fetch_error is None and data.status_code == 200
+def _apply_display(
+    icon: pystray.Icon,
+    state: processor.DisplayState,
+    companion: TaskbarCompanion,
+) -> None:
+    """Apply one processed state to the tray and taskbar surfaces."""
+    tray.apply(icon, state)
+    companion.update(state.taskbar_text)
+
+
+def _wait_with_display_refresh(
+    manual_refresh: threading.Event,
+    *,
+    interval_seconds: int,
+    refresh_display: Callable[[], None],
+    clock: Callable[[], float] = time.monotonic,
+    shutdown_requested: threading.Event | None = None,
+) -> bool:
+    """Wait for the next fetch while refreshing relative display text each second."""
+    deadline = clock() + interval_seconds
+    while True:
+        if shutdown_requested is not None and shutdown_requested.is_set():
+            return False
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        if manual_refresh.wait(timeout=min(_DISPLAY_REFRESH_INTERVAL_SECONDS, remaining)):
+            return True
+        refresh_display()
+
+
+def _handle_console_control_event(
+    control_type: int,
+    shutdown_requested: threading.Event,
+    manual_refresh: threading.Event,
+    icon: pystray.Icon,
+) -> bool:
+    """Convert Ctrl+C/Ctrl+Break into the same orderly shutdown as tray Quit."""
+    if control_type not in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT):
+        return False
+    shutdown_requested.set()
+    manual_refresh.set()
+    icon.stop()
+    return True
+
+
+def _install_console_shutdown_handler(
+    shutdown_requested: threading.Event,
+    manual_refresh: threading.Event,
+    icon: pystray.Icon,
+) -> ctypes._CFuncPtr:
+    """Install a Windows console handler that consumes Ctrl+C for clean shutdown."""
+    from ctypes import wintypes
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(control_type: int) -> bool:
+        return _handle_console_control_event(
+            control_type,
+            shutdown_requested,
+            manual_refresh,
+            icon,
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = (ctypes.c_void_p, wintypes.BOOL)
+    kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    if not kernel32.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), True):
+        logging.getLogger(__name__).warning("unable to register console shutdown handler")
+    return handler
+
+
+def _remove_console_shutdown_handler(handler: ctypes._CFuncPtr) -> None:
+    """Unregister the console handler once the pystray message loop has ended."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = (ctypes.c_void_p, wintypes.BOOL)
+    kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    kernel32.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), False)
 
 
 def _next_poll_interval_seconds(
@@ -47,6 +130,11 @@ def _next_poll_interval_seconds(
             current_interval_seconds - _POLL_INTERVAL_RECOVERY_STEP_SECONDS,
         )
     return current_interval_seconds
+
+
+def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
+    """Return whether a fetch completed successfully enough to update freshness."""
+    return data.fetch_error is None and data.status_code == 200
 
 
 def _acquire_single_instance(name: str = "ClaudeMonitor.SingleInstance") -> bool:
@@ -72,12 +160,26 @@ def main() -> None:
     if not _acquire_single_instance():
         sys.exit(0)
 
-    log = logging.getLogger(__name__)
     log.info("ClaudeMonitor starting")
 
     cfg = load_config()
     manual_refresh = threading.Event()
-    tray.init(manual_refresh, log_dir)
+    shutdown_requested = threading.Event()
+    companion = TaskbarCompanion(initial_visible=cfg.taskbar.enabled)
+
+    def toggle_taskbar() -> None:
+        visible = not companion.visible
+        companion.set_visible(visible)
+        save_taskbar_enabled(visible)
+
+    tray.init(
+        manual_refresh,
+        log_dir,
+        shutdown_requested,
+        taskbar_visible=lambda: companion.visible,
+        toggle_taskbar=toggle_taskbar,
+    )
+    companion.start()
 
     def setup(icon: pystray.Icon) -> None:
         icon.visible = True
@@ -86,7 +188,7 @@ def main() -> None:
         last_good: fetcher.AnthropicUsageData | None = None
         current_poll_interval_seconds = cfg.polling.interval_seconds
         threshold_notifier = ThresholdNotifier()
-        while True:
+        while not shutdown_requested.is_set():
             notifications = []
             try:
                 data = fetcher.fetch()
@@ -98,17 +200,31 @@ def main() -> None:
                     data,
                     baseline_seconds=cfg.polling.interval_seconds,
                 )
-                state = processor.process(
-                    data, now=datetime.now(timezone.utc), config=cfg, last_good=last_good
-                )
+                def build_state() -> processor.DisplayState:
+                    return processor.process(
+                        data,
+                        now=datetime.now(timezone.utc),
+                        config=cfg,
+                        last_good=last_good,
+                    )
             except Exception:
                 log.exception("unhandled error in poll loop")
-                state = processor.internal_error_state(now=datetime.now(timezone.utc))
-            tray.apply(icon, state)
+                def build_state() -> processor.DisplayState:
+                    return processor.internal_error_state(now=datetime.now(timezone.utc))
+
+            _apply_display(icon, build_state(), companion)
             for notification in notifications:
                 tray.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
-            manual_refresh.wait(timeout=current_poll_interval_seconds)
+            if shutdown_requested.is_set():
+                break
+            # TODO: future - move this into a separate module
+            _wait_with_display_refresh(
+                manual_refresh,
+                interval_seconds=current_poll_interval_seconds,
+                refresh_display=lambda: _apply_display(icon, build_state(), companion),
+                shutdown_requested=shutdown_requested,
+            )
 
     icon = pystray.Icon(
         "ClaudeMonitor",
@@ -116,7 +232,18 @@ def main() -> None:
         title="Claude Monitor — loading…",
         menu=pystray.Menu(),
     )
-    icon.run(setup=setup)
+    console_handler = _install_console_shutdown_handler(
+        shutdown_requested,
+        manual_refresh,
+        icon,
+    )
+    try:
+        icon.run(setup=setup)
+    finally:
+        shutdown_requested.set()
+        manual_refresh.set()
+        _remove_console_shutdown_handler(console_handler)
+        companion.stop()
 
 
 def poll() -> None:

@@ -4,7 +4,7 @@ import os
 import threading
 import webbrowser
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import pystray
 from PIL import Image, ImageDraw
@@ -31,13 +31,27 @@ _MAX_TOOLTIP_LEN = 127
 
 _icons: dict[str, Image.Image] = {}
 _manual_refresh: threading.Event | None = None
+_shutdown_requested: threading.Event | None = None
 _log_dir: Path | None = None
+_taskbar_visible: Callable[[], bool] | None = None
+_toggle_taskbar: Callable[[], None] | None = None
 
 
-def init(manual_refresh: threading.Event, log_dir: Path) -> None:
-    global _manual_refresh, _log_dir
+def init(
+    manual_refresh: threading.Event,
+    log_dir: Path,
+    shutdown_requested: threading.Event | None = None,
+    taskbar_visible: Callable[[], bool] | None = None,
+    toggle_taskbar: Callable[[], None] | None = None,
+) -> None:
+    """Prepare tray dependencies, including the event that ends the poll loop."""
+    global _manual_refresh, _shutdown_requested, _log_dir
+    global _taskbar_visible, _toggle_taskbar
     _manual_refresh = manual_refresh
+    _shutdown_requested = shutdown_requested
     _log_dir = log_dir
+    _taskbar_visible = taskbar_visible
+    _toggle_taskbar = toggle_taskbar
     _build_icons()
 
 
@@ -82,6 +96,11 @@ def _build_menu(status_label: str) -> pystray.Menu:
         pystray.MenuItem("Refresh now", _on_refresh),
         pystray.MenuItem("Open Anthropic console", _on_open_console),
         pystray.MenuItem("Open log folder", _on_open_log_folder),
+        pystray.MenuItem(
+            "Show taskbar usage",
+            _on_toggle_taskbar,
+            checked=lambda item: bool(_taskbar_visible and _taskbar_visible()),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _on_quit),
     )
@@ -101,5 +120,18 @@ def _on_open_log_folder(icon: pystray.Icon, item: pystray.MenuItem) -> None:
         os.startfile(str(_log_dir))
 
 
+def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    """Toggle the companion and refresh the menu checkmark."""
+    if _toggle_taskbar is not None:
+        _toggle_taskbar()
+    if hasattr(icon, "update_menu"):
+        icon.update_menu()
+
+
 def _on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    """End the poll loop before asking pystray to join its setup thread."""
+    if _shutdown_requested is not None:
+        _shutdown_requested.set()
+    if _manual_refresh is not None:
+        _manual_refresh.set()
     icon.stop()
