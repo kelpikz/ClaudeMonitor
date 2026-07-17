@@ -14,10 +14,12 @@ from typing import Callable
 import pystray
 
 from . import fetcher, processor, tray
-from .config import load_config
+from .config import load_config, save_taskbar_enabled
 from .notifications import ThresholdNotifier
+from .taskbar_companion import TaskbarCompanion
 
 _ERROR_ALREADY_EXISTS = 183
+log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
 _POLL_INTERVAL_BACKOFF_FACTOR = 2
@@ -25,6 +27,16 @@ _POLL_INTERVAL_CAP_SECONDS = 600
 _DISPLAY_REFRESH_INTERVAL_SECONDS = 1
 _CTRL_C_EVENT = 0
 _CTRL_BREAK_EVENT = 1
+
+
+def _apply_display(
+    icon: pystray.Icon,
+    state: processor.DisplayState,
+    companion: TaskbarCompanion,
+) -> None:
+    """Apply one processed state to the tray and taskbar surfaces."""
+    tray.apply(icon, state)
+    companion.update(state.taskbar_text)
 
 
 def _wait_with_display_refresh(
@@ -98,11 +110,6 @@ def _remove_console_shutdown_handler(handler: ctypes._CFuncPtr) -> None:
     kernel32.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), False)
 
 
-def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
-    """Return whether a fetch completed successfully enough to update freshness."""
-    return data.fetch_error is None and data.status_code == 200
-
-
 def _next_poll_interval_seconds(
     current_interval_seconds: int,
     data: fetcher.AnthropicUsageData,
@@ -123,6 +130,11 @@ def _next_poll_interval_seconds(
             current_interval_seconds - _POLL_INTERVAL_RECOVERY_STEP_SECONDS,
         )
     return current_interval_seconds
+
+
+def _is_successful_fetch(data: fetcher.AnthropicUsageData) -> bool:
+    """Return whether a fetch completed successfully enough to update freshness."""
+    return data.fetch_error is None and data.status_code == 200
 
 
 def _acquire_single_instance(name: str = "ClaudeMonitor.SingleInstance") -> bool:
@@ -148,13 +160,26 @@ def main() -> None:
     if not _acquire_single_instance():
         sys.exit(0)
 
-    log = logging.getLogger(__name__)
     log.info("ClaudeMonitor starting")
 
     cfg = load_config()
     manual_refresh = threading.Event()
     shutdown_requested = threading.Event()
-    tray.init(manual_refresh, log_dir, shutdown_requested)
+    companion = TaskbarCompanion(initial_visible=cfg.taskbar.enabled)
+
+    def toggle_taskbar() -> None:
+        visible = not companion.visible
+        companion.set_visible(visible)
+        save_taskbar_enabled(visible)
+
+    tray.init(
+        manual_refresh,
+        log_dir,
+        shutdown_requested,
+        taskbar_visible=lambda: companion.visible,
+        toggle_taskbar=toggle_taskbar,
+    )
+    companion.start()
 
     def setup(icon: pystray.Icon) -> None:
         icon.visible = True
@@ -187,16 +212,17 @@ def main() -> None:
                 def build_state() -> processor.DisplayState:
                     return processor.internal_error_state(now=datetime.now(timezone.utc))
 
-            tray.apply(icon, build_state())
+            _apply_display(icon, build_state(), companion)
             for notification in notifications:
                 tray.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
             if shutdown_requested.is_set():
                 break
+            # TODO: future - move this into a separate module
             _wait_with_display_refresh(
                 manual_refresh,
                 interval_seconds=current_poll_interval_seconds,
-                refresh_display=lambda: tray.apply(icon, build_state()),
+                refresh_display=lambda: _apply_display(icon, build_state(), companion),
                 shutdown_requested=shutdown_requested,
             )
 
@@ -217,6 +243,7 @@ def main() -> None:
         shutdown_requested.set()
         manual_refresh.set()
         _remove_console_shutdown_handler(console_handler)
+        companion.stop()
 
 
 def poll() -> None:

@@ -22,6 +22,22 @@ def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
     return f"{seconds}s"
 
 
+def _taskbar_text(window: UsageWindow, now: datetime) -> str:
+    """Format remaining five-hour usage and its reset countdown compactly."""
+    remaining_usage = max(0.0, min(100.0, 100.0 - window.utilization))
+    if window.resets_at is None:
+        reset_text = "not started"
+    else:
+        seconds = max(0, int((window.resets_at - now).total_seconds()))
+        hours = seconds // 3600
+        if hours:
+            reset_text = f"{hours} {'hour' if hours == 1 else 'hours'}"
+        else:
+            minutes = seconds // 60
+            reset_text = f"{minutes} {'minute' if minutes == 1 else 'minutes'}"
+    return f"Claude: {remaining_usage:.0f}% ({reset_text})"
+
+
 def _updated_at_line(fetched_at: datetime, now: datetime) -> str:
     """Return the time elapsed since the most recent fetch in whole seconds."""
     elapsed = max(0, int((now - fetched_at).total_seconds()))
@@ -112,6 +128,7 @@ def _stale_state(last_good: AnthropicUsageData, now: datetime, config: Config) -
         icon_color=color,
         tooltip="\n".join(lines),
         menu_status_label=f"Rate limited — last update {elapsed} ago",
+        taskbar_text=_taskbar_text(last_good.five_hour, now),
     )
 
 
@@ -151,6 +168,7 @@ def process(
         icon_color=_icon_color(data.five_hour.utilization, config),
         tooltip="\n".join(lines),
         menu_status_label=label,
+        taskbar_text=_taskbar_text(data.five_hour, now),
     )
 
 

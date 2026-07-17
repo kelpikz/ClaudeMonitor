@@ -90,6 +90,26 @@ class TestProcessHappyPath:
         # 70% remaining > amber_below (50) -> green branch of process().
         assert self._state().icon_color == "green"
 
+    def test_taskbar_text_shows_remaining_usage_and_reset_time(self):
+        data = make_data(
+            five_hour=UsageWindow(
+                utilization=20.0,
+                resets_at=NOW + timedelta(hours=3),
+            )
+        )
+
+        assert process(data, NOW, Config()).taskbar_text == "Claude: 80% (3 hours)"
+
+    def test_taskbar_text_uses_singular_hour(self):
+        data = make_data(
+            five_hour=UsageWindow(
+                utilization=20.0,
+                resets_at=NOW + timedelta(hours=1),
+            )
+        )
+
+        assert process(data, NOW, Config()).taskbar_text == "Claude: 80% (1 hour)"
+
     def test_tooltip_has_full_three_line_body_plus_timestamp(self):
         # Verifies the exact assembled tooltip: header, 5h line, week line,
         # and the trailing "Updated at" line. This is the one place we check

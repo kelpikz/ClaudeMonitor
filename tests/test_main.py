@@ -29,6 +29,32 @@ class _FakeIcon:
         self.stop_calls += 1
 
 
+class _FakeCompanion:
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def update(self, text: str) -> None:
+        self.texts.append(text)
+
+
+def test_apply_display_updates_tray_and_taskbar(monkeypatch):
+    icon = _FakeIcon()
+    companion = _FakeCompanion()
+    state = main.processor.DisplayState(
+        icon_color="green",
+        tooltip="usage",
+        menu_status_label="updated",
+        taskbar_text="Claude: 80% (3 hours)",
+    )
+    applied: list[object] = []
+    monkeypatch.setattr(main.tray, "apply", lambda target, value: applied.append((target, value)))
+
+    main._apply_display(icon, state, companion)
+
+    assert applied == [(icon, state)]
+    assert companion.texts == ["Claude: 80% (3 hours)"]
+
+
 def test_wait_refreshes_the_display_each_second_until_next_poll():
     event = _FakeEvent([False, False])
     clock = iter([0.0, 0.0, 1.0, 2.0])

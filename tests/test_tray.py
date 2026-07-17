@@ -98,3 +98,17 @@ class TestQuit:
         assert shutdown_requested.is_set()
         assert manual_refresh.is_set()
         assert icon.stop_calls == 1
+
+
+def test_toggle_taskbar_display_calls_configured_visibility_action():
+    toggles: list[None] = []
+    tray.init(
+        threading.Event(),
+        Path("."),
+        taskbar_visible=lambda: True,
+        toggle_taskbar=lambda: toggles.append(None),
+    )
+
+    tray._on_toggle_taskbar(_FakeIcon(), None)
+
+    assert toggles == [None]
