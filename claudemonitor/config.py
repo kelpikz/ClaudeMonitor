@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-import re
-import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel
+import tomlkit
 
 _DEFAULT_TOML = """\
 # ClaudeMonitor config — edit and restart the app
@@ -56,7 +55,7 @@ def load_config() -> Config:
         toml_text = _DEFAULT_TOML
     else:
         toml_text = path.read_text(encoding="utf-8")
-    raw = tomllib.loads(toml_text)
+    raw = tomlkit.parse(toml_text)
     polling = PollingConfig(**raw.get("polling", {}))
     thresholds = ThresholdsConfig(**raw.get("thresholds", {}))
     taskbar = TaskbarConfig(**raw.get("taskbar", {}))
@@ -64,24 +63,14 @@ def load_config() -> Config:
 
 
 def save_taskbar_enabled(enabled: bool) -> None:
-    """Persist taskbar visibility while preserving the user's other TOML settings."""
+    """Persist taskbar visibility using a comment-preserving TOML document."""
     path = _config_path()
     if not path.exists():
         load_config()
-    text = path.read_text(encoding="utf-8")
-    value = "true" if enabled else "false"
-    section = re.search(r"(?ms)^\[taskbar\]\s*$.*?(?=^\[|\Z)", text)
-    if section is None:
-        text = text.rstrip() + f"\n\n[taskbar]\nenabled = {value}\n"
-    else:
-        block = section.group(0)
-        if re.search(r"(?m)^\s*enabled\s*=", block):
-            updated = re.sub(
-                r"(?m)^(\s*enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)$",
-                rf"\g<1>{value}\g<2>",
-                block,
-            )
-        else:
-            updated = block.rstrip() + f"\nenabled = {value}\n"
-        text = text[: section.start()] + updated + text[section.end() :]
-    path.write_text(text, encoding="utf-8")
+    document = tomlkit.parse(path.read_text(encoding="utf-8"))
+    taskbar = document.get("taskbar")
+    if taskbar is None:
+        taskbar = tomlkit.table()
+        document["taskbar"] = taskbar
+    taskbar["enabled"] = enabled
+    path.write_text(tomlkit.dumps(document), encoding="utf-8")

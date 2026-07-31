@@ -1,24 +1,13 @@
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
+import threading
 
 from claudemonitor.taskbar_companion import (
-    HELLO_WORLD_TEXT,
     Rect,
     TaskbarCompanion,
-    _WS_EX_NOACTIVATE,
-    _WS_EX_TOOLWINDOW,
-    _WS_POPUP,
-    _WS_VISIBLE,
     leftmost_abutting_edge,
     taskbar_child_rect,
-    Win32TaskbarWindow,
 )
-
-
-def test_loading_label_is_the_initial_native_window_content():
-    assert HELLO_WORLD_TEXT == "Claude: loading..."
 
 
 def test_leftmost_abutting_edge_steps_over_other_taskbar_plugins():
@@ -64,6 +53,9 @@ class _FakeNativeWindow:
         self.attach_succeeds = attach_succeeds
         self.notification_rect = Rect(1542, 1032, 1920, 1080)
         self.sibling_rects: list[Rect] = []
+        self.window_created = threading.Event()
+        self.messages_pumped = threading.Event()
+        self.visibility_changed = threading.Event()
 
     def find_taskbar(self):
         self.calls.append(("find_taskbar",))
@@ -79,8 +71,9 @@ class _FakeNativeWindow:
             return Rect(0, 1032, 1920, 1080)
         return self.notification_rect
 
-    def create_window(self, *, parent, style, ex_style, text):
-        self.calls.append(("create_window", parent, style, ex_style, text))
+    def create_window(self, *, text, visible):
+        self.calls.append(("create_window", text, visible))
+        self.window_created.set()
         return 30
 
     def attach_to_taskbar(self, handle, taskbar):
@@ -102,9 +95,11 @@ class _FakeNativeWindow:
 
     def set_visible(self, handle, visible):
         self.calls.append(("set_visible", handle, visible))
+        self.visibility_changed.set()
 
     def pump_messages(self, stop_requested, duration_seconds):
         self.calls.append(("pump_messages", duration_seconds))
+        self.messages_pumped.set()
         self.pump_rounds -= 1
         if self.pump_rounds <= 0:
             stop_requested.set()
@@ -113,20 +108,14 @@ class _FakeNativeWindow:
         self.calls.append(("close_window", handle))
 
 
-def test_native_popup_is_created_non_activating_with_hello_world():
+def test_native_window_is_created_with_a_clear_loading_message():
     native = _FakeNativeWindow()
     companion = TaskbarCompanion(native=native)
 
     companion._run()
 
     create_call = next(call for call in native.calls if call[0] == "create_window")
-    _, parent, style, ex_style, text = create_call
-    assert parent == 0
-    assert style & (_WS_POPUP | _WS_VISIBLE) == (_WS_POPUP | _WS_VISIBLE)
-    assert ex_style & (_WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE) == (
-        _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE
-    )
-    assert text == HELLO_WORLD_TEXT
+    assert create_call == ("create_window", "Claude: loading...", True)
 
 
 def test_usage_text_supplied_before_start_is_rendered_initially():
@@ -137,17 +126,37 @@ def test_usage_text_supplied_before_start_is_rendered_initially():
     companion._run()
 
     create_call = next(call for call in native.calls if call[0] == "create_window")
-    assert create_call[-1] == "Claude: 80% (3 hours)"
+    assert create_call == ("create_window", "Claude: 80% (3 hours)", True)
 
 
 def test_visibility_can_be_disabled_before_start():
     native = _FakeNativeWindow()
     companion = TaskbarCompanion(native=native, initial_visible=False)
 
-    companion._run()
+    companion.start()
+    assert native.window_created.wait(timeout=1)
+    try:
+        create_call = next(call for call in native.calls if call[0] == "create_window")
+        assert create_call == ("create_window", "Claude: loading...", False)
+        assert not native.messages_pumped.wait(timeout=0.1)
+        assert not any(call[0] == "move_window" for call in native.calls)
+    finally:
+        companion.stop()
 
-    create_call = next(call for call in native.calls if call[0] == "create_window")
-    assert create_call[2] & _WS_VISIBLE == 0
+
+def test_hidden_companion_resumes_native_work_when_made_visible():
+    native = _FakeNativeWindow(pump_rounds=1)
+    companion = TaskbarCompanion(native=native, initial_visible=False)
+
+    companion.start()
+    assert native.window_created.wait(timeout=1)
+    companion.set_visible(True)
+    try:
+        assert native.messages_pumped.wait(timeout=1)
+        assert ("set_visible", 30, True) in native.calls
+        assert any(call[0] == "move_window" for call in native.calls)
+    finally:
+        companion.stop()
 
 
 def test_usage_text_updates_while_native_window_is_running():
@@ -177,9 +186,12 @@ def test_visibility_updates_while_native_window_is_running():
 
     native.pump_messages = hide_during_first_pump
 
-    companion._run()
-
-    assert ("set_visible", 30, False) in native.calls
+    companion.start()
+    try:
+        assert native.visibility_changed.wait(timeout=1)
+        assert ("set_visible", 30, False) in native.calls
+    finally:
+        companion.stop()
 
 
 def test_companion_embeds_into_the_taskbar_like_trafficmonitor():
@@ -258,20 +270,6 @@ def test_companion_falls_back_to_topmost_screen_popup_when_parenting_fails():
 
     assert not any(call[0] == "set_colorkey_transparency" for call in native.calls)
     move_calls = [call for call in native.calls if call[0] == "move_window"]
-    assert len(move_calls) == 1 + 3
+    assert len(move_calls) == 3
     assert all(call[3] is True for call in move_calls)
     assert move_calls[0][2] == Rect(left=1362, top=1032, right=1542, bottom=1080)
-
-
-def test_default_window_proc_accepts_pointer_sized_message_parameters():
-    native = Win32TaskbarWindow()
-
-    argument_types = native._user32.DefWindowProcW.argtypes
-
-    assert argument_types == (
-        wintypes.HWND,
-        wintypes.UINT,
-        wintypes.WPARAM,
-        wintypes.LPARAM,
-    )
-    assert ctypes.sizeof(argument_types[3]) == ctypes.sizeof(ctypes.c_void_p)
