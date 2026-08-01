@@ -6,22 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 claudemonitor/
-  main.py       — entry point; logging setup, single-instance mutex, poll loop, wires everything together
-  fetcher.py    — calls Anthropic API; always returns AnthropicUsageData (errors included, never raises)
-  processor.py  — pure function: AnthropicUsageData -> DisplayState; owns all string formatting
-  tray.py       — drives pystray icon, tooltip, and menu; init() must be called before apply()
-  models.py     — Pydantic models shared between layers: UsageWindow, AnthropicUsageData, DisplayState
-  config.py     — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config
+  main.py                 — entry point; logging setup, single-instance mutex, poll loop, wires everything together
+  fetcher.py              — calls Anthropic API; always returns AnthropicUsageData (errors included, never raises)
+  processor.py            — pure function: AnthropicUsageData -> DisplayState; owns all string formatting
+  tray.py                 — drives pystray icon, tooltip, and menu; init() must be called before apply()
+  models.py               — shared cross-layer types: UsageWindow, AnthropicUsageData, DisplayState, Rect
+  config.py               — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config
+  notifications.py        — decides when a threshold crossing warrants a desktop notification
+  taskbar_companion.py    — controller for the taskbar usage label: owns its UI thread and placement maths
+  win32_taskbar_window.py — the only module that calls user32/gdi32; implements the NativeWindow protocol
+  win32_bindings.py       — Windows constants, C structs, and function signature tables (no behavior)
 
 tests/          — pytest suite (run via uv run pytest)
 run.py          — one-liner PyInstaller entry point (don't run directly; use uv run dev)
 _scripts.py     — build script called by uv run build
-design-v1.md    — full product + architecture spec for v1
 docs/
   design-v1.md                       — full product + architecture spec for v1
-  adr-0001-flat-module-architecture.md — ADR: why the flat 6-module layout was chosen
+  adr-0001-flat-module-architecture.md — ADR: why the flat module layout was chosen
   project-info.md                    — project background and goals
-  claudeNotes/                       — session notes written by Claude after each task (see Bookkeeping below)
+  agentNotes/                        — session notes written after each task (see Bookkeeping below)
 ```
 
 ## Commands
@@ -35,6 +38,9 @@ docs/
 
 ## Development process
 
+### Running the app
+- Do not start `uv run dev`, the built executable, or any long-running Claude Monitor process unless the user explicitly asks. The user will normally launch the app themselves to inspect it.
+
 ### Development method
 - Follow a red green TDD (Test Driven Development) mode of architecture. 
 - You should always write / modify tests first. And verify if everything the tests are failing before starting to implment the feature
@@ -47,6 +53,7 @@ docs/
 ### Code Structure
 - The code written should be modular and easy to test. Every function should do one thing and one thing only
 - Variable and funciton names should be descriptive and every function should contain a comment on what it does
+- Prefer self explanatory code over comments
 
 
 ## Debugging
@@ -68,4 +75,4 @@ All architecture docs are in `docs/`. Start with `docs/design-v1.md` for the ful
 
 ## Bookkeeping
 
-At the end of every session or task, write a brief technical note to `./docs/claudeNotes/` named `YYYY-MM-DD-<short-slug>.md`. Include: what was changed, why, and any decisions or gotchas worth remembering. Keep it short — a future Claude should be able to scan it in 30 seconds.
+At the end of every session or task, write a brief technical note to `./docs/agentNotes/` named `YYYY-MM-DD-<short-slug>.md`. Include: what was changed, why, and any decisions or gotchas worth remembering. Keep it short — a future Claude should be able to scan it in 30 seconds.

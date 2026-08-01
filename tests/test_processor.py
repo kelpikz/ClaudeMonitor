@@ -90,6 +90,26 @@ class TestProcessHappyPath:
         # 70% remaining > amber_below (50) -> green branch of process().
         assert self._state().icon_color == "green"
 
+    def test_taskbar_text_shows_remaining_usage_and_reset_time(self):
+        data = make_data(
+            five_hour=UsageWindow(
+                utilization=20.0,
+                resets_at=NOW + timedelta(hours=3),
+            )
+        )
+
+        assert process(data, NOW, Config()).taskbar_text == "Claude: 80% (3 hours)"
+
+    def test_taskbar_text_uses_singular_hour(self):
+        data = make_data(
+            five_hour=UsageWindow(
+                utilization=20.0,
+                resets_at=NOW + timedelta(hours=1),
+            )
+        )
+
+        assert process(data, NOW, Config()).taskbar_text == "Claude: 80% (1 hour)"
+
     def test_tooltip_has_full_three_line_body_plus_timestamp(self):
         # Verifies the exact assembled tooltip: header, 5h line, week line,
         # and the trailing "Updated at" line. This is the one place we check
@@ -624,3 +644,85 @@ class TestErrorTooltip:
         # Defense in depth: an unmapped code still yields a sane message.
         data = make_data(fetch_error="boom")
         assert _error_tooltip("boom", data, NOW) == "Internal error — see log"
+
+
+class TestTaskbarText:
+    """The taskbar label is the most visible surface, so every fetch outcome —
+    success, each error code, and missing data — must produce its own honest
+    short message rather than one undifferentiated placeholder."""
+
+    def _taskbar_text(self, **kwargs) -> str:
+        return process(make_data(**kwargs), NOW, Config()).taskbar_text
+
+    def test_remaining_usage_is_floored_so_full_only_means_untouched(self):
+        # 99.6% remaining must not round up to a reassuring "100%".
+        assert (
+            self._taskbar_text(
+                five_hour=UsageWindow(utilization=0.4, resets_at=NOW + timedelta(hours=2))
+            )
+            == "Claude: 99% (2 hours)"
+        )
+
+    def test_reset_under_one_minute_avoids_a_zero_minute_countdown(self):
+        assert (
+            self._taskbar_text(
+                five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(seconds=30))
+            )
+            == "Claude: 80% (under a minute)"
+        )
+
+    def test_reset_within_the_hour_is_shown_in_minutes(self):
+        assert (
+            self._taskbar_text(
+                five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(minutes=1))
+            )
+            == "Claude: 80% (1 minute)"
+        )
+
+    def test_unstarted_window_matches_the_tooltip_definition(self):
+        # _window_not_started requires utilization 0 *and* no reset time, so the
+        # taskbar must use the same rule the tooltip does.
+        assert (
+            self._taskbar_text(five_hour=UsageWindow(utilization=0.0, resets_at=None))
+            == "Claude: 100% (not started)"
+        )
+
+    def test_used_window_without_a_reset_time_is_not_called_unstarted(self):
+        # The tooltip says "resets in unknown" here; the taskbar must agree
+        # rather than claiming the session never started.
+        assert (
+            self._taskbar_text(five_hour=UsageWindow(utilization=40.0, resets_at=None))
+            == "Claude: 60% (unknown)"
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            ("token_expired", "Claude: token expired"),
+            ("timeout", "Claude: offline"),
+            ("offline", "Claude: offline"),
+            ("no_credentials", "Claude: not logged in"),
+            ("bad_response", "Claude: bad response"),
+            ("rate_limited", "Claude: rate limited"),
+            ("boom", "Claude: unavailable"),
+        ],
+    )
+    def test_each_fetch_error_gets_its_own_short_label(self, error, expected):
+        assert self._taskbar_text(fetch_error=error) == expected
+
+    def test_missing_usage_data_is_reported_as_no_data(self):
+        assert self._taskbar_text(five_hour=None) == "Claude: no data"
+
+    def test_internal_error_state_reports_an_error_label(self):
+        assert internal_error_state(NOW).taskbar_text == "Claude: error"
+
+    def test_rate_limited_fallback_keeps_showing_the_last_good_usage(self):
+        last_good = make_data(
+            five_hour=UsageWindow(utilization=25.0, resets_at=NOW + timedelta(hours=2)),
+            fetched_at=NOW - timedelta(minutes=5),
+        )
+        data = make_data(fetch_error="rate_limited")
+
+        state = process(data, NOW, Config(), last_good=last_good)
+
+        assert state.taskbar_text == "Claude: 75% (2 hours)"

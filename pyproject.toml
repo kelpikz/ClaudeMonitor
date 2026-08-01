@@ -9,6 +9,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "httpx>=0.28.1",
+    "tomlkit>=0.13.3",
 ]
 
 [project.scripts]

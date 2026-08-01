@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import datetime, timezone
 
@@ -27,6 +28,62 @@ class _FakeIcon:
 
     def stop(self) -> None:
         self.stop_calls += 1
+
+
+class _FakeCompanion:
+    def __init__(self, visible: bool = True):
+        self.texts: list[str] = []
+        self.visible = visible
+
+    def update(self, text: str) -> None:
+        self.texts.append(text)
+
+    def set_visible(self, visible: bool) -> None:
+        self.visible = visible
+
+
+class TestToggleTaskbarVisibility:
+    """Toggling runs inside pystray's message loop, where an escaping exception
+    would surface only as an invisible stderr traceback in a windowed build."""
+
+    def test_toggle_flips_visibility_and_persists_the_choice(self):
+        companion = _FakeCompanion(visible=True)
+        saved: list[bool] = []
+
+        main._toggle_taskbar_visibility(companion, saved.append)
+
+        assert companion.visible is False
+        assert saved == [False]
+
+    def test_toggle_survives_a_failing_config_write(self, caplog):
+        companion = _FakeCompanion(visible=False)
+
+        def unwritable(_visible: bool) -> None:
+            raise OSError("config file is locked")
+
+        with caplog.at_level(logging.ERROR):
+            main._toggle_taskbar_visibility(companion, unwritable)
+
+        assert companion.visible is True
+        assert "taskbar visibility" in caplog.text
+
+
+def test_apply_display_updates_tray_and_taskbar(monkeypatch):
+    icon = _FakeIcon()
+    companion = _FakeCompanion()
+    state = main.processor.DisplayState(
+        icon_color="green",
+        tooltip="usage",
+        menu_status_label="updated",
+        taskbar_text="Claude: 80% (3 hours)",
+    )
+    applied: list[object] = []
+    monkeypatch.setattr(main.tray, "apply", lambda target, value: applied.append((target, value)))
+
+    main._apply_display(icon, state, companion)
+
+    assert applied == [(icon, state)]
+    assert companion.texts == ["Claude: 80% (3 hours)"]
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():

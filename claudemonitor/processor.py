@@ -1,9 +1,26 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import math
+from datetime import datetime
 
 from .config import Config
 from .models import AnthropicUsageData, DisplayState, UsageWindow
+
+# Every taskbar string lives here so the label, the tooltip, and the menu can
+# never drift apart. The companion shows this until the first fetch completes.
+LOADING_TASKBAR_TEXT = "Claude: loading..."
+
+_TASKBAR_ERROR_TEXTS = {
+    "token_expired": "Claude: token expired",
+    "timeout": "Claude: offline",
+    "offline": "Claude: offline",
+    "no_credentials": "Claude: not logged in",
+    "bad_response": "Claude: bad response",
+    "rate_limited": "Claude: rate limited",
+}
+_TASKBAR_UNKNOWN_ERROR_TEXT = "Claude: unavailable"
+_TASKBAR_NO_DATA_TEXT = "Claude: no data"
+_TASKBAR_INTERNAL_ERROR_TEXT = "Claude: error"
 
 
 def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
@@ -20,6 +37,43 @@ def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
     if minutes:
         return f"{minutes}m {seconds}s"
     return f"{seconds}s"
+
+
+def _plural(count: int, unit: str) -> str:
+    """Render a whole-number quantity with a correctly pluralized unit."""
+    return f"{count} {unit if count == 1 else unit + 's'}"
+
+
+def _taskbar_reset_text(resets_at: datetime | None, now: datetime) -> str:
+    """Describe how long until a usage window resets, in one coarse unit."""
+    if resets_at is None:
+        # Matches the tooltip's "resets in unknown" for the same missing value.
+        return "unknown"
+    seconds = max(0, int((resets_at - now).total_seconds()))
+    hours = seconds // 3600
+    if hours:
+        return _plural(hours, "hour")
+    minutes = seconds // 60
+    if minutes:
+        return _plural(minutes, "minute")
+    # A "0 minutes" countdown reads as broken rather than nearly finished.
+    return "under a minute"
+
+
+def _taskbar_text(window: UsageWindow, now: datetime) -> str:
+    """Format remaining five-hour usage and its reset countdown compactly."""
+    if _window_not_started(window):
+        # Same rule the tooltip uses, so the two surfaces cannot disagree.
+        return "Claude: 100% (not started)"
+
+    # Floor rather than round, so "100%" only ever means a truly untouched window.
+    remaining_usage = math.floor(max(0.0, min(100.0, 100.0 - window.utilization)))
+    return f"Claude: {remaining_usage}% ({_taskbar_reset_text(window.resets_at, now)})"
+
+
+def _taskbar_error_text(error: str | None) -> str:
+    """Map a fetch error to a short label that still says what went wrong."""
+    return _TASKBAR_ERROR_TEXTS.get(error or "", _TASKBAR_UNKNOWN_ERROR_TEXT)
 
 
 def _updated_at_line(fetched_at: datetime, now: datetime) -> str:
@@ -112,6 +166,7 @@ def _stale_state(last_good: AnthropicUsageData, now: datetime, config: Config) -
         icon_color=color,
         tooltip="\n".join(lines),
         menu_status_label=f"Rate limited — last update {elapsed} ago",
+        taskbar_text=_taskbar_text(last_good.five_hour, now),
     )
 
 
@@ -135,13 +190,19 @@ def process(
     if data.fetch_error:
         tooltip = _error_tooltip(data.fetch_error, data, now)
         tooltip += f"\n{_updated_at_line(data.fetched_at, now)}"
-        return DisplayState(icon_color="grey", tooltip=tooltip, menu_status_label=label)
+        return DisplayState(
+            icon_color="grey",
+            tooltip=tooltip,
+            menu_status_label=label,
+            taskbar_text=_taskbar_error_text(data.fetch_error),
+        )
 
     if data.five_hour is None:
         return DisplayState(
             icon_color="grey",
             tooltip=f"Claude usage\nNo usage data available\n{_updated_at_line(data.fetched_at, now)}",
             menu_status_label=label,
+            taskbar_text=_TASKBAR_NO_DATA_TEXT,
         )
 
     lines = _usage_lines(data, now)
@@ -151,6 +212,7 @@ def process(
         icon_color=_icon_color(data.five_hour.utilization, config),
         tooltip="\n".join(lines),
         menu_status_label=label,
+        taskbar_text=_taskbar_text(data.five_hour, now),
     )
 
 
@@ -174,4 +236,5 @@ def internal_error_state(now: datetime) -> DisplayState:
         icon_color="grey",
         tooltip="Internal error — see log",
         menu_status_label=f"Error — {now.strftime('%H:%M')}",
+        taskbar_text=_TASKBAR_INTERNAL_ERROR_TEXT,
     )
