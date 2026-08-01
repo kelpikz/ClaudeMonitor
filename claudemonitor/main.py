@@ -16,7 +16,7 @@ import pystray
 from . import fetcher, processor, tray
 from .config import load_config, save_taskbar_enabled
 from .notifications import ThresholdNotifier
-from .taskbar_companion import TaskbarCompanion
+from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 
 _ERROR_ALREADY_EXISTS = 183
 log = logging.getLogger(__name__)
@@ -32,11 +32,29 @@ _CTRL_BREAK_EVENT = 1
 def _apply_display(
     icon: pystray.Icon,
     state: processor.DisplayState,
-    companion: TaskbarCompanion,
+    companion: TaskbarDisplay,
 ) -> None:
     """Apply one processed state to the tray and taskbar surfaces."""
     tray.apply(icon, state)
     companion.update(state.taskbar_text)
+
+
+def _toggle_taskbar_visibility(
+    companion: TaskbarDisplay,
+    persist: Callable[[bool], None],
+) -> None:
+    """Flip the taskbar label on or off and remember the choice for next launch.
+
+    This runs inside pystray's message loop, where an escaping exception would
+    surface only as a stderr traceback nobody sees in a windowed build, so a
+    failed config write is logged and the toggle still takes effect.
+    """
+    visible = not companion.visible
+    companion.set_visible(visible)
+    try:
+        persist(visible)
+    except Exception:
+        log.exception("unable to persist taskbar visibility")
 
 
 def _wait_with_display_refresh(
@@ -165,19 +183,15 @@ def main() -> None:
     cfg = load_config()
     manual_refresh = threading.Event()
     shutdown_requested = threading.Event()
-    companion = TaskbarCompanion(initial_visible=cfg.taskbar.enabled)
-
-    def toggle_taskbar() -> None:
-        visible = not companion.visible
-        companion.set_visible(visible)
-        save_taskbar_enabled(visible)
+    companion = create_taskbar_companion(initial_visible=cfg.taskbar.enabled)
 
     tray.init(
         manual_refresh,
         log_dir,
         shutdown_requested,
         taskbar_visible=lambda: companion.visible,
-        toggle_taskbar=toggle_taskbar,
+        toggle_taskbar=lambda: _toggle_taskbar_visibility(companion, save_taskbar_enabled),
+        taskbar_healthy=lambda: companion.healthy,
     )
     companion.start()
 
@@ -218,7 +232,6 @@ def main() -> None:
             manual_refresh.clear()
             if shutdown_requested.is_set():
                 break
-            # TODO: future - move this into a separate module
             _wait_with_display_refresh(
                 manual_refresh,
                 interval_seconds=current_poll_interval_seconds,

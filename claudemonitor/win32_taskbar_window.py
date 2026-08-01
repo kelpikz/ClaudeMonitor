@@ -4,111 +4,71 @@ Most of ClaudeMonitor is ordinary Python. This module is the deliberately
 isolated exception: it translates readable operations such as "move the label"
 or "change its text" into calls to Windows' ``user32`` and ``gdi32`` DLLs.
 
-The numeric constants below are values defined by the Windows API. They are
-grouped by purpose so maintainers do not need to know the API vocabulary to
-follow the higher-level controller in ``taskbar_companion.py``.
+The Windows vocabulary itself — constants, C structures, and function
+signatures — lives in ``win32_bindings`` so this file describes only behavior.
 """
 
 from __future__ import annotations
 
 import ctypes
+import logging
 import threading
 import time
 from ctypes import wintypes
 
-from .taskbar_companion import Rect
-
-
-# Basic window behavior: begin as a standalone popup, optionally visible, then
-# convert to a child after Explorer accepts it into the taskbar.
-_WS_POPUP = 0x80000000  # Create a top-level window before taskbar attachment.
-_WS_CHILD = 0x40000000  # Make coordinates and lifetime belong to the taskbar.
-_WS_VISIBLE = 0x10000000  # Ask Windows to display the window immediately.
-_WS_EX_TOOLWINDOW = 0x00000080  # Keep the helper out of Alt+Tab.
-_WS_EX_NOACTIVATE = 0x08000000  # Never steal keyboard focus.
-_GWL_STYLE = -16  # Select the ordinary style field in Get/SetWindowLongPtr.
-_GWL_EXSTYLE = -20  # Select the extended-style field in Get/SetWindowLongPtr.
-
-# Transparency: pixels painted black become holes through which the taskbar's
-# own acrylic background remains visible.
-_WS_EX_LAYERED = 0x00080000  # Allow per-pixel transparency configuration.
-_LWA_COLORKEY = 0x00000001  # Treat one chosen color as fully transparent.
-_TRANSPARENT_COLORKEY = 0x00000000  # Black pixels will reveal the taskbar.
-
-# Repositioning flags. Moving must not activate or accidentally show a window;
-# visibility is controlled separately through ShowWindow.
-_SWP_NOSIZE = 0x0001  # Preserve width and height during a style-only update.
-_SWP_NOMOVE = 0x0002  # Preserve x and y during a style-only update.
-_SWP_NOZORDER = 0x0004  # Preserve stacking order relative to other windows.
-_SWP_NOACTIVATE = 0x0010  # Do not move keyboard focus to this window.
-_SWP_FRAMECHANGED = 0x0020  # Recalculate the frame after changing styles.
-_HWND_TOPMOST = -1  # Place the fallback popup above other normal windows.
-
-# Windows sends messages to request painting and shutdown. PeekMessage removes
-# each message from the queue before it is dispatched.
-_WM_PAINT = 0x000F  # Windows is asking the window to redraw itself.
-_WM_QUIT = 0x0012  # The thread's message loop should end.
-_PM_REMOVE = 0x0001  # Remove messages as PeekMessage reads them.
-
-# Text drawing options: center one line both horizontally and vertically, draw
-# without a background rectangle, and use Windows' standard interface font.
-_DT_CENTER = 0x00000001  # Center text horizontally.
-_DT_VCENTER = 0x00000004  # Center text vertically.
-_DT_SINGLELINE = 0x00000020  # Keep the usage summary on one line.
-_TRANSPARENT = 1  # Do not let GDI paint a background behind glyphs.
-_DEFAULT_GUI_FONT = 17  # Windows stock font identifier for standard UI text.
-_TASKBAR_FOREGROUND = 0x00F5F5F5  # Near-white COLORREF in BGR byte order.
-
-# Window-class and sibling-enumeration values used to register our label and
-# walk the taskbar's direct child windows.
-_CS_HREDRAW = 0x0002  # Repaint after horizontal resizing.
-_CS_VREDRAW = 0x0001  # Repaint after vertical resizing.
-_CLASS_NAME = "ClaudeMonitorTaskbarWindow"  # Process-local window type name.
-_GW_HWNDNEXT = 2  # Continue to the next sibling window.
-_GW_CHILD = 5  # Start at a parent's first child window.
-
-
-# A window procedure is the callback Windows invokes whenever our label needs
-# to paint or receives another operating-system message.
-_WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t,  # LRESULT: pointer-sized value returned to Windows.
-    wintypes.HWND,  # HWND: window receiving the message.
-    wintypes.UINT,  # UINT: numeric message identifier such as WM_PAINT.
-    wintypes.WPARAM,  # WPARAM: message-specific pointer-sized input.
-    wintypes.LPARAM,  # LPARAM: second message-specific pointer-sized input.
+from .models import Rect
+from .win32_bindings import (
+    CLASS_NAME,
+    CS_HREDRAW,
+    CS_VREDRAW,
+    DEFAULT_GUI_FONT,
+    DT_CENTER,
+    DT_SINGLELINE,
+    DT_VCENTER,
+    ERROR_CLASS_ALREADY_EXISTS,
+    GDI32_SIGNATURES,
+    GW_CHILD,
+    GW_HWNDNEXT,
+    GWL_EXSTYLE,
+    GWL_STYLE,
+    HWND_TOPMOST,
+    IDC_ARROW,
+    KERNEL32_SIGNATURES,
+    LWA_COLORKEY,
+    NONCLIENTMETRICSW,
+    PAINTSTRUCT,
+    PM_REMOVE,
+    SPI_GETNONCLIENTMETRICS,
+    SW_HIDE,
+    SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED,
+    SWP_NOACTIVATE,
+    SWP_NOMOVE,
+    SWP_NOSIZE,
+    SWP_NOZORDER,
+    TRANSPARENT_BACKGROUND,
+    TRANSPARENT_COLORKEY,
+    USER32_SIGNATURES,
+    WM_PAINT,
+    WM_QUIT,
+    WM_SETTINGCHANGE,
+    WM_THEMECHANGED,
+    WNDCLASSEXW,
+    WNDPROC,
+    WS_CHILD,
+    WS_EX_LAYERED,
+    WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
+    WS_POPUP,
+    apply_signatures,
+    foreground_color_for_theme,
+    system_uses_light_theme,
 )
 
+log = logging.getLogger(__name__)
 
-class _WNDCLASSEXW(ctypes.Structure):
-    """Python layout of the Win32 structure used to register a window type."""
-
-    _fields_ = [
-        ("cbSize", wintypes.UINT),  # Byte size, used for versioning the structure.
-        ("style", wintypes.UINT),  # Redraw behavior shared by every window.
-        ("lpfnWndProc", _WNDPROC),  # Callback that handles Windows messages.
-        ("cbClsExtra", ctypes.c_int),  # Extra class bytes; ClaudeMonitor needs none.
-        ("cbWndExtra", ctypes.c_int),  # Extra per-window bytes; also unused.
-        ("hInstance", wintypes.HINSTANCE),  # Module that owns this window class.
-        ("hIcon", wintypes.HICON),  # Large icon; omitted for the taskbar label.
-        ("hCursor", wintypes.HANDLE),  # Mouse cursor; no custom cursor is needed.
-        ("hbrBackground", wintypes.HBRUSH),  # Brush used to erase the background.
-        ("lpszMenuName", wintypes.LPCWSTR),  # Native menu resource; none is attached.
-        ("lpszClassName", wintypes.LPCWSTR),  # Name passed to CreateWindowExW.
-        ("hIconSm", wintypes.HICON),  # Small icon; omitted for the taskbar label.
-    ]
-
-
-class _PAINTSTRUCT(ctypes.Structure):
-    """Python layout of the drawing information Windows supplies while painting."""
-
-    _fields_ = [
-        ("hdc", wintypes.HDC),  # Drawing context prepared by BeginPaint.
-        ("fErase", wintypes.BOOL),  # Whether Windows erased the background.
-        ("rcPaint", wintypes.RECT),  # Region that needs repainting.
-        ("fRestore", wintypes.BOOL),  # Reserved Windows bookkeeping value.
-        ("fIncUpdate", wintypes.BOOL),  # Reserved Windows bookkeeping value.
-        ("rgbReserved", ctypes.c_byte * 32),  # Private state owned by Windows.
-    ]
+# How often the message pump checks for shutdown while waiting for messages.
+_PUMP_POLL_SECONDS = 0.05
 
 
 class Win32TaskbarWindow:
@@ -127,20 +87,35 @@ class Win32TaskbarWindow:
         self._gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-        # Declare parameter and return types before making any DLL calls. This
-        # prevents ctypes from truncating 64-bit window handles into C integers.
-        self._configure_functions()
+        missing = (
+            apply_signatures(self._user32, USER32_SIGNATURES)
+            + apply_signatures(self._gdi32, GDI32_SIGNATURES)
+            + apply_signatures(self._kernel32, KERNEL32_SIGNATURES)
+        )
+        if missing:
+            # Every entry the label actually depends on has shipped since
+            # Windows XP, so this is diagnostic rather than fatal.
+            log.warning("Windows does not export %s; continuing without it", missing)
 
         # Keep the callback object alive as long as Windows may call it. If it
         # were garbage-collected, a later paint message could crash the process.
-        self._window_proc_callback = _WNDPROC(self._window_proc)
-
-        # Registration happens lazily before the first window is created, and
-        # only once because duplicate class registration is an error.
-        self._class_registered = False
+        self._window_proc_callback = WNDPROC(self._window_proc)
 
         # DrawTextW reads this latest value whenever Windows sends WM_PAINT.
         self._window_text = ""
+
+        # GDI objects are created once per process and shared by every window
+        # this adapter registers, so recreating the label never leaks handles.
+        # A resolved font may legitimately be None (a NULL handle), so the flag
+        # rather than the value records that the lookup already happened.
+        self._font_handle: int | None = None
+        self._font_resolved = False
+        self._background_brush: int | None = None
+        self._foreground_color = foreground_color_for_theme(
+            uses_light_theme=system_uses_light_theme()
+        )
+
+    # --- Discovery -------------------------------------------------------
 
     def find_taskbar(self) -> int:
         """Find Explorer's primary taskbar by its stable Windows class name."""
@@ -174,8 +149,49 @@ class Win32TaskbarWindow:
         # shared with the controller and tests.
         return Rect(raw.left, raw.top, raw.right, raw.bottom)
 
-    def create_window(self, *, text: str, visible: bool) -> int:
-        """Create a non-activating popup that can later be embedded in Explorer."""
+    def list_sibling_rects(self, taskbar: int, exclude_handle: int) -> list[Rect]:
+        """Collect visible windows sharing the taskbar so placement can avoid them."""
+        # Accumulate plain Python rectangles; the controller decides which
+        # adjacent rectangles actually affect placement.
+        rects: list[Rect] = []
+
+        # GetWindow(GW_CHILD) starts at the first direct taskbar child. Repeated
+        # GW_HWNDNEXT calls then walk its siblings without recursion.
+        child = self._user32.GetWindow(taskbar, GW_CHILD)
+        while child:
+            rect = self._sibling_rect(child, exclude_handle)
+            if rect is not None:
+                rects.append(rect)
+
+            # Advance to the next sibling; a zero return ends enumeration.
+            child = self._user32.GetWindow(child, GW_HWNDNEXT)
+        return rects
+
+    def _sibling_rect(self, child: int, exclude_handle: int) -> Rect | None:
+        """Measure one taskbar child, or return None when it cannot affect layout."""
+        # Ignore our own HWND and hidden Explorer helpers. IsWindowVisible
+        # reports the effective WS_VISIBLE state of each sibling.
+        if child == exclude_handle or not self._user32.IsWindowVisible(child):
+            return None
+        try:
+            rect = self.get_rect(child)
+        except OSError:
+            # Taskbar children are transient: tooltips and flyouts can be
+            # destroyed between enumeration and measurement. One that has
+            # already vanished simply is not a sibling.
+            return None
+        if rect.width <= 0 or rect.height <= 0:
+            return None
+        return rect
+
+    # --- Lifecycle -------------------------------------------------------
+
+    def create_window(self, *, text: str) -> int:
+        """Create a hidden, non-activating popup that Explorer can later adopt.
+
+        The window is always created hidden so the controller can position it
+        before revealing it; otherwise a 1x1 speck flashes at the screen origin.
+        """
         # CreateWindowExW can only use a class after RegisterClassExW has taught
         # Windows its name, paint callback, and background brush.
         self._register_class()
@@ -184,23 +200,22 @@ class Win32TaskbarWindow:
         # this Python field rather than querying Windows for the title.
         self._window_text = text
 
-        # The ordinary style controls parent/visibility behavior. Extended
-        # styles keep this helper out of Alt+Tab and prevent focus stealing.
-        style = _WS_POPUP | (_WS_VISIBLE if visible else 0)
-        extended_style = _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE
+        # Extended styles keep this helper out of Alt+Tab and prevent focus
+        # stealing; WS_VISIBLE is deliberately omitted.
+        extended_style = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
 
         # GetModuleHandleW(None) identifies this running executable, which must
         # match the module used when the custom window class was registered.
         module_handle = self._kernel32.GetModuleHandleW(None)
 
         # CreateWindowExW returns the HWND used by every later operation. The
-        # initial 1x1 size avoids flashing a full-sized popup before placement;
+        # initial 1x1 size costs nothing while the window is still hidden;
         # no parent/menu/creation payload is needed at this stage.
         handle = self._user32.CreateWindowExW(
             extended_style,
-            _CLASS_NAME,
+            CLASS_NAME,
             text,
-            style,
+            WS_POPUP,
             0,
             0,
             1,
@@ -214,6 +229,64 @@ class Win32TaskbarWindow:
             raise ctypes.WinError(ctypes.get_last_error())
         return handle
 
+    def close_window(self, handle: int) -> None:
+        """Destroy the label on the same thread that created it."""
+        # IsWindow protects cleanup from a stale handle if Explorer or Windows
+        # already destroyed the native label.
+        if self._user32.IsWindow(handle):
+            # DestroyWindow releases the HWND and sends final destruction
+            # messages. Calling it on the creating thread satisfies Win32 rules.
+            self._user32.DestroyWindow(handle)
+
+    def _register_class(self) -> None:
+        """Teach Windows how to create and repaint this process's label windows."""
+        # WNDCLASSEXW describes a reusable window *type*, not an individual
+        # window. CreateWindowExW later instantiates this description.
+        window_class = WNDCLASSEXW()
+
+        # Windows uses cbSize to determine which version of the structure it
+        # received and which trailing fields are safe to read.
+        window_class.cbSize = ctypes.sizeof(WNDCLASSEXW)
+
+        # Repaint the full label after either dimension changes.
+        window_class.style = CS_HREDRAW | CS_VREDRAW
+
+        # Store the live ctypes callback Windows will invoke for messages.
+        window_class.lpfnWndProc = self._window_proc_callback
+
+        # GetModuleHandleW(None) returns the module of this running executable.
+        window_class.hInstance = self._kernel32.GetModuleHandleW(None)
+
+        # Without an explicit cursor, hovering the label leaves whatever pointer
+        # the neighbouring window last set.
+        window_class.hCursor = self._user32.LoadCursorW(None, IDC_ARROW)
+
+        window_class.hbrBackground = self._background_brush_handle()
+
+        # This exact name links registration to the later CreateWindowExW call.
+        window_class.lpszClassName = CLASS_NAME
+
+        # RegisterClassExW returns a zero atom on failure. A class already
+        # registered by an earlier window in this process is not a failure.
+        ctypes.set_last_error(0)
+        if self._user32.RegisterClassExW(ctypes.byref(window_class)):
+            return
+        error = ctypes.get_last_error()
+        if error != ERROR_CLASS_ALREADY_EXISTS:
+            raise ctypes.WinError(error)
+
+    def _background_brush_handle(self) -> int:
+        """Return the black erasing brush, creating it once for this process.
+
+        After layered transparency is enabled, this same black becomes the
+        transparent color that reveals the taskbar behind the label.
+        """
+        if self._background_brush is None:
+            self._background_brush = self._gdi32.CreateSolidBrush(TRANSPARENT_COLORKEY)
+        return self._background_brush
+
+    # --- Styles and placement -------------------------------------------
+
     def attach_to_taskbar(self, handle: int, taskbar: int) -> bool:
         """Convert the popup into a child window and attach it to Explorer.
 
@@ -224,12 +297,12 @@ class Win32TaskbarWindow:
         """
         # GetWindowLongPtrW returns the complete current style bitmask. Retain
         # it so a failed Explorer attachment can restore the popup exactly.
-        original_style = self._user32.GetWindowLongPtrW(handle, _GWL_STYLE)
+        original_style = self._user32.GetWindowLongPtrW(handle, GWL_STYLE)
 
         # Bit operations remove standalone-popup behavior and add child-window
         # behavior while leaving visibility and any unrelated flags untouched.
-        child_style = (original_style & ~_WS_POPUP) | _WS_CHILD
-        self._set_window_style(handle, child_style)
+        child_style = (original_style & ~WS_POPUP) | WS_CHILD
+        self._set_window_long(handle, GWL_STYLE, child_style)
 
         # SetParent can legitimately return zero when the previous parent was
         # null, and also returns zero on failure. Clearing LastError first lets
@@ -239,75 +312,48 @@ class Win32TaskbarWindow:
         if not previous_parent and ctypes.get_last_error() != 0:
             # Explorer rejected the child. Restore popup behavior so the
             # controller can position it in absolute screen coordinates.
-            self._set_window_style(handle, original_style)
+            self._set_window_long(handle, GWL_STYLE, original_style)
             return False
 
-        # Tell Windows to recalculate the non-client frame after the style
-        # change without moving, resizing, activating, or reordering the label.
+        self._apply_frame_change(handle)
+        return True
+
+    def _apply_frame_change(self, handle: int) -> None:
+        """Make Windows notice a style change without moving or showing anything."""
         frame_flags = (
-            _SWP_NOMOVE
-            | _SWP_NOSIZE
-            | _SWP_NOZORDER
-            | _SWP_NOACTIVATE
-            | _SWP_FRAMECHANGED
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
         )
         # SetWindowPos with zero geometry plus NOMOVE/NOSIZE applies no visual
         # movement; FRAMECHANGED merely makes Windows notice the new style.
         if not self._user32.SetWindowPos(handle, None, 0, 0, 0, 0, frame_flags):
             raise ctypes.WinError(ctypes.get_last_error())
-        return True
 
-    def _set_window_style(self, handle: int, style: int) -> None:
-        """Apply a base window style while handling Win32's ambiguous zero result."""
-        # Like SetParent, SetWindowLongPtrW may validly return zero (when the old
-        # value was zero) or return zero for failure, so LastError disambiguates.
+    def _set_window_long(self, handle: int, index: int, value: int) -> None:
+        """Write one pointer-sized window field, handling Win32's ambiguous zero."""
+        # SetWindowLongPtrW may validly return zero (when the old value was zero)
+        # or return zero for failure, so LastError disambiguates the two.
         ctypes.set_last_error(0)
-        previous_style = self._user32.SetWindowLongPtrW(handle, _GWL_STYLE, style)
-        if previous_style == 0 and ctypes.get_last_error() != 0:
+        previous_value = self._user32.SetWindowLongPtrW(handle, index, value)
+        if previous_value == 0 and ctypes.get_last_error() != 0:
             raise ctypes.WinError(ctypes.get_last_error())
-
-    def list_sibling_rects(self, taskbar: int, exclude_handle: int) -> list[Rect]:
-        """Collect visible windows sharing the taskbar so placement can avoid them."""
-        # Accumulate plain Python rectangles; the controller decides which
-        # adjacent rectangles actually affect placement.
-        rects: list[Rect] = []
-
-        # GetWindow(GW_CHILD) starts at the first direct taskbar child. Repeated
-        # GW_HWNDNEXT calls then walk its siblings without recursion.
-        child = self._user32.GetWindow(taskbar, _GW_CHILD)
-        while child:
-            # Ignore our own HWND and hidden Explorer helpers. IsWindowVisible
-            # reports the effective WS_VISIBLE state of each sibling.
-            if child != exclude_handle and self._user32.IsWindowVisible(child):
-                rect = self.get_rect(child)
-                if rect.width > 0 and rect.height > 0:
-                    rects.append(rect)
-
-            # Advance to the next sibling; a zero return ends enumeration.
-            child = self._user32.GetWindow(child, _GW_HWNDNEXT)
-        return rects
 
     def set_colorkey_transparency(self, handle: int) -> None:
         """Make the black background transparent, leaving only painted text."""
         # Read the existing extended flags so enabling layered rendering does
         # not erase TOOLWINDOW or NOACTIVATE behavior.
-        extended_style = self._user32.GetWindowLongPtrW(handle, _GWL_EXSTYLE)
+        extended_style = self._user32.GetWindowLongPtrW(handle, GWL_EXSTYLE)
 
-        # SetWindowLongPtrW turns on layered-window support, which is required
-        # before SetLayeredWindowAttributes accepts a transparent color key.
-        self._user32.SetWindowLongPtrW(
-            handle,
-            _GWL_EXSTYLE,
-            extended_style | _WS_EX_LAYERED,
-        )
+        # Layered-window support is required before SetLayeredWindowAttributes
+        # will accept a transparent color key.
+        self._set_window_long(handle, GWL_EXSTYLE, extended_style | WS_EX_LAYERED)
 
         # SetLayeredWindowAttributes makes every black pixel fully transparent.
         # Alpha is zero because LWA_COLORKEY uses the color rather than alpha.
         if not self._user32.SetLayeredWindowAttributes(
             handle,
-            _TRANSPARENT_COLORKEY,
+            TRANSPARENT_COLORKEY,
             0,
-            _LWA_COLORKEY,
+            LWA_COLORKEY,
         ):
             raise ctypes.WinError(ctypes.get_last_error())
 
@@ -315,15 +361,15 @@ class Win32TaskbarWindow:
         """Move and resize the label without activating or changing visibility."""
         # Every move avoids activation. Embedded children preserve their normal
         # z-order; only the standalone fallback is promoted above the taskbar.
-        flags = _SWP_NOACTIVATE
+        flags = SWP_NOACTIVATE
         if not topmost:
-            flags |= _SWP_NOZORDER
+            flags |= SWP_NOZORDER
 
         # SetWindowPos applies both location and size. Child coordinates are
         # taskbar-relative; fallback popup coordinates are screen-relative.
         if not self._user32.SetWindowPos(
             handle,
-            _HWND_TOPMOST if topmost else None,
+            HWND_TOPMOST if topmost else None,
             rect.left,
             rect.top,
             rect.width,
@@ -331,6 +377,13 @@ class Win32TaskbarWindow:
             flags,
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def set_visible(self, handle: int, visible: bool) -> None:
+        """Show without taking focus, or hide the native label."""
+        # ShowWindow changes visibility only; placement remains untouched.
+        self._user32.ShowWindow(handle, SW_SHOWNOACTIVATE if visible else SW_HIDE)
+
+    # --- Text and painting ----------------------------------------------
 
     def set_text(self, handle: int, text: str) -> None:
         """Store replacement text and ask Windows to repaint the label."""
@@ -342,18 +395,106 @@ class Win32TaskbarWindow:
         if not self._user32.SetWindowTextW(handle, text):
             raise ctypes.WinError(ctypes.get_last_error())
 
-        # InvalidateRect marks the entire client area dirty. The TRUE erase flag
-        # clears the old glyphs with the registered black background brush.
+        self._request_repaint(handle)
+
+    def _request_repaint(self, handle: int) -> None:
+        """Mark the whole label dirty so the next paint redraws it completely."""
+        # The TRUE erase flag clears the old glyphs with the black background
+        # brush registered for this window class.
         self._user32.InvalidateRect(handle, None, True)
 
-    def set_visible(self, handle: int, visible: bool) -> None:
-        """Show without taking focus, or hide the native label."""
-        # These are ShowWindow command values: SW_SHOWNOACTIVATE and SW_HIDE.
-        show_without_activation = 8
-        hide = 0
+    def refresh_theme(self, handle: int) -> None:
+        """Re-read light/dark mode, repainting only if the text colour changed.
 
-        # ShowWindow changes visibility only; placement remains untouched.
-        self._user32.ShowWindow(handle, show_without_activation if visible else hide)
+        Windows broadcasts WM_SETTINGCHANGE to top-level windows only, so once
+        the label is a taskbar child the message never arrives and the
+        controller polls this instead.
+        """
+        color = foreground_color_for_theme(uses_light_theme=system_uses_light_theme())
+        if color == self._foreground_color:
+            return
+        self._foreground_color = color
+        self._request_repaint(handle)
+
+    def message_font(self) -> int | None:
+        """Return the system UI font, creating it once from the current metrics.
+
+        The stock GUI font is an 8pt legacy face that matches neither the
+        taskbar's typeface nor the user's display scaling.
+        """
+        if self._font_resolved:
+            return self._font_handle
+        self._font_resolved = True
+
+        metrics = NONCLIENTMETRICSW()
+        metrics.cbSize = ctypes.sizeof(NONCLIENTMETRICSW)
+        queried = self._user32.SystemParametersInfoW(
+            SPI_GETNONCLIENTMETRICS,
+            ctypes.sizeof(NONCLIENTMETRICSW),
+            ctypes.byref(metrics),
+            0,
+        )
+        if queried:
+            self._font_handle = self._gdi32.CreateFontIndirectW(
+                ctypes.byref(metrics.lfMessageFont)
+            )
+        else:
+            log.warning("unable to read system UI font metrics; using the stock font")
+            self._font_handle = self._gdi32.GetStockObject(DEFAULT_GUI_FONT)
+        return self._font_handle
+
+    def _paint_label(self, hwnd: int) -> None:
+        """Draw the current usage text centered in the label's client area."""
+        # PAINTSTRUCT receives bookkeeping that must be passed back to EndPaint
+        # after drawing finishes.
+        paint = PAINTSTRUCT()
+
+        # BeginPaint validates the dirty region and supplies a device
+        # context—the native drawing surface used by GDI.
+        device_context = self._user32.BeginPaint(hwnd, ctypes.byref(paint))
+        try:
+            # GetClientRect returns the drawable interior using coordinates
+            # relative to the label's own top-left corner.
+            client_rect = wintypes.RECT()
+            self._user32.GetClientRect(hwnd, ctypes.byref(client_rect))
+
+            # Draw only text. The black background is removed by color-key
+            # transparency, allowing the real taskbar to show through.
+            self._gdi32.SetBkMode(device_context, TRANSPARENT_BACKGROUND)
+            self._gdi32.SetTextColor(device_context, self._foreground_color)
+            self._gdi32.SelectObject(device_context, self.message_font())
+
+            # DrawTextW lays out the complete Python string (-1 means
+            # null-terminated) inside client_rect using the centering flags.
+            self._user32.DrawTextW(
+                device_context,
+                self._window_text,
+                -1,
+                ctypes.byref(client_rect),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            )
+        finally:
+            # Every successful BeginPaint must be paired with EndPaint so
+            # Windows clears the dirty region and releases the drawing context.
+            self._user32.EndPaint(hwnd, ctypes.byref(paint))
+
+    def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
+        """Route Windows messages, handling only painting and theme changes."""
+        if message == WM_PAINT:
+            self._paint_label(hwnd)
+            return 0
+
+        if message in (WM_SETTINGCHANGE, WM_THEMECHANGED):
+            # Only the unattached fallback popup ever receives these, but taking
+            # them saves it waiting for the controller's slower poll.
+            self.refresh_theme(hwnd)
+            return 0
+
+        # DefWindowProcW provides Windows' standard behavior for lifecycle,
+        # sizing, cursor, and every other message ClaudeMonitor does not handle.
+        return self._user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    # --- Message pump ----------------------------------------------------
 
     def pump_messages(
         self,
@@ -367,14 +508,14 @@ class Win32TaskbarWindow:
         # PeekMessageW overwrites this structure for each queued message.
         message = wintypes.MSG()
 
-        # Event.wait doubles as a 50 ms sleep and a prompt shutdown signal.
-        while not stop_requested.wait(0.05):
+        # Event.wait doubles as a short sleep and a prompt shutdown signal.
+        while not stop_requested.wait(_PUMP_POLL_SECONDS):
             # PeekMessageW returns nonzero while a queued message exists. Passing
             # no HWND and a zero range accepts every message for this UI thread.
             while self._user32.PeekMessageW(
-                ctypes.byref(message), None, 0, 0, _PM_REMOVE
+                ctypes.byref(message), None, 0, 0, PM_REMOVE
             ):
-                if message.message == _WM_QUIT:
+                if message.message == WM_QUIT:
                     stop_requested.set()
                     return
 
@@ -386,306 +527,3 @@ class Win32TaskbarWindow:
                 self._user32.DispatchMessageW(ctypes.byref(message))
             if time.monotonic() >= deadline:
                 return
-
-    def close_window(self, handle: int) -> None:
-        """Destroy the label on the same thread that created it."""
-        # IsWindow protects cleanup from a stale handle if Explorer or Windows
-        # already destroyed the native label.
-        if self._user32.IsWindow(handle):
-            # DestroyWindow releases the HWND and sends final destruction
-            # messages. Calling it on the creating thread satisfies Win32 rules.
-            self._user32.DestroyWindow(handle)
-
-    def _register_class(self) -> None:
-        """Teach Windows how to create and repaint this process's label windows."""
-        if self._class_registered:
-            return
-
-        # WNDCLASSEXW describes a reusable window *type*, not an individual
-        # window. CreateWindowExW later instantiates this description.
-        window_class = _WNDCLASSEXW()
-
-        # Windows uses cbSize to determine which version of the structure it
-        # received and which trailing fields are safe to read.
-        window_class.cbSize = ctypes.sizeof(_WNDCLASSEXW)
-
-        # Repaint the full label after either dimension changes.
-        window_class.style = _CS_HREDRAW | _CS_VREDRAW
-
-        # Store the live ctypes callback Windows will invoke for messages.
-        window_class.lpfnWndProc = self._window_proc_callback
-
-        # GetModuleHandleW(None) returns the module of this running executable.
-        module_handle = self._kernel32.GetModuleHandleW(None)
-        window_class.hInstance = module_handle
-
-        # CreateSolidBrush produces the black erasing brush. After layered
-        # transparency is enabled, this same black becomes transparent.
-        background_brush = self._gdi32.CreateSolidBrush(_TRANSPARENT_COLORKEY)
-        window_class.hbrBackground = background_brush
-
-        # This exact name links registration to the later CreateWindowExW call.
-        window_class.lpszClassName = _CLASS_NAME
-
-        # RegisterClassExW copies this description into Windows. It returns a
-        # zero atom on failure, in which case LastError explains why.
-        if not self._user32.RegisterClassExW(ctypes.byref(window_class)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        self._class_registered = True
-
-    def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
-        """Draw current text when requested and let Windows handle other messages."""
-        if message == _WM_PAINT:
-            # PAINTSTRUCT receives bookkeeping that must be passed back to
-            # EndPaint after drawing finishes.
-            paint = _PAINTSTRUCT()
-
-            # BeginPaint validates the dirty region and supplies a device
-            # context—the native drawing surface used by GDI.
-            device_context = self._user32.BeginPaint(hwnd, ctypes.byref(paint))
-
-            # GetClientRect returns the drawable interior using coordinates
-            # relative to the label's own top-left corner.
-            client_rect = wintypes.RECT()
-            self._user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-
-            # Draw only centered text. The black background is removed later by
-            # color-key transparency, allowing the real taskbar to show through.
-            # SetBkMode prevents GDI from drawing an opaque box behind glyphs.
-            self._gdi32.SetBkMode(device_context, _TRANSPARENT)
-
-            # SetTextColor chooses the near-white taskbar foreground color.
-            self._gdi32.SetTextColor(device_context, _TASKBAR_FOREGROUND)
-
-            # GetStockObject obtains Windows' shared default UI font; SelectObject
-            # installs it into this drawing context for the next text operation.
-            default_font = self._gdi32.GetStockObject(_DEFAULT_GUI_FONT)
-            self._gdi32.SelectObject(
-                device_context,
-                default_font,
-            )
-
-            # DrawTextW lays out the complete Python string (-1 means
-            # null-terminated) inside client_rect using the centering flags.
-            self._user32.DrawTextW(
-                device_context,
-                self._window_text,
-                -1,
-                ctypes.byref(client_rect),
-                _DT_CENTER | _DT_VCENTER | _DT_SINGLELINE,
-            )
-
-            # Every successful BeginPaint must be paired with EndPaint so
-            # Windows clears the dirty region and releases the drawing context.
-            self._user32.EndPaint(hwnd, ctypes.byref(paint))
-            return 0
-
-        # DefWindowProcW provides Windows' standard behavior for lifecycle,
-        # sizing, cursor, and every other message ClaudeMonitor does not handle.
-        return self._user32.DefWindowProcW(hwnd, message, wparam, lparam)
-
-    def _configure_functions(self) -> None:
-        """Declare each DLL function's argument and return types for 64-bit safety.
-
-        ``ctypes`` otherwise guesses that values are ordinary C integers, which
-        can truncate 64-bit window handles. This method is verbose but contains
-        no application behavior; it is the type boundary between Python and
-        Windows.
-        """
-        # Locate taskbar windows and read their geometry.
-        # FindWindowW: locate a top-level window by class name/title.
-        self._user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
-        self._user32.FindWindowW.restype = wintypes.HWND
-
-        # FindWindowExW: locate a child window inside a known parent.
-        self._user32.FindWindowExW.argtypes = (
-            wintypes.HWND,
-            wintypes.HWND,
-            wintypes.LPCWSTR,
-            wintypes.LPCWSTR,
-        )
-        self._user32.FindWindowExW.restype = wintypes.HWND
-
-        # GetWindowRect: copy a window's screen bounds into a RECT pointer.
-        self._user32.GetWindowRect.argtypes = (
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.RECT),
-        )
-        self._user32.GetWindowRect.restype = wintypes.BOOL
-
-        # Create, move, show, parent, and enumerate windows.
-        # CreateWindowExW: instantiate the registered class and return its HWND.
-        self._user32.CreateWindowExW.argtypes = (
-            wintypes.DWORD,
-            wintypes.LPCWSTR,
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            wintypes.HWND,
-            wintypes.HMENU,
-            wintypes.HINSTANCE,
-            wintypes.LPVOID,
-        )
-        self._user32.CreateWindowExW.restype = wintypes.HWND
-
-        # SetWindowPos: move/resize/reorder a window according to flag bits.
-        self._user32.SetWindowPos.argtypes = (
-            wintypes.HWND,
-            wintypes.HWND,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            wintypes.UINT,
-        )
-        self._user32.SetWindowPos.restype = wintypes.BOOL
-
-        # ShowWindow: change visibility using a SW_* command integer.
-        self._user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
-        self._user32.ShowWindow.restype = wintypes.BOOL
-
-        # SetParent: attach the label to Explorer and return its previous parent.
-        self._user32.SetParent.argtypes = (wintypes.HWND, wintypes.HWND)
-        self._user32.SetParent.restype = wintypes.HWND
-
-        # GetWindow: traverse parent/child and sibling relationships.
-        self._user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
-        self._user32.GetWindow.restype = wintypes.HWND
-
-        # IsWindowVisible: report whether a sibling participates in display.
-        self._user32.IsWindowVisible.argtypes = (wintypes.HWND,)
-        self._user32.IsWindowVisible.restype = wintypes.BOOL
-
-        # IsWindow: validate that an HWND still identifies a live window.
-        self._user32.IsWindow.argtypes = (wintypes.HWND,)
-        self._user32.IsWindow.restype = wintypes.BOOL
-
-        # DestroyWindow: release a window owned by the current UI thread.
-        self._user32.DestroyWindow.argtypes = (wintypes.HWND,)
-        self._user32.DestroyWindow.restype = wintypes.BOOL
-
-        # Change window styles and configure transparent backgrounds.
-        # SetWindowLongPtrW: replace a pointer-sized style field.
-        self._user32.SetWindowLongPtrW.argtypes = (
-            wintypes.HWND,
-            ctypes.c_int,
-            ctypes.c_ssize_t,
-        )
-        self._user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
-
-        # GetWindowLongPtrW: read a pointer-sized style field.
-        self._user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
-        self._user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
-
-        # SetLayeredWindowAttributes: apply color-key transparency.
-        self._user32.SetLayeredWindowAttributes.argtypes = (
-            wintypes.HWND,
-            wintypes.COLORREF,
-            wintypes.BYTE,
-            wintypes.DWORD,
-        )
-        self._user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
-
-        # Change text and dispatch Windows' message queue.
-        # SetWindowTextW: update the native Unicode title string.
-        self._user32.SetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPCWSTR)
-        self._user32.SetWindowTextW.restype = wintypes.BOOL
-
-        # InvalidateRect: mark part or all of a window as needing repaint.
-        self._user32.InvalidateRect.argtypes = (
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.RECT),
-            wintypes.BOOL,
-        )
-        self._user32.InvalidateRect.restype = wintypes.BOOL
-
-        # PeekMessageW: non-blockingly remove the next queued thread message.
-        self._user32.PeekMessageW.argtypes = (
-            ctypes.POINTER(wintypes.MSG),
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.UINT,
-            wintypes.UINT,
-        )
-        self._user32.PeekMessageW.restype = wintypes.BOOL
-
-        # TranslateMessage: derive character messages from raw keyboard input.
-        self._user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
-        self._user32.TranslateMessage.restype = wintypes.BOOL
-
-        # DispatchMessageW: call the target window's registered procedure.
-        self._user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
-        self._user32.DispatchMessageW.restype = ctypes.c_ssize_t
-
-        # Register the custom class and paint its contents.
-        # RegisterClassExW: register the class description for this process.
-        self._user32.RegisterClassExW.argtypes = (ctypes.POINTER(_WNDCLASSEXW),)
-        self._user32.RegisterClassExW.restype = wintypes.ATOM
-
-        # DefWindowProcW: default handling for messages our callback ignores.
-        self._user32.DefWindowProcW.argtypes = (
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
-        self._user32.DefWindowProcW.restype = ctypes.c_ssize_t
-
-        # BeginPaint: obtain the drawing context for a WM_PAINT operation.
-        self._user32.BeginPaint.argtypes = (
-            wintypes.HWND,
-            ctypes.POINTER(_PAINTSTRUCT),
-        )
-        self._user32.BeginPaint.restype = wintypes.HDC
-
-        # EndPaint: finish drawing and validate the dirty region.
-        self._user32.EndPaint.argtypes = (
-            wintypes.HWND,
-            ctypes.POINTER(_PAINTSTRUCT),
-        )
-        self._user32.EndPaint.restype = wintypes.BOOL
-
-        # GetClientRect: read drawable bounds relative to the window itself.
-        self._user32.GetClientRect.argtypes = (
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.RECT),
-        )
-        self._user32.GetClientRect.restype = wintypes.BOOL
-
-        # DrawTextW: render a Unicode string inside a rectangle.
-        self._user32.DrawTextW.argtypes = (
-            wintypes.HDC,
-            wintypes.LPCWSTR,
-            ctypes.c_int,
-            ctypes.POINTER(wintypes.RECT),
-            wintypes.UINT,
-        )
-        self._user32.DrawTextW.restype = ctypes.c_int
-
-        # Obtain this process's module handle and configure GDI text drawing.
-        # GetModuleHandleW: identify the current executable module when passed None.
-        self._kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
-        self._kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-
-        # CreateSolidBrush: allocate a brush that paints one COLORREF value.
-        self._gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
-        self._gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
-
-        # SetBkMode: choose transparent or opaque text backgrounds.
-        self._gdi32.SetBkMode.argtypes = (wintypes.HDC, ctypes.c_int)
-        self._gdi32.SetBkMode.restype = ctypes.c_int
-
-        # SetTextColor: choose the foreground color for later text drawing.
-        self._gdi32.SetTextColor.argtypes = (wintypes.HDC, wintypes.COLORREF)
-        self._gdi32.SetTextColor.restype = wintypes.COLORREF
-
-        # GetStockObject: retrieve a Windows-owned standard font or brush.
-        self._gdi32.GetStockObject.argtypes = (ctypes.c_int,)
-        self._gdi32.GetStockObject.restype = wintypes.HGDIOBJ
-
-        # SelectObject: install the chosen font into a drawing context.
-        self._gdi32.SelectObject.argtypes = (wintypes.HDC, wintypes.HGDIOBJ)
-        self._gdi32.SelectObject.restype = wintypes.HGDIOBJ

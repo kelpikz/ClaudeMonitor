@@ -4,15 +4,12 @@ import os
 import threading
 import webbrowser
 from pathlib import Path
-from typing import Callable, TYPE_CHECKING
+from typing import Callable
 
 import pystray
 from PIL import Image, ImageDraw
 
 from .models import DisplayState
-
-if TYPE_CHECKING:
-    pass
 
 _COLORS: dict[str, tuple[int, int, int]] = {
     "green": (46, 160, 67),
@@ -35,6 +32,10 @@ _shutdown_requested: threading.Event | None = None
 _log_dir: Path | None = None
 _taskbar_visible: Callable[[], bool] | None = None
 _toggle_taskbar: Callable[[], None] | None = None
+_taskbar_healthy: Callable[[], bool] | None = None
+
+_TASKBAR_MENU_LABEL = "Show taskbar usage"
+_TASKBAR_UNAVAILABLE_MENU_LABEL = "Show taskbar usage (unavailable — see log)"
 
 
 def init(
@@ -43,15 +44,17 @@ def init(
     shutdown_requested: threading.Event | None = None,
     taskbar_visible: Callable[[], bool] | None = None,
     toggle_taskbar: Callable[[], None] | None = None,
+    taskbar_healthy: Callable[[], bool] | None = None,
 ) -> None:
     """Prepare tray dependencies, including the event that ends the poll loop."""
     global _manual_refresh, _shutdown_requested, _log_dir
-    global _taskbar_visible, _toggle_taskbar
+    global _taskbar_visible, _toggle_taskbar, _taskbar_healthy
     _manual_refresh = manual_refresh
     _shutdown_requested = shutdown_requested
     _log_dir = log_dir
     _taskbar_visible = taskbar_visible
     _toggle_taskbar = toggle_taskbar
+    _taskbar_healthy = taskbar_healthy
     _build_icons()
 
 
@@ -96,13 +99,31 @@ def _build_menu(status_label: str) -> pystray.Menu:
         pystray.MenuItem("Refresh now", _on_refresh),
         pystray.MenuItem("Open Anthropic console", _on_open_console),
         pystray.MenuItem("Open log folder", _on_open_log_folder),
-        pystray.MenuItem(
-            "Show taskbar usage",
-            _on_toggle_taskbar,
-            checked=lambda item: bool(_taskbar_visible and _taskbar_visible()),
-        ),
+        _taskbar_menu_item(),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _on_quit),
+    )
+
+
+def _taskbar_is_available() -> bool:
+    """Return whether a native taskbar label is actually being shown."""
+    return _taskbar_healthy is None or _taskbar_healthy()
+
+
+def _taskbar_menu_item() -> pystray.MenuItem:
+    """Build the taskbar toggle, disabled when no label can be displayed.
+
+    Leaving a checked, clickable entry in place while the native window is gone
+    would tell the user the feature is working when it is not.
+    """
+    available = _taskbar_is_available()
+    return pystray.MenuItem(
+        _TASKBAR_MENU_LABEL if available else _TASKBAR_UNAVAILABLE_MENU_LABEL,
+        _on_toggle_taskbar,
+        checked=lambda item: bool(
+            available and _taskbar_visible and _taskbar_visible()
+        ),
+        enabled=available,
     )
 
 
@@ -124,8 +145,7 @@ def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
     """Toggle the companion and refresh the menu checkmark."""
     if _toggle_taskbar is not None:
         _toggle_taskbar()
-    if hasattr(icon, "update_menu"):
-        icon.update_menu()
+    icon.update_menu()
 
 
 def _on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
