@@ -16,9 +16,23 @@ class _FakeIcon:
         self.title = None
         self.menu = None
         self.notifications = []
+        self.menu_updates = 0
 
     def notify(self, message, title=None):
         self.notifications.append((title, message))
+
+    def update_menu(self):
+        self.menu_updates += 1
+
+
+class _QuitIcon:
+    """Records whether the tray Quit action asks pystray to stop."""
+
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
 
 
 class TestTruncateTooltip:
@@ -57,6 +71,7 @@ class TestApplyNeverExceedsTooltipLimit:
             icon_color="grey",
             tooltip="z" * 500,
             menu_status_label="Updated 1s ago",
+            taskbar_text="Claude: unavailable",
         )
         tray.apply(icon, state)
         assert len(icon.title) <= _MAX_TOOLTIP_LEN
@@ -72,3 +87,65 @@ class TestNotify:
         assert icon.notifications == [
             ("Claude usage below 50%", "5h usage has 49% remaining.")
         ]
+
+
+class TestQuit:
+    """Quit must wake the background poll loop before stopping pystray."""
+
+    def test_quit_requests_shutdown_and_wakes_the_waiting_poll_loop(self):
+        manual_refresh = threading.Event()
+        shutdown_requested = threading.Event()
+        tray.init(manual_refresh, Path("."), shutdown_requested)
+        icon = _QuitIcon()
+
+        tray._on_quit(icon, None)
+
+        assert shutdown_requested.is_set()
+        assert manual_refresh.is_set()
+        assert icon.stop_calls == 1
+
+
+class TestTaskbarMenuItem:
+    """The 'Show taskbar usage' entry is the only way to toggle the label, so
+    both the action and its checkmark must reflect the companion's real state."""
+
+    def _menu_item(self, state: DisplayState | None = None):
+        state = state or DisplayState(
+            icon_color="green",
+            tooltip="usage",
+            menu_status_label="Updated 1s ago",
+            taskbar_text="Claude: 80% (3 hours)",
+        )
+        icon = _FakeIcon()
+        tray.apply(icon, state)
+        return next(item for item in icon.menu.items if item.text == "Show taskbar usage")
+
+    def test_menu_offers_the_taskbar_toggle(self):
+        tray.init(threading.Event(), Path("."), taskbar_visible=lambda: True)
+
+        assert self._menu_item() is not None
+
+    def test_checkmark_follows_the_companion_visibility(self):
+        visible = [True]
+        tray.init(threading.Event(), Path("."), taskbar_visible=lambda: visible[0])
+
+        assert self._menu_item().checked is True
+
+        visible[0] = False
+
+        assert self._menu_item().checked is False
+
+    def test_toggle_runs_the_configured_action_and_refreshes_the_menu(self):
+        toggles: list[None] = []
+        tray.init(
+            threading.Event(),
+            Path("."),
+            taskbar_visible=lambda: True,
+            toggle_taskbar=lambda: toggles.append(None),
+        )
+        icon = _FakeIcon()
+
+        tray._on_toggle_taskbar(icon, None)
+
+        assert toggles == [None]
+        assert icon.menu_updates == 1

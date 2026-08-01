@@ -1,0 +1,197 @@
+"""End-to-end coverage for the taskbar label.
+
+Every test here starts at the Anthropic API response and finishes at the exact
+string the native window is asked to paint, so no layer can drift from another.
+"""
+
+from __future__ import annotations
+
+import threading
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
+
+from claudemonitor import fetcher, main, processor
+from claudemonitor.config import Config
+from claudemonitor.models import Rect
+from claudemonitor.taskbar_companion import TaskbarCompanion
+
+
+NOW = datetime(2026, 6, 20, 12, 0, 0, tzinfo=timezone.utc)
+TASKBAR = Rect(left=0, top=1032, right=1920, bottom=1080)
+NOTIFICATION = Rect(left=1542, top=1032, right=1920, bottom=1080)
+
+
+class _RecordingNativeWindow:
+    """Capture the text the Windows layer would paint, without touching Win32."""
+
+    def __init__(self) -> None:
+        self.painted: list[str] = []
+
+    def find_taskbar(self) -> int:
+        return 10
+
+    def find_notification_area(self, taskbar: int) -> int:
+        return 20
+
+    def get_rect(self, handle: int) -> Rect:
+        return TASKBAR if handle == 10 else NOTIFICATION
+
+    def create_window(self, *, text: str) -> int:
+        self.painted.append(text)
+        return 30
+
+    def attach_to_taskbar(self, handle: int, taskbar: int) -> bool:
+        return True
+
+    def list_sibling_rects(self, taskbar: int, exclude_handle: int) -> list[Rect]:
+        return []
+
+    def set_colorkey_transparency(self, handle: int) -> None:
+        pass
+
+    def refresh_theme(self, handle: int) -> None:
+        pass
+
+    def move_window(self, handle: int, rect: Rect, *, topmost: bool) -> None:
+        pass
+
+    def set_text(self, handle: int, text: str) -> None:
+        self.painted.append(text)
+
+    def set_visible(self, handle: int, visible: bool) -> None:
+        pass
+
+    def pump_messages(self, stop_requested: threading.Event, duration_seconds: float) -> None:
+        stop_requested.set()
+
+    def close_window(self, handle: int) -> None:
+        pass
+
+
+class _StubIcon:
+    """Absorb the tray half of the display update so only the taskbar is asserted."""
+
+    def __init__(self) -> None:
+        self.icon = None
+        self.title = None
+        self.menu = None
+
+
+def _respond_with(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> None:
+    """Make fetcher.fetch see one canned Anthropic API response."""
+    monkeypatch.setattr(
+        fetcher,
+        "_read_credentials",
+        lambda: fetcher.Credentials(access_token="token", expires_at=None),
+    )
+    monkeypatch.setattr(httpx, "get", lambda *args, **kwargs: response)
+
+
+def _usage_response(five_hour: dict | None, seven_day: dict | None = None) -> httpx.Response:
+    body: dict[str, object] = {}
+    if five_hour is not None:
+        body["five_hour"] = five_hour
+    if seven_day is not None:
+        body["seven_day"] = seven_day
+    return httpx.Response(200, json=body, request=httpx.Request("GET", "https://example.test"))
+
+
+def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run one full fetch -> process -> display -> native paint cycle."""
+    native = _RecordingNativeWindow()
+    companion = TaskbarCompanion(native=native)
+    data = fetcher.fetch()
+    # Freeze the clock so reset countdowns are deterministic.
+    state = processor.process(data, now=NOW, config=Config())
+
+    monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
+    main._apply_display(_StubIcon(), state, companion)
+
+    companion._run()
+    return native.painted[-1]
+
+
+class TestHappyPath:
+    def test_live_usage_reaches_the_native_label(self, monkeypatch):
+        _respond_with(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 20.0, "resets_at": (NOW + timedelta(hours=3)).isoformat()},
+                {"utilization": 36.0, "resets_at": (NOW + timedelta(days=4)).isoformat()},
+            ),
+        )
+
+        assert _painted_label(monkeypatch) == "Claude: 80% (3 hours)"
+
+    def test_an_unstarted_session_is_labelled_honestly(self, monkeypatch):
+        _respond_with(
+            monkeypatch,
+            _usage_response({"utilization": 0.0, "resets_at": None}),
+        )
+
+        assert _painted_label(monkeypatch) == "Claude: 100% (not started)"
+
+    def test_a_nearly_exhausted_window_reaches_the_native_label(self, monkeypatch):
+        _respond_with(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 99.5, "resets_at": (NOW + timedelta(minutes=12)).isoformat()}
+            ),
+        )
+
+        assert _painted_label(monkeypatch) == "Claude: 0% (12 minutes)"
+
+
+class TestErrorPaths:
+    """Each failure mode must reach the user as its own message, not one blank
+    placeholder that hides why usage stopped updating."""
+
+    def test_expired_token(self, monkeypatch):
+        _respond_with(
+            monkeypatch,
+            httpx.Response(401, request=httpx.Request("GET", "https://example.test")),
+        )
+
+        assert _painted_label(monkeypatch) == "Claude: token expired"
+
+    def test_rate_limited_without_previous_data(self, monkeypatch):
+        _respond_with(
+            monkeypatch,
+            httpx.Response(429, request=httpx.Request("GET", "https://example.test")),
+        )
+
+        assert _painted_label(monkeypatch) == "Claude: rate limited"
+
+    def test_network_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            fetcher,
+            "_read_credentials",
+            lambda: fetcher.Credentials(access_token="token", expires_at=None),
+        )
+
+        def refuse(*args, **kwargs):
+            raise httpx.ConnectError("no route to host")
+
+        monkeypatch.setattr(httpx, "get", refuse)
+
+        assert _painted_label(monkeypatch) == "Claude: offline"
+
+    def test_missing_credentials(self, monkeypatch):
+        def missing():
+            raise FileNotFoundError
+
+        monkeypatch.setattr(fetcher, "_read_credentials", missing)
+
+        assert _painted_label(monkeypatch) == "Claude: not logged in"
+
+    def test_unexpected_response_shape(self, monkeypatch):
+        _respond_with(monkeypatch, _usage_response({"nonsense": True}))
+
+        assert _painted_label(monkeypatch) == "Claude: bad response"
+
+    def test_response_without_usage_windows(self, monkeypatch):
+        _respond_with(monkeypatch, _usage_response(None))
+
+        assert _painted_label(monkeypatch) == "Claude: no data"
