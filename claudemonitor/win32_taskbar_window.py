@@ -32,6 +32,8 @@ from .win32_bindings import (
     CS_VREDRAW,
     DEFAULT_GUI_FONT,
     DIB_RGB_COLORS,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_UNAWARE,
     DT_SINGLELINE,
     DT_VCENTER,
     ERROR_CLASS_ALREADY_EXISTS,
@@ -51,6 +53,8 @@ from .win32_bindings import (
     PM_REMOVE,
     SIZE,
     SPI_GETNONCLIENTMETRICS,
+    SRCCOPY,
+    STRETCH_HALFTONE,
     SW_HIDE,
     SW_SHOWNOACTIVATE,
     SWP_FRAMECHANGED,
@@ -74,6 +78,7 @@ from .win32_bindings import (
     TTS_NOPREFIX,
     TRANSPARENT_BACKGROUND,
     TRANSPARENT_COLORKEY,
+    USER_DEFAULT_SCREEN_DPI,
     USER32_SIGNATURES,
     UXTHEME_SIGNATURES,
     WM_PAINT,
@@ -118,6 +123,73 @@ _TOOLTIP_MAX_WIDTH = 600
 _TOOLTIP_TASKBAR_GAP = 4
 _TOOLTIP_BACKGROUND_COLOR = 0x002B2B2B
 _TOOLTIP_TEXT_COLOR = 0x00F5F5F5
+
+
+def scale_for_dpi(value: int, dpi: int) -> int:
+    """Convert a constant written for 96 DPI into pixels for a display at ``dpi``."""
+    # GetDpiForWindow answers 0 for a handle Windows no longer recognizes, and
+    # a zero scale factor would collapse the label to nothing.
+    if dpi <= 0:
+        return value
+    return round(value * dpi / USER_DEFAULT_SCREEN_DPI)
+
+
+def _user32_for_dpi() -> Any:
+    """Return a user32 handle with the DPI calls' argument types declared.
+
+    This runs before ``Win32TaskbarWindow`` exists, because awareness has to be
+    set before the process creates its first window — so it cannot borrow the
+    adapter's already-prepared DLL. Declaring the signatures matters here more
+    than anywhere else: without them ctypes passes the ``-4`` awareness context
+    as a 32-bit int, and the truncated value silently fails to match any
+    context Windows recognizes.
+    """
+    dll = ctypes.WinDLL("user32", use_last_error=True)
+    apply_signatures(dll, USER32_SIGNATURES)
+    return dll
+
+
+def enable_per_monitor_dpi_awareness(user32: Any | None = None) -> bool:
+    """Adopt the taskbar's DPI awareness, and report whether per-monitor was won.
+
+    Explorer's taskbar is per-monitor aware. While ClaudeMonitor was unaware,
+    Windows virtualized every coordinate crossing between the two, so a slot
+    requested as 180x48 was applied as 144x38 on a 125% display and the label
+    both mis-sized itself and kept its old scale after moving to a second
+    monitor. Must be called before any window is created.
+    """
+    dll = _user32_for_dpi() if user32 is None else user32
+
+    # SetProcessDpiAwarenessContext is Windows 10 1703 and later. It also fails
+    # when awareness was already established, which is not worth dying over in
+    # the first statement of the program.
+    try:
+        if dll.SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ):
+            return True
+    except (AttributeError, OSError) as exc:
+        log.info("per-monitor DPI awareness unavailable (%s); trying system DPI", exc)
+
+    # Older builds offer only one process-wide, system-DPI setting. That still
+    # stops coordinates being virtualized on a single-monitor machine.
+    try:
+        dll.SetProcessDPIAware()
+    except (AttributeError, OSError) as exc:
+        log.warning("unable to declare any DPI awareness (%s)", exc)
+    return False
+
+
+def process_dpi_awareness(user32: Any | None = None) -> int:
+    """Return this process's DPI awareness using the same scale as a window's."""
+    dll = _user32_for_dpi() if user32 is None else user32
+    try:
+        # A thread with no explicit context reports the process default, so the
+        # current thread's context is the process's answer.
+        context = dll.GetThreadDpiAwarenessContext()
+        return dll.GetAwarenessFromDpiAwarenessContext(context)
+    except (AttributeError, OSError):
+        return DPI_AWARENESS_UNAWARE
 
 
 @functools.lru_cache(maxsize=1)
@@ -216,10 +288,18 @@ class Win32TaskbarWindow:
 
         # GDI objects are created once per process and shared by every window
         # this adapter registers, so recreating the label never leaks handles.
-        # A resolved font may legitimately be None (a NULL handle), so the flag
-        # rather than the value records that the lookup already happened.
+        # The font is the exception: it is sized for one display scale, so the
+        # DPI it was built for is remembered and it is rebuilt when the taskbar
+        # moves to a monitor that scales differently. A resolved font may
+        # legitimately be None (a NULL handle), so the recorded DPI rather than
+        # the value marks that the lookup already happened.
         self._font_handle: int | None = None
-        self._font_resolved = False
+        self._font_dpi: int | None = None
+        self._font_is_stock = False
+
+        # The label whose monitor decides the scale for every measurement. It
+        # exists only between create_window and close_window.
+        self._label_handle: int | None = None
         self._background_brush: int | None = None
         self._uses_light_theme = system_uses_light_theme()
         self._foreground_color = foreground_color_for_theme(
@@ -349,6 +429,11 @@ class Win32TaskbarWindow:
         )
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
+
+        # Every later measurement asks this window which display it is on, so
+        # the label follows the taskbar's scaling rather than the primary
+        # monitor's.
+        self._label_handle = handle
         return handle
 
     def close_window(self, handle: int) -> None:
@@ -358,6 +443,12 @@ class Win32TaskbarWindow:
         self._active_tooltip_labels.discard(handle)
         if tooltip_handle is not None and self._user32.IsWindow(tooltip_handle):
             self._user32.DestroyWindow(tooltip_handle)
+
+        # A destroyed window can no longer be asked about its display, so stop
+        # measuring against it; the unscaled default applies until the
+        # controller rebuilds the label.
+        if self._label_handle == handle:
+            self._label_handle = None
 
         # IsWindow protects cleanup from a stale handle if Explorer or Windows
         # already destroyed the native label.
@@ -650,32 +741,103 @@ class Win32TaskbarWindow:
         if tooltip_handle is not None:
             self._configure_tooltip_theme(tooltip_handle)
 
-    def message_font(self) -> int | None:
-        """Return the system UI font, creating it once from the current metrics.
+    def label_dpi(self) -> int:
+        """Return the scaling of the display the label currently sits on.
 
-        The stock GUI font is an 8pt legacy face that matches neither the
-        taskbar's typeface nor the user's display scaling.
+        Asking the window rather than the system is what lets the label follow
+        the taskbar onto a second monitor with different scaling instead of
+        keeping the DPI it happened to be born on.
         """
-        if self._font_resolved:
-            return self._font_handle
-        self._font_resolved = True
+        if self._label_handle is None:
+            return USER_DEFAULT_SCREEN_DPI
+        try:
+            dpi = self._user32.GetDpiForWindow(self._label_handle)
+        except (AttributeError, OSError):
+            return USER_DEFAULT_SCREEN_DPI
+        return dpi or USER_DEFAULT_SCREEN_DPI
 
+    def window_dpi_awareness(self, handle: int) -> int:
+        """Return the DPI awareness Windows records for another window."""
+        try:
+            context = self._user32.GetWindowDpiAwarenessContext(handle)
+            return self._user32.GetAwarenessFromDpiAwarenessContext(context)
+        except (AttributeError, OSError):
+            return DPI_AWARENESS_UNAWARE
+
+    def _read_font_metrics(self, dpi: int) -> NONCLIENTMETRICSW | None:
+        """Read the system UI font metrics as they apply at ``dpi``."""
         metrics = NONCLIENTMETRICSW()
         metrics.cbSize = ctypes.sizeof(NONCLIENTMETRICSW)
-        queried = self._user32.SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            ctypes.sizeof(NONCLIENTMETRICSW),
-            ctypes.byref(metrics),
-            0,
-        )
-        if queried:
-            self._font_handle = self._gdi32.CreateFontIndirectW(
+
+        # SystemParametersInfoForDpi (Windows 10 1607) is the only variant that
+        # answers for a display other than the one Windows considers primary.
+        try:
+            queried = self._user32.SystemParametersInfoForDpi(
+                SPI_GETNONCLIENTMETRICS,
+                ctypes.sizeof(NONCLIENTMETRICSW),
+                ctypes.byref(metrics),
+                0,
+                dpi,
+            )
+        except (AttributeError, OSError):
+            queried = 0
+
+        # It refuses by returning zero rather than raising, and the stock font
+        # is a visibly different typeface, so an unexplained refusal is worth
+        # one more attempt at the system-wide metrics before giving that up.
+        if not queried:
+            queried = self._user32.SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS,
+                ctypes.sizeof(NONCLIENTMETRICSW),
+                ctypes.byref(metrics),
+                0,
+            )
+        return metrics if queried else None
+
+    def message_font(self, dpi: int | None = None) -> int | None:
+        """Return the system UI font sized for the display the label is on.
+
+        The stock GUI font is an 8pt legacy face that matches neither the
+        taskbar's typeface nor the user's display scaling. The font is cached
+        per DPI: reusing one built for a 125% laptop screen on a 100% external
+        monitor is what left the label visibly oversized after docking.
+        """
+        dpi = self.label_dpi() if dpi is None else dpi
+        if self._font_dpi == dpi:
+            return self._font_handle
+
+        metrics = self._read_font_metrics(dpi)
+        if metrics is not None:
+            replacement = self._gdi32.CreateFontIndirectW(
                 ctypes.byref(metrics.lfMessageFont)
             )
+            replacement_is_stock = False
         else:
             log.warning("unable to read system UI font metrics; using the stock font")
-            self._font_handle = self._gdi32.GetStockObject(DEFAULT_GUI_FONT)
+            replacement = self._gdi32.GetStockObject(DEFAULT_GUI_FONT)
+            replacement_is_stock = True
+
+        self._release_font()
+        self._font_handle = replacement
+        self._font_is_stock = replacement_is_stock
+        self._font_dpi = dpi
         return self._font_handle
+
+    def _release_font(self) -> None:
+        """Free the font built for a previous display scale.
+
+        Every rescale creates a new GDI object, and the process is long-lived,
+        so the superseded one has to go back to Windows. A stock object is
+        owned by Windows and is the one kind that must be left alone.
+        """
+        if self._font_handle is None or self._font_dpi is None:
+            return
+        if not self._font_is_stock:
+            try:
+                self._gdi32.DeleteObject(self._font_handle)
+            except (AttributeError, OSError) as exc:
+                log.warning("unable to release the previous label font (%s)", exc)
+        self._font_handle = None
 
     def measure_text_width(self, text: str) -> int:
         """Return the pixel width the message font renders this text at.
@@ -696,13 +858,19 @@ class Win32TaskbarWindow:
 
     def content_width_for(self, text: str) -> int:
         """Return the label width that fits the icon and this text exactly,
-        so short strings never leave dead space before the notification area."""
+        so short strings never leave dead space before the notification area.
+
+        The text is measured with a font Windows already sized for this
+        display, but the insets around it are plain constants and have to be
+        scaled here or they shrink relative to the text as scaling rises.
+        """
+        dpi = self.label_dpi()
         return (
-            _ICON_LEFT_INSET
-            + _ICON_SIZE
-            + _ICON_TEXT_GAP
+            scale_for_dpi(_ICON_LEFT_INSET, dpi)
+            + scale_for_dpi(_ICON_SIZE, dpi)
+            + scale_for_dpi(_ICON_TEXT_GAP, dpi)
             + self.measure_text_width(text)
-            + _ICON_CONTENT_RIGHT_PADDING
+            + scale_for_dpi(_ICON_CONTENT_RIGHT_PADDING, dpi)
         )
 
     def _icon_pixels(self) -> tuple[bytes, BITMAPINFO]:
@@ -713,25 +881,39 @@ class Win32TaskbarWindow:
             self._icon_info = _bitmap_info_for(width=image.width, height=image.height)
         return self._icon_bytes, self._icon_info
 
-    def _draw_icon(self, device_context: int, client_rect: wintypes.RECT) -> None:
-        """Blit the Claude glyph against the label's left edge, vertically centered."""
+    def _draw_icon(
+        self, device_context: int, client_rect: wintypes.RECT, dpi: int
+    ) -> None:
+        """Blit the Claude glyph against the label's left edge, vertically centered.
+
+        The glyph is stretched rather than copied pixel for pixel, because a
+        fixed 16px square shrinks to a speck beside text that Windows has
+        already scaled up for a 125% or 150% display.
+        """
         pixels, bitmap_info = self._icon_pixels()
+        source_size = _load_claude_icon().width
+        drawn_size = scale_for_dpi(_ICON_SIZE, dpi)
         icon_top = client_rect.top + (
-            (client_rect.bottom - client_rect.top - _ICON_SIZE) // 2
+            (client_rect.bottom - client_rect.top - drawn_size) // 2
         )
-        self._gdi32.SetDIBitsToDevice(
+
+        # HALFTONE averages the source pixels instead of dropping them, which
+        # is what keeps the glyph from looking ragged at fractional scales.
+        self._gdi32.SetStretchBltMode(device_context, STRETCH_HALFTONE)
+        self._gdi32.StretchDIBits(
             device_context,
-            client_rect.left + _ICON_LEFT_INSET,
+            client_rect.left + scale_for_dpi(_ICON_LEFT_INSET, dpi),
             icon_top,
-            _ICON_SIZE,
-            _ICON_SIZE,
+            drawn_size,
+            drawn_size,
             0,
             0,
-            0,
-            _ICON_SIZE,
+            source_size,
+            source_size,
             pixels,
             ctypes.byref(bitmap_info),
             DIB_RGB_COLORS,
+            SRCCOPY,
         )
 
     def _paint_label(self, hwnd: int) -> None:
@@ -752,17 +934,22 @@ class Win32TaskbarWindow:
 
             # The black background is removed by color-key transparency,
             # allowing the real taskbar to show through both the icon and text.
+            # One DPI reading drives the whole paint, so the glyph and the text
+            # cannot disagree about the scale midway through drawing.
+            dpi = self.label_dpi()
+
             self._gdi32.SetBkMode(device_context, TRANSPARENT_BACKGROUND)
             self._gdi32.SetTextColor(device_context, self._foreground_color)
-            self._gdi32.SelectObject(device_context, self.message_font())
+            self._gdi32.SelectObject(device_context, self.message_font(dpi))
 
-            self._draw_icon(device_context, client_rect)
+            self._draw_icon(device_context, client_rect, dpi)
 
             # The text starts right after the icon rather than centering across
             # the whole remaining width, which otherwise reads as a large gap
             # between the glyph and short strings like "100% (not started)".
             text_rect = wintypes.RECT(
-                client_rect.left + _ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP,
+                client_rect.left
+                + scale_for_dpi(_ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP, dpi),
                 client_rect.top,
                 client_rect.right,
                 client_rect.bottom,

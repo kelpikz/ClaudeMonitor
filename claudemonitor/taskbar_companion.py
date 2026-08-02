@@ -21,9 +21,9 @@ from .processor import LOADING_TASKBAR_TEXT
 log = logging.getLogger(__name__)
 
 # Fallback minimum width for companion_slot() callers that do not size the
-# label to measured content. ClaudeMonitor does not declare DPI awareness, so
-# Windows virtualizes every coordinate this module sees to 96 DPI: a constant
-# in that space is correct at any display scaling.
+# label to measured content. The application always passes its measured width,
+# which the native adapter has already scaled to the taskbar's display, so this
+# is a floor for tests and future callers rather than a production constant.
 _MIN_COMPANION_WIDTH = 60
 
 # While visible, re-check taskbar geometry once per second so the label follows

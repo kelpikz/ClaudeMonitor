@@ -17,6 +17,7 @@ from . import fetcher, processor, tray
 from .config import load_config, save_taskbar_enabled
 from .notifications import ThresholdNotifier
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
+from .win32_taskbar_window import enable_per_monitor_dpi_awareness
 
 _ERROR_ALREADY_EXISTS = 183
 log = logging.getLogger(__name__)
@@ -172,6 +173,11 @@ def _setup_logging(log_dir: Path) -> None:
 
 
 def main() -> None:
+    # Must precede every window this process creates, including pystray's, or
+    # Windows fixes the awareness at "unaware" and virtualizes the coordinates
+    # the taskbar label exchanges with Explorer.
+    enable_per_monitor_dpi_awareness()
+
     log_dir = Path(os.environ["APPDATA"]) / "claudemonitor"
     _setup_logging(log_dir)
 

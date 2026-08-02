@@ -94,10 +94,21 @@ ERROR_CLASS_ALREADY_EXISTS = 1410  # A second instance registered the class firs
 # Font metrics.
 SPI_GETNONCLIENTMETRICS = 0x0029  # Ask Windows for the current UI font metrics.
 
+# Display scaling. Explorer's taskbar is per-monitor DPI aware, so a process
+# that is not has every coordinate it exchanges with the taskbar virtualized:
+# a child asked to occupy 180x48 arrives as 144x38 on a 125% display. Declaring
+# the same awareness makes both sides speak in the same physical pixels.
+USER_DEFAULT_SCREEN_DPI = 96  # The scale every design constant here is written for.
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4  # Per-window DPI, updated live.
+DPI_AWARENESS_UNAWARE = 0  # Coordinates are virtualized to 96 DPI.
+DPI_AWARENESS_PER_MONITOR_AWARE = 2  # What Shell_TrayWnd itself reports.
+
 # Blitting the small Claude glyph beside the usage text as an uncompressed,
 # top-down 24bpp bitmap.
 BI_RGB = 0  # Uncompressed pixel data; no compression bookkeeping needed.
 DIB_RGB_COLORS = 0  # The DIB's color table holds literal RGB values (unused at 24bpp).
+SRCCOPY = 0x00CC0020  # Replace the destination pixels outright when stretching.
+STRETCH_HALFTONE = 4  # Average source pixels when rescaling, rather than dropping them.
 
 
 def _int_resource(identifier: int) -> wintypes.LPCWSTR:
@@ -263,6 +274,10 @@ class NONCLIENTMETRICSW(ctypes.Structure):
         ("lfMenuFont", LOGFONTW),
         ("lfStatusFont", LOGFONTW),
         ("lfMessageFont", LOGFONTW),  # The font Windows uses for ordinary UI text.
+        # Added in Windows Vista. SystemParametersInfoW still accepts the older
+        # layout without it, but SystemParametersInfoForDpi rejects the short
+        # structure outright with ERROR_INVALID_PARAMETER.
+        ("iPaddedBorderWidth", ctypes.c_int),
     ]
 
 
@@ -371,6 +386,21 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
         (wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT),
         wintypes.BOOL,
     ),
+    # Follow the scaling of whichever display the taskbar currently occupies.
+    # These arrived in Windows 10; apply_signatures tolerates their absence.
+    "GetDpiForWindow": ((wintypes.HWND,), wintypes.UINT),
+    # The DPI_AWARENESS_CONTEXT values are small negative pseudo-handles, not
+    # real pointers. Declaring a pointer-sized *signed* integer is what sign
+    # extends -4 into the 0xFFFF...FFFC Windows actually compares against; as a
+    # plain HANDLE, ctypes passes a value the call rejects.
+    "SetProcessDpiAwarenessContext": ((ctypes.c_ssize_t,), wintypes.BOOL),
+    "GetWindowDpiAwarenessContext": ((wintypes.HWND,), wintypes.HANDLE),
+    "GetThreadDpiAwarenessContext": ((), wintypes.HANDLE),
+    "GetAwarenessFromDpiAwarenessContext": ((wintypes.HANDLE,), ctypes.c_int),
+    "SystemParametersInfoForDpi": (
+        (wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT, wintypes.UINT),
+        wintypes.BOOL,
+    ),
 }
 
 GDI32_SIGNATURES: dict[str, tuple[tuple, object]] = {
@@ -404,6 +434,29 @@ GDI32_SIGNATURES: dict[str, tuple[tuple, object]] = {
         ),
         ctypes.c_int,
     ),
+    # Drawing the glyph at a scaled size needs the stretching variant, because
+    # SetDIBitsToDevice copies pixels one for one and cannot resize.
+    "StretchDIBits": (
+        (
+            wintypes.HDC,
+            ctypes.c_int,  # xDest
+            ctypes.c_int,  # yDest
+            ctypes.c_int,  # DestWidth
+            ctypes.c_int,  # DestHeight
+            ctypes.c_int,  # xSrc
+            ctypes.c_int,  # ySrc
+            ctypes.c_int,  # SrcWidth
+            ctypes.c_int,  # SrcHeight
+            ctypes.c_void_p,  # lpBits
+            ctypes.POINTER(BITMAPINFO),  # lpbmi
+            wintypes.UINT,  # iUsage
+            wintypes.DWORD,  # rop
+        ),
+        ctypes.c_int,
+    ),
+    "SetStretchBltMode": ((wintypes.HDC, ctypes.c_int), ctypes.c_int),
+    # Releasing a font that a display-scaling change has replaced.
+    "DeleteObject": ((wintypes.HGDIOBJ,), wintypes.BOOL),
 }
 
 COMCTL32_SIGNATURES: dict[str, tuple[tuple, object]] = {

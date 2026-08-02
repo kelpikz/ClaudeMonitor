@@ -663,7 +663,9 @@ class TestPainting:
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
-        assert gdi32.named("SetDIBitsToDevice")
+        # StretchDIBits rather than SetDIBitsToDevice: the glyph has to be
+        # resized to match a scaled display, which a one-for-one copy cannot do.
+        assert gdi32.named("StretchDIBits")
         assert user32.named("DrawTextW")
 
     def test_the_text_rect_leaves_room_for_the_icon_on_the_left(self):
@@ -789,6 +791,9 @@ class TestFont:
 
     def test_a_failed_metrics_query_falls_back_to_the_stock_ui_font(self):
         user32 = _FakeUser32()
+        # Both the per-DPI query and the legacy one have to fail before the
+        # stock font is the only option left.
+        user32.results["SystemParametersInfoForDpi"] = 0
         user32.results["SystemParametersInfoW"] = 0
         gdi32 = _FakeDll()
         gdi32.results["GetStockObject"] = 66

@@ -24,10 +24,29 @@ from claudemonitor.models import Rect
 from claudemonitor.taskbar_companion import companion_slot
 from claudemonitor.win32_bindings import (
     IDC_ARROW,
+    NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS,
+    USER_DEFAULT_SCREEN_DPI,
     USER32_SIGNATURES,
     apply_signatures,
 )
-from claudemonitor.win32_taskbar_window import Win32TaskbarWindow
+from claudemonitor.win32_taskbar_window import (
+    Win32TaskbarWindow,
+    enable_per_monitor_dpi_awareness,
+    process_dpi_awareness,
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def per_monitor_dpi_awareness() -> None:
+    """Run every live test in the DPI mode the real application starts in.
+
+    Without this the whole module measures the taskbar through Windows' DPI
+    virtualization layer, which is the identity transform at 100% scaling and
+    therefore hides placement bugs on exactly the scaled laptop displays where
+    they occur.
+    """
+    enable_per_monitor_dpi_awareness()
 
 
 @pytest.fixture
@@ -72,6 +91,46 @@ class TestRealWindowLifecycle:
         handle = native.create_window(text="Claude: loading...")
         native.close_window(handle)
         native.close_window(handle)
+
+
+class TestLiveDpiAwareness:
+    """Coordinates only survive the trip into Explorer if both sides agree on DPI."""
+
+    def test_the_process_matches_the_taskbars_per_monitor_awareness(self, native):
+        """A mismatch silently mis-sizes the label on any scaled display.
+
+        Explorer's taskbar is per-monitor aware. While ClaudeMonitor was DPI
+        unaware, a child placed inside it came back scaled by 1/display-scale —
+        180x48 became 144x38 at 125%. At 100% the factor is 1.0, so asserting
+        the awareness itself is the only check that fails on every machine
+        rather than only on a scaled one.
+        """
+        taskbar = native.find_taskbar()
+
+        assert process_dpi_awareness() == native.window_dpi_awareness(taskbar)
+
+    def test_windows_accepts_our_metrics_struct_for_a_per_dpi_font_query(self, native):
+        """A struct Windows rejects would silently downgrade the label's font.
+
+        SystemParametersInfoForDpi validates the size of the structure it is
+        handed and answers a plain zero when it disagrees — no exception, no
+        error to notice. The legacy SystemParametersInfoW still accepts the
+        pre-Vista layout for compatibility, so only calling the per-DPI variant
+        for real proves NONCLIENTMETRICSW matches this Windows build.
+        """
+        metrics = NONCLIENTMETRICSW()
+        metrics.cbSize = ctypes.sizeof(NONCLIENTMETRICSW)
+
+        accepted = native._user32.SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS,
+            ctypes.sizeof(NONCLIENTMETRICSW),
+            ctypes.byref(metrics),
+            0,
+            USER_DEFAULT_SCREEN_DPI,
+        )
+
+        assert accepted
+        assert metrics.lfMessageFont.lfFaceName
 
 
 class TestLivePlacement:
