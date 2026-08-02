@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Callable
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image
 
+from .icon_art import tile_icon
 from .models import DisplayState
 
 _COLORS: dict[str, tuple[int, int, int]] = {
@@ -65,12 +66,9 @@ def loading_icon() -> Image.Image:
 
 
 def _build_icons() -> None:
+    """Render one status tile per color, once, so each poll only swaps images."""
     for name, fill in _COLORS.items():
-        border = tuple(int(c * 0.7) for c in fill)
-        img = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.ellipse([1, 1, 14, 14], fill=fill, outline=border)
-        _icons[name] = img
+        _icons[name] = tile_icon(fill)
 
 
 def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
