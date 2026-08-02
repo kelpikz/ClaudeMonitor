@@ -98,17 +98,17 @@ class TestProcessHappyPath:
             )
         )
 
-        assert process(data, NOW, Config()).taskbar_text == "Claude: 80% (3 hours)"
+        assert process(data, NOW, Config()).taskbar_text == "80% (3h 0m)"
 
-    def test_taskbar_text_uses_singular_hour(self):
+    def test_taskbar_text_shows_minutes_alongside_hours(self):
         data = make_data(
             five_hour=UsageWindow(
                 utilization=20.0,
-                resets_at=NOW + timedelta(hours=1),
+                resets_at=NOW + timedelta(hours=3, minutes=45),
             )
         )
 
-        assert process(data, NOW, Config()).taskbar_text == "Claude: 80% (1 hour)"
+        assert process(data, NOW, Config()).taskbar_text == "80% (3h 45m)"
 
     def test_tooltip_has_full_three_line_body_plus_timestamp(self):
         # Verifies the exact assembled tooltip: header, 5h line, week line,
@@ -660,7 +660,7 @@ class TestTaskbarText:
             self._taskbar_text(
                 five_hour=UsageWindow(utilization=0.4, resets_at=NOW + timedelta(hours=2))
             )
-            == "Claude: 99% (2 hours)"
+            == "99% (2h 0m)"
         )
 
     def test_reset_under_one_minute_avoids_a_zero_minute_countdown(self):
@@ -668,7 +668,7 @@ class TestTaskbarText:
             self._taskbar_text(
                 five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(seconds=30))
             )
-            == "Claude: 80% (under a minute)"
+            == "80% (under a minute)"
         )
 
     def test_reset_within_the_hour_is_shown_in_minutes(self):
@@ -676,7 +676,7 @@ class TestTaskbarText:
             self._taskbar_text(
                 five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(minutes=1))
             )
-            == "Claude: 80% (1 minute)"
+            == "80% (1m)"
         )
 
     def test_unstarted_window_matches_the_tooltip_definition(self):
@@ -684,7 +684,7 @@ class TestTaskbarText:
         # taskbar must use the same rule the tooltip does.
         assert (
             self._taskbar_text(five_hour=UsageWindow(utilization=0.0, resets_at=None))
-            == "Claude: 100% (not started)"
+            == "100% (not started)"
         )
 
     def test_used_window_without_a_reset_time_is_not_called_unstarted(self):
@@ -692,29 +692,29 @@ class TestTaskbarText:
         # rather than claiming the session never started.
         assert (
             self._taskbar_text(five_hour=UsageWindow(utilization=40.0, resets_at=None))
-            == "Claude: 60% (unknown)"
+            == "60% (unknown)"
         )
 
     @pytest.mark.parametrize(
         ("error", "expected"),
         [
-            ("token_expired", "Claude: token expired"),
-            ("timeout", "Claude: offline"),
-            ("offline", "Claude: offline"),
-            ("no_credentials", "Claude: not logged in"),
-            ("bad_response", "Claude: bad response"),
-            ("rate_limited", "Claude: rate limited"),
-            ("boom", "Claude: unavailable"),
+            ("token_expired", "token expired"),
+            ("timeout", "offline"),
+            ("offline", "offline"),
+            ("no_credentials", "not logged in"),
+            ("bad_response", "bad response"),
+            ("rate_limited", "rate limited"),
+            ("boom", "unavailable"),
         ],
     )
     def test_each_fetch_error_gets_its_own_short_label(self, error, expected):
         assert self._taskbar_text(fetch_error=error) == expected
 
     def test_missing_usage_data_is_reported_as_no_data(self):
-        assert self._taskbar_text(five_hour=None) == "Claude: no data"
+        assert self._taskbar_text(five_hour=None) == "no data"
 
     def test_internal_error_state_reports_an_error_label(self):
-        assert internal_error_state(NOW).taskbar_text == "Claude: error"
+        assert internal_error_state(NOW).taskbar_text == "error"
 
     def test_rate_limited_fallback_keeps_showing_the_last_good_usage(self):
         last_good = make_data(
@@ -725,4 +725,4 @@ class TestTaskbarText:
 
         state = process(data, NOW, Config(), last_good=last_good)
 
-        assert state.taskbar_text == "Claude: 75% (2 hours)"
+        assert state.taskbar_text == "75% (2h 0m)"

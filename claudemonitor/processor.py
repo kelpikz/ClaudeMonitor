@@ -8,19 +8,21 @@ from .models import AnthropicUsageData, DisplayState, UsageWindow
 
 # Every taskbar string lives here so the label, the tooltip, and the menu can
 # never drift apart. The companion shows this until the first fetch completes.
-LOADING_TASKBAR_TEXT = "Claude: loading..."
+# The native label draws the Claude glyph itself, so these strings no longer
+# spell out "Claude" — see win32_taskbar_window._draw_icon.
+LOADING_TASKBAR_TEXT = "loading..."
 
 _TASKBAR_ERROR_TEXTS = {
-    "token_expired": "Claude: token expired",
-    "timeout": "Claude: offline",
-    "offline": "Claude: offline",
-    "no_credentials": "Claude: not logged in",
-    "bad_response": "Claude: bad response",
-    "rate_limited": "Claude: rate limited",
+    "token_expired": "token expired",
+    "timeout": "offline",
+    "offline": "offline",
+    "no_credentials": "not logged in",
+    "bad_response": "bad response",
+    "rate_limited": "rate limited",
 }
-_TASKBAR_UNKNOWN_ERROR_TEXT = "Claude: unavailable"
-_TASKBAR_NO_DATA_TEXT = "Claude: no data"
-_TASKBAR_INTERNAL_ERROR_TEXT = "Claude: error"
+_TASKBAR_UNKNOWN_ERROR_TEXT = "unavailable"
+_TASKBAR_NO_DATA_TEXT = "no data"
+_TASKBAR_INTERNAL_ERROR_TEXT = "error"
 
 
 def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
@@ -39,24 +41,19 @@ def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
     return f"{seconds}s"
 
 
-def _plural(count: int, unit: str) -> str:
-    """Render a whole-number quantity with a correctly pluralized unit."""
-    return f"{count} {unit if count == 1 else unit + 's'}"
-
-
 def _taskbar_reset_text(resets_at: datetime | None, now: datetime) -> str:
-    """Describe how long until a usage window resets, in one coarse unit."""
+    """Describe how long until a usage window resets, as hours and minutes."""
     if resets_at is None:
         # Matches the tooltip's "resets in unknown" for the same missing value.
         return "unknown"
     seconds = max(0, int((resets_at - now).total_seconds()))
-    hours = seconds // 3600
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
     if hours:
-        return _plural(hours, "hour")
-    minutes = seconds // 60
+        return f"{hours}h {minutes}m"
     if minutes:
-        return _plural(minutes, "minute")
-    # A "0 minutes" countdown reads as broken rather than nearly finished.
+        return f"{minutes}m"
+    # A "0m" countdown reads as broken rather than nearly finished.
     return "under a minute"
 
 
@@ -64,11 +61,11 @@ def _taskbar_text(window: UsageWindow, now: datetime) -> str:
     """Format remaining five-hour usage and its reset countdown compactly."""
     if _window_not_started(window):
         # Same rule the tooltip uses, so the two surfaces cannot disagree.
-        return "Claude: 100% (not started)"
+        return "100% (not started)"
 
     # Floor rather than round, so "100%" only ever means a truly untouched window.
     remaining_usage = math.floor(max(0.0, min(100.0, 100.0 - window.utilization)))
-    return f"Claude: {remaining_usage}% ({_taskbar_reset_text(window.resets_at, now)})"
+    return f"{remaining_usage}% ({_taskbar_reset_text(window.resets_at, now)})"
 
 
 def _taskbar_error_text(error: str | None) -> str:

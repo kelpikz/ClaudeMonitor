@@ -5,16 +5,27 @@ import threading
 from ctypes import wintypes
 
 import pytest
+from PIL import Image
 
 from claudemonitor.models import Rect
 from claudemonitor import win32_bindings
 from claudemonitor.win32_bindings import (
+    BI_RGB,
+    COMCTL32_SIGNATURES,
     DARK_THEME_FOREGROUND,
     ERROR_CLASS_ALREADY_EXISTS,
     GDI32_SIGNATURES,
     KERNEL32_SIGNATURES,
     LIGHT_THEME_FOREGROUND,
     USER32_SIGNATURES,
+    TTM_ADDTOOLW,
+    TTM_SETMAXTIPWIDTH,
+    TTM_SETTIPBKCOLOR,
+    TTM_SETTIPTEXTCOLOR,
+    TTM_TRACKACTIVATE,
+    TTM_TRACKPOSITION,
+    TTM_UPDATETIPTEXTW,
+    UXTHEME_SIGNATURES,
     WM_PAINT,
     WM_QUIT,
     WM_SETTINGCHANGE,
@@ -25,7 +36,17 @@ from claudemonitor.win32_bindings import (
     foreground_color_for_theme,
 )
 from claudemonitor import win32_taskbar_window
-from claudemonitor.win32_taskbar_window import Win32TaskbarWindow
+from claudemonitor.win32_taskbar_window import (
+    Win32TaskbarWindow,
+    _bitmap_info_for,
+    _ICON_CONTENT_RIGHT_PADDING,
+    _ICON_LEFT_INSET,
+    _ICON_SIZE,
+    _ICON_TEXT_GAP,
+    _icon_bgr_bytes,
+    _load_claude_icon,
+    _initialize_tooltip_controls,
+)
 
 
 # Windows' SWP_SHOWWINDOW bit. Repositioning must not pass it because that would
@@ -139,11 +160,17 @@ class _FakeUser32(_FakeDll):
         return 1
 
 
-def _window(*, user32: _FakeUser32 | None = None, gdi32: _FakeDll | None = None):
+def _window(
+    *,
+    user32: _FakeUser32 | None = None,
+    gdi32: _FakeDll | None = None,
+    uxtheme: _FakeDll | None = None,
+):
     """Build a Win32TaskbarWindow whose DLLs are replaced by recording fakes."""
     native = Win32TaskbarWindow()
     native._user32 = user32 or _FakeUser32()
     native._gdi32 = gdi32 or _FakeDll()
+    native._uxtheme = uxtheme or _FakeDll()
     return native
 
 
@@ -172,6 +199,8 @@ class TestSignatureTable:
             (native._user32, USER32_SIGNATURES),
             (native._gdi32, GDI32_SIGNATURES),
             (native._kernel32, KERNEL32_SIGNATURES),
+            (native._comctl32, COMCTL32_SIGNATURES),
+            (native._uxtheme, UXTHEME_SIGNATURES),
         )
 
         for dll, signatures in tables:
@@ -325,6 +354,208 @@ class TestWindowLifecycle:
         assert not user32.was_called("DestroyWindow")
 
 
+class TestTooltip:
+    """Hovering the taskbar label exposes the same detail as the tray icon."""
+
+    def test_common_controls_are_initialized_for_the_tooltip_window_class(self):
+        comctl32 = _FakeDll()
+
+        _initialize_tooltip_controls(comctl32)
+
+        initialized = comctl32.named("InitCommonControlsEx")
+        assert initialized
+        assert initialized[0][1]._obj.dwSize > 0
+        assert initialized[0][1]._obj.dwICC != 0
+
+    def test_failed_common_control_initialization_is_reported(self):
+        comctl32 = _FakeDll()
+        comctl32.results["InitCommonControlsEx"] = 0
+
+        with pytest.raises(OSError):
+            _initialize_tooltip_controls(comctl32)
+
+    def test_cursor_inside_the_label_rectangle_opens_its_tooltip(self):
+        user32 = _FakeUser32()
+        user32.windows[30] = (Rect(100, 200, 300, 240), True)
+
+        def point_inside(point_pointer):
+            point_pointer._obj.x = 150
+            point_pointer._obj.y = 220
+            return 1
+
+        user32.results["GetCursorPos"] = point_inside
+        user32.windows[41] = (Rect(0, 0, 180, 70), True)
+        native = _window(user32=user32)
+        native._tooltip_handles[30] = 41
+
+        native._poll_tooltip_hover()
+
+        assert any(
+            call[1:3] == (41, TTM_TRACKPOSITION)
+            for call in user32.named("SendMessageW")
+        )
+        assert any(
+            call[1:4] == (41, TTM_TRACKACTIVATE, True)
+            for call in user32.named("SendMessageW")
+        )
+        tooltip_position = user32.named("SetWindowPos")[-1]
+        assert tooltip_position[1:7] == (41, -1, 110, 126, 0, 0)
+        assert tooltip_position[7] & win32_bindings.SWP_NOSIZE
+        assert tooltip_position[7] & win32_bindings.SWP_NOACTIVATE
+        assert 30 in native._active_tooltip_labels
+
+    def test_cursor_polling_does_not_reopen_and_flicker_an_active_tooltip(self):
+        user32 = _FakeUser32()
+        user32.windows[30] = (Rect(100, 200, 300, 240), True)
+
+        def point_inside(point_pointer):
+            point_pointer._obj.x = 150
+            point_pointer._obj.y = 220
+            return 1
+
+        user32.results["GetCursorPos"] = point_inside
+        user32.windows[41] = (Rect(0, 0, 180, 70), True)
+        native = _window(user32=user32)
+        native._tooltip_handles[30] = 41
+
+        native._poll_tooltip_hover()
+        native._poll_tooltip_hover()
+
+        popup_calls = [
+            call
+            for call in user32.named("SendMessageW")
+            if call[2] == TTM_TRACKACTIVATE and call[3] is True
+        ]
+        assert len(popup_calls) == 1
+
+    def test_cursor_leaving_the_label_rectangle_closes_its_tooltip(self):
+        user32 = _FakeUser32()
+        user32.windows[30] = (Rect(100, 200, 300, 240), True)
+        pointer = [150, 220]
+
+        def fill_point(point_pointer):
+            point_pointer._obj.x, point_pointer._obj.y = pointer
+            return 1
+
+        user32.results["GetCursorPos"] = fill_point
+        native = _window(user32=user32)
+        native._tooltip_handles[30] = 41
+        native._poll_tooltip_hover()
+
+        pointer[:] = [50, 50]
+        native._poll_tooltip_hover()
+
+        assert any(
+            call[1:4] == (41, TTM_TRACKACTIVATE, False)
+            for call in user32.named("SendMessageW")
+        )
+        assert 30 not in native._active_tooltip_labels
+
+    def test_setting_a_tooltip_attaches_a_multiline_native_tooltip_to_the_label(self):
+        user32 = _FakeUser32()
+        uxtheme = _FakeDll()
+        uxtheme.results["SetWindowTheme"] = 0
+        native = _window(user32=user32, uxtheme=uxtheme)
+        native._uses_light_theme = False
+        detail = "Claude usage\n5h: 89% left · resets in 1h 28m\nWeek: 85% left"
+
+        native.set_tooltip(30, detail)
+
+        created = user32.named("CreateWindowExW")
+        assert any(call[2] == "tooltips_class32" for call in created)
+        assert any(call[2] == TTM_SETMAXTIPWIDTH for call in user32.named("SendMessageW"))
+        assert any(call[2] == TTM_ADDTOOLW for call in user32.named("SendMessageW"))
+        assert uxtheme.named("SetWindowTheme") == [
+            ("SetWindowTheme", 1, "DarkMode_Explorer", None)
+        ]
+        assert not any(
+            call[2] in (TTM_SETTIPBKCOLOR, TTM_SETTIPTEXTCOLOR)
+            for call in user32.named("SendMessageW")
+        )
+        assert native._tooltip_buffers[30].value == detail
+
+    def test_light_taskbar_uses_windows_explorer_tooltip_theme(self):
+        user32 = _FakeUser32()
+        uxtheme = _FakeDll()
+        uxtheme.results["SetWindowTheme"] = 0
+        native = _window(user32=user32, uxtheme=uxtheme)
+        native._uses_light_theme = True
+
+        native.set_tooltip(30, "detail")
+
+        assert uxtheme.named("SetWindowTheme") == [
+            ("SetWindowTheme", 1, "Explorer", None)
+        ]
+
+    def test_dark_color_fallback_is_used_when_explorer_theme_is_unavailable(self):
+        user32 = _FakeUser32()
+        uxtheme = _FakeDll()
+        uxtheme.results["SetWindowTheme"] = 1
+        native = _window(user32=user32, uxtheme=uxtheme)
+        native._uses_light_theme = False
+
+        native.set_tooltip(30, "detail")
+
+        assert uxtheme.named("SetWindowTheme") == [
+            ("SetWindowTheme", 1, "DarkMode_Explorer", None),
+            ("SetWindowTheme", 1, "", ""),
+        ]
+        assert any(call[2] == TTM_SETTIPBKCOLOR for call in user32.named("SendMessageW"))
+        assert any(call[2] == TTM_SETTIPTEXTCOLOR for call in user32.named("SendMessageW"))
+
+    def test_updating_tooltip_text_reuses_the_existing_native_control(self):
+        user32 = _FakeUser32()
+        native = _window(user32=user32)
+        native.set_tooltip(30, "old detail")
+
+        native.set_tooltip(30, "new detail")
+
+        created_classes = [call[2] for call in user32.named("CreateWindowExW")]
+        assert created_classes.count("tooltips_class32") == 1
+        assert any(call[2] == TTM_UPDATETIPTEXTW for call in user32.named("SendMessageW"))
+        assert native._tooltip_buffers[30].value == "new detail"
+
+    def test_visible_tooltip_text_updates_without_reopening_the_popup(self):
+        user32 = _FakeUser32()
+        native = _window(user32=user32)
+        native.set_tooltip(30, "Updated (1 second ago)")
+        native._active_tooltip_labels.add(30)
+
+        native.set_tooltip(30, "Updated (2 seconds ago)")
+
+        updates = [
+            call
+            for call in user32.named("SendMessageW")
+            if call[2] == TTM_UPDATETIPTEXTW
+        ]
+        redraws = [
+            call
+            for call in user32.named("SendMessageW")
+            if call[2] == win32_bindings.WM_USER + 29
+        ]
+        assert len(updates) == 1
+        assert len(redraws) == 1
+        assert native._tooltip_buffers[30].value == "Updated (2 seconds ago)"
+        assert not any(
+            call[2] == TTM_TRACKACTIVATE
+            for call in user32.named("SendMessageW")
+        )
+
+    def test_closing_the_label_also_destroys_its_tooltip_control(self):
+        user32 = _FakeUser32()
+        user32.results["CreateWindowExW"] = 41
+        native = _window(user32=user32)
+        native.set_tooltip(30, "detail")
+
+        native.close_window(30)
+
+        destroyed = user32.named("DestroyWindow")
+        assert destroyed[:2] == [
+            ("DestroyWindow", 41),
+            ("DestroyWindow", 30),
+        ]
+
+
 class TestStyleWrites:
     def test_layered_transparency_preserves_existing_extended_styles(self):
         user32 = _FakeUser32()
@@ -418,12 +649,31 @@ class TestPainting:
     def test_current_text_is_drawn_on_every_paint_request(self):
         user32 = _FakeUser32()
         native = _window(user32=user32)
-        native._window_text = "Claude: 80% (3 hours)"
+        native._window_text = "80% (3h 0m)"
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
         drawn = user32.named("DrawTextW")
-        assert drawn and drawn[0][2] == "Claude: 80% (3 hours)"
+        assert drawn and drawn[0][2] == "80% (3h 0m)"
+
+    def test_the_claude_icon_is_blitted_during_paint(self):
+        user32 = _FakeUser32()
+        gdi32 = _FakeDll()
+        native = _window(user32=user32, gdi32=gdi32)
+
+        native._window_proc(30, WM_PAINT, 0, 0)
+
+        assert gdi32.named("SetDIBitsToDevice")
+        assert user32.named("DrawTextW")
+
+    def test_the_text_rect_leaves_room_for_the_icon_on_the_left(self):
+        user32 = _FakeUser32()
+        native = _window(user32=user32)
+
+        native._window_proc(30, WM_PAINT, 0, 0)
+
+        drawn_rect = user32.named("DrawTextW")[0][4]._obj
+        assert drawn_rect.left > 0
 
     def test_painting_always_pairs_begin_and_end(self):
         user32 = _FakeUser32()
@@ -441,6 +691,93 @@ class TestPainting:
 
         assert result == 7
         assert ("DefWindowProcW", 30, unhandled_message, 1, 2) in user32.calls
+
+
+class TestClaudeIconAsset:
+    """Pure image-preparation helpers, testable without touching Windows."""
+
+    def test_the_bundled_icon_loads_as_a_small_rgba_image(self):
+        image = _load_claude_icon()
+
+        assert image.mode == "RGBA"
+        assert image.size == (16, 16)
+
+    def test_loading_is_cached_rather_than_re_reading_the_file(self):
+        assert _load_claude_icon() is _load_claude_icon()
+
+    def test_an_opaque_pixel_is_packed_as_bgr(self):
+        # A single opaque red pixel must come out blue=0, green=0, red=255 —
+        # the byte order SetDIBitsToDevice expects, not PIL's native RGB order.
+        # The lone 3-byte pixel is itself padded to a 4-byte row boundary.
+        image = Image.new("RGBA", (1, 1), (255, 0, 0, 255))
+
+        assert _icon_bgr_bytes(image) == bytes([0, 0, 255, 0])
+
+    def test_a_transparent_pixel_composites_to_black_so_colorkey_hides_it(self):
+        image = Image.new("RGBA", (1, 1), (255, 0, 0, 0))
+
+        assert _icon_bgr_bytes(image) == bytes([0, 0, 0, 0])
+
+    def test_rows_are_padded_to_a_four_byte_boundary(self):
+        # Two 3-byte BGR pixels make a 6-byte row; DIB rows must land on a
+        # 4-byte boundary, so Windows expects this padded to 8 bytes.
+        image = Image.new("RGBA", (2, 1), (0, 255, 0, 255))
+
+        assert len(_icon_bgr_bytes(image)) == 8
+
+    def test_bitmap_info_describes_a_top_down_24bpp_dib(self):
+        info = _bitmap_info_for(width=16, height=16)
+
+        assert info.bmiHeader.biWidth == 16
+        # Negative height marks the DIB top-down, matching row 0 = top row.
+        assert info.bmiHeader.biHeight == -16
+        assert info.bmiHeader.biBitCount == 24
+        assert info.bmiHeader.biPlanes == 1
+        assert info.bmiHeader.biCompression == BI_RGB
+
+
+class TestTextMeasurement:
+    """The label is sized to fit exactly the icon plus the current text, so a
+    short string like an error label never leaves dead space before the clock."""
+
+    def _fake_gdi32_reporting_width(self, width: int) -> _FakeDll:
+        gdi32 = _FakeDll()
+
+        def fill_size(hdc, text, length, size_pointer):
+            size_pointer._obj.cx = width
+            size_pointer._obj.cy = 15
+            return 1
+
+        gdi32.results["GetTextExtentPoint32W"] = fill_size
+        return gdi32
+
+    def test_measured_width_matches_what_windows_reports(self):
+        gdi32 = self._fake_gdi32_reporting_width(91)
+
+        assert _window(gdi32=gdi32).measure_text_width("95% (4h 14m)") == 91
+
+    def test_the_measurement_device_context_is_always_released(self):
+        gdi32 = _FakeDll()
+
+        _window(gdi32=gdi32).measure_text_width("x")
+
+        assert gdi32.was_called("CreateCompatibleDC")
+        assert gdi32.was_called("DeleteDC")
+
+    def test_content_width_adds_the_icon_prefix_and_right_padding(self):
+        gdi32 = self._fake_gdi32_reporting_width(100)
+
+        content_width = _window(gdi32=gdi32).content_width_for("anything")
+
+        assert content_width == (
+            _ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP + 100 + _ICON_CONTENT_RIGHT_PADDING
+        )
+
+    def test_shorter_text_yields_a_narrower_content_width(self):
+        native = _window(gdi32=self._fake_gdi32_reporting_width(40))
+        wider_native = _window(gdi32=self._fake_gdi32_reporting_width(120))
+
+        assert native.content_width_for("40%") < wider_native.content_width_for("100% (not started)")
 
 
 class TestFont:
@@ -511,6 +848,31 @@ class TestClassRegistration:
 
         with pytest.raises(OSError):
             native._register_class()
+
+    def test_a_successful_registration_keeps_its_callback_referenced(self):
+        # Windows may call this class's window procedure for the rest of the
+        # process's life, so the registering instance's callback must outlive
+        # the instance itself rather than being freed once it is discarded.
+        native = _window(user32=_FakeUser32())
+
+        native._register_class()
+
+        assert native._window_proc_callback in win32_taskbar_window._registered_wndproc_callbacks
+
+    def test_an_already_registered_class_does_not_add_a_duplicate_reference(self):
+        user32 = _FakeUser32()
+        native = _window(user32=user32)
+
+        def already_registered(*_args):
+            ctypes.set_last_error(ERROR_CLASS_ALREADY_EXISTS)
+            return 0
+
+        user32.RegisterClassExW = already_registered
+        before = len(win32_taskbar_window._registered_wndproc_callbacks)
+
+        native._register_class()
+
+        assert len(win32_taskbar_window._registered_wndproc_callbacks) == before
 
 
 class TestMessagePump:

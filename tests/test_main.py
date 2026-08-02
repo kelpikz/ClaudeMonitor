@@ -32,11 +32,11 @@ class _FakeIcon:
 
 class _FakeCompanion:
     def __init__(self, visible: bool = True):
-        self.texts: list[str] = []
+        self.updates: list[tuple[str, str]] = []
         self.visible = visible
 
-    def update(self, text: str) -> None:
-        self.texts.append(text)
+    def update(self, text: str, tooltip: str) -> None:
+        self.updates.append((text, tooltip))
 
     def set_visible(self, visible: bool) -> None:
         self.visible = visible
@@ -75,7 +75,7 @@ def test_apply_display_updates_tray_and_taskbar(monkeypatch):
         icon_color="green",
         tooltip="usage",
         menu_status_label="updated",
-        taskbar_text="Claude: 80% (3 hours)",
+        taskbar_text="80% (3h 0m)",
     )
     applied: list[object] = []
     monkeypatch.setattr(main.tray, "apply", lambda target, value: applied.append((target, value)))
@@ -83,7 +83,7 @@ def test_apply_display_updates_tray_and_taskbar(monkeypatch):
     main._apply_display(icon, state, companion)
 
     assert applied == [(icon, state)]
-    assert companion.texts == ["Claude: 80% (3 hours)"]
+    assert companion.updates == [("80% (3h 0m)", "usage")]
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():

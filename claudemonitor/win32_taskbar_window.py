@@ -11,18 +11,27 @@ signatures — lives in ``win32_bindings`` so this file describes only behavior.
 from __future__ import annotations
 
 import ctypes
+import functools
 import logging
 import threading
 import time
 from ctypes import wintypes
+from pathlib import Path
+from typing import Any
+
+from PIL import Image
 
 from .models import Rect
 from .win32_bindings import (
+    BI_RGB,
+    BITMAPINFO,
+    BITMAPINFOHEADER,
     CLASS_NAME,
+    COMCTL32_SIGNATURES,
     CS_HREDRAW,
     CS_VREDRAW,
     DEFAULT_GUI_FONT,
-    DT_CENTER,
+    DIB_RGB_COLORS,
     DT_SINGLELINE,
     DT_VCENTER,
     ERROR_CLASS_ALREADY_EXISTS,
@@ -32,12 +41,15 @@ from .win32_bindings import (
     GWL_EXSTYLE,
     GWL_STYLE,
     HWND_TOPMOST,
+    ICC_WIN95_CLASSES,
     IDC_ARROW,
+    INITCOMMONCONTROLSEX,
     KERNEL32_SIGNATURES,
     LWA_COLORKEY,
     NONCLIENTMETRICSW,
     PAINTSTRUCT,
     PM_REMOVE,
+    SIZE,
     SPI_GETNONCLIENTMETRICS,
     SW_HIDE,
     SW_SHOWNOACTIVATE,
@@ -46,9 +58,24 @@ from .win32_bindings import (
     SWP_NOMOVE,
     SWP_NOSIZE,
     SWP_NOZORDER,
+    TOOLINFOW,
+    TOOLTIPS_CLASS,
+    TTF_IDISHWND,
+    TTF_TRACK,
+    TTM_ADDTOOLW,
+    TTM_SETMAXTIPWIDTH,
+    TTM_SETTIPBKCOLOR,
+    TTM_SETTIPTEXTCOLOR,
+    TTM_TRACKACTIVATE,
+    TTM_TRACKPOSITION,
+    TTM_UPDATE,
+    TTM_UPDATETIPTEXTW,
+    TTS_ALWAYSTIP,
+    TTS_NOPREFIX,
     TRANSPARENT_BACKGROUND,
     TRANSPARENT_COLORKEY,
     USER32_SIGNATURES,
+    UXTHEME_SIGNATURES,
     WM_PAINT,
     WM_QUIT,
     WM_SETTINGCHANGE,
@@ -58,6 +85,7 @@ from .win32_bindings import (
     WS_CHILD,
     WS_EX_LAYERED,
     WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST,
     WS_EX_TOOLWINDOW,
     WS_POPUP,
     apply_signatures,
@@ -69,6 +97,82 @@ log = logging.getLogger(__name__)
 
 # How often the message pump checks for shutdown while waiting for messages.
 _PUMP_POLL_SECONDS = 0.05
+
+# Window classes are registered process-wide and never unregistered, so once a
+# callback is handed to RegisterClassExW, Windows may invoke it for the rest of
+# the process's life — even after the Win32TaskbarWindow instance that created
+# it is garbage collected. Keeping every registering instance's callback here
+# stops that trampoline from being freed out from under a later CreateWindowExW
+# call, which otherwise crashes with an access violation.
+_registered_wndproc_callbacks: list[object] = []
+
+# The Claude glyph replaces the literal word "Claude" in the label, so it is
+# drawn at the same square size as the tray's own status dot.
+_ICON_SIZE = 16
+_ICON_LEFT_INSET = 6
+_ICON_TEXT_GAP = 6
+# Breathing room after the text so it does not touch the taskbar's own icons.
+_ICON_CONTENT_RIGHT_PADDING = 8
+_ICON_ASSET_PATH = Path(__file__).parent / "assets" / "claude_icon.png"
+_TOOLTIP_MAX_WIDTH = 600
+_TOOLTIP_TASKBAR_GAP = 4
+_TOOLTIP_BACKGROUND_COLOR = 0x002B2B2B
+_TOOLTIP_TEXT_COLOR = 0x00F5F5F5
+
+
+@functools.lru_cache(maxsize=1)
+def _load_claude_icon() -> Image.Image:
+    """Load the bundled Claude glyph once and reuse it for every paint."""
+    return Image.open(_ICON_ASSET_PATH).convert("RGBA")
+
+
+def _icon_bgr_bytes(image: Image.Image) -> bytes:
+    """Pack an RGBA image as the row-padded, top-down 24bpp BGR buffer
+    ``SetDIBitsToDevice`` expects.
+
+    Compositing onto opaque black before dropping the alpha channel means
+    every pixel outside the glyph becomes exactly the window's color-keyed
+    background, so it disappears rather than leaving a dark halo.
+    """
+    canvas = Image.new("RGBA", image.size, (0, 0, 0, 255))
+    opaque = Image.alpha_composite(canvas, image).convert("RGB")
+    red, green, blue = opaque.split()
+    bgr_rows = Image.merge("RGB", (blue, green, red)).tobytes()
+
+    width, _height = image.size
+    row_bytes = width * 3
+    padded_row_bytes = (row_bytes + 3) & ~3
+    if padded_row_bytes == row_bytes:
+        return bgr_rows
+
+    padding = b"\x00" * (padded_row_bytes - row_bytes)
+    rows = (
+        bgr_rows[offset : offset + row_bytes] + padding
+        for offset in range(0, len(bgr_rows), row_bytes)
+    )
+    return b"".join(rows)
+
+
+def _bitmap_info_for(*, width: int, height: int) -> BITMAPINFO:
+    """Describe an uncompressed, top-down 24bpp DIB of the given size."""
+    info = BITMAPINFO()
+    info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    info.bmiHeader.biWidth = width
+    # Negative height selects top-down row order, matching the PNG's own.
+    info.bmiHeader.biHeight = -height
+    info.bmiHeader.biPlanes = 1
+    info.bmiHeader.biBitCount = 24
+    info.bmiHeader.biCompression = BI_RGB
+    return info
+
+
+def _initialize_tooltip_controls(comctl32: Any) -> None:
+    """Register Windows' standard tooltip class for this process."""
+    controls = INITCOMMONCONTROLSEX()
+    controls.dwSize = ctypes.sizeof(INITCOMMONCONTROLSEX)
+    controls.dwICC = ICC_WIN95_CLASSES
+    if not comctl32.InitCommonControlsEx(ctypes.byref(controls)):
+        raise OSError("unable to initialize Windows tooltip controls")
 
 
 class Win32TaskbarWindow:
@@ -86,16 +190,22 @@ class Win32TaskbarWindow:
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+        self._uxtheme = ctypes.WinDLL("uxtheme", use_last_error=True)
 
         missing = (
             apply_signatures(self._user32, USER32_SIGNATURES)
             + apply_signatures(self._gdi32, GDI32_SIGNATURES)
             + apply_signatures(self._kernel32, KERNEL32_SIGNATURES)
+            + apply_signatures(self._comctl32, COMCTL32_SIGNATURES)
+            + apply_signatures(self._uxtheme, UXTHEME_SIGNATURES)
         )
         if missing:
             # Every entry the label actually depends on has shipped since
             # Windows XP, so this is diagnostic rather than fatal.
             log.warning("Windows does not export %s; continuing without it", missing)
+
+        _initialize_tooltip_controls(self._comctl32)
 
         # Keep the callback object alive as long as Windows may call it. If it
         # were garbage-collected, a later paint message could crash the process.
@@ -111,9 +221,21 @@ class Win32TaskbarWindow:
         self._font_handle: int | None = None
         self._font_resolved = False
         self._background_brush: int | None = None
+        self._uses_light_theme = system_uses_light_theme()
         self._foreground_color = foreground_color_for_theme(
-            uses_light_theme=system_uses_light_theme()
+            uses_light_theme=self._uses_light_theme
         )
+
+        # The icon's pixel buffer never changes at runtime, so it is packed
+        # once and reused for every WM_PAINT rather than re-composited each time.
+        self._icon_bytes: bytes | None = None
+        self._icon_info: BITMAPINFO | None = None
+
+        # Each tooltip control and its backing Unicode buffer must stay alive
+        # for as long as the associated taskbar label exists.
+        self._tooltip_handles: dict[int, int] = {}
+        self._tooltip_buffers: dict[int, ctypes.Array] = {}
+        self._active_tooltip_labels: set[int] = set()
 
     # --- Discovery -------------------------------------------------------
 
@@ -231,6 +353,12 @@ class Win32TaskbarWindow:
 
     def close_window(self, handle: int) -> None:
         """Destroy the label on the same thread that created it."""
+        tooltip_handle = self._tooltip_handles.pop(handle, None)
+        self._tooltip_buffers.pop(handle, None)
+        self._active_tooltip_labels.discard(handle)
+        if tooltip_handle is not None and self._user32.IsWindow(tooltip_handle):
+            self._user32.DestroyWindow(tooltip_handle)
+
         # IsWindow protects cleanup from a stale handle if Explorer or Windows
         # already destroyed the native label.
         if self._user32.IsWindow(handle):
@@ -240,6 +368,18 @@ class Win32TaskbarWindow:
 
     def _register_class(self) -> None:
         """Teach Windows how to create and repaint this process's label windows."""
+        self._register_window_class(
+            class_name=CLASS_NAME,
+            background_brush=self._background_brush_handle(),
+        )
+
+    def _register_window_class(
+        self,
+        *,
+        class_name: str,
+        background_brush: int | None,
+    ) -> None:
+        """Register one custom window class backed by this adapter's callback."""
         # WNDCLASSEXW describes a reusable window *type*, not an individual
         # window. CreateWindowExW later instantiates this description.
         window_class = WNDCLASSEXW()
@@ -261,15 +401,19 @@ class Win32TaskbarWindow:
         # the neighbouring window last set.
         window_class.hCursor = self._user32.LoadCursorW(None, IDC_ARROW)
 
-        window_class.hbrBackground = self._background_brush_handle()
+        window_class.hbrBackground = background_brush
 
         # This exact name links registration to the later CreateWindowExW call.
-        window_class.lpszClassName = CLASS_NAME
+        window_class.lpszClassName = class_name
 
         # RegisterClassExW returns a zero atom on failure. A class already
         # registered by an earlier window in this process is not a failure.
         ctypes.set_last_error(0)
         if self._user32.RegisterClassExW(ctypes.byref(window_class)):
+            # This instance's callback is now the one Windows calls for every
+            # window of this class, for as long as the process runs.
+            if self._window_proc_callback not in _registered_wndproc_callbacks:
+                _registered_wndproc_callbacks.append(self._window_proc_callback)
             return
         error = ctypes.get_last_error()
         if error != ERROR_CLASS_ALREADY_EXISTS:
@@ -380,6 +524,8 @@ class Win32TaskbarWindow:
 
     def set_visible(self, handle: int, visible: bool) -> None:
         """Show without taking focus, or hide the native label."""
+        if not visible:
+            self._hide_tooltip(handle)
         # ShowWindow changes visibility only; placement remains untouched.
         self._user32.ShowWindow(handle, SW_SHOWNOACTIVATE if visible else SW_HIDE)
 
@@ -397,6 +543,89 @@ class Win32TaskbarWindow:
 
         self._request_repaint(handle)
 
+    def set_tooltip(self, handle: int, tooltip: str) -> None:
+        """Attach or update the multiline hover detail for a taskbar label."""
+        tooltip_handle = self._tooltip_handles.get(handle)
+        tooltip_is_active = handle in self._active_tooltip_labels
+
+        buffer = ctypes.create_unicode_buffer(tooltip)
+        tool_info = TOOLINFOW()
+        tool_info.cbSize = ctypes.sizeof(TOOLINFOW)
+        tool_info.uFlags = TTF_IDISHWND | TTF_TRACK
+        tool_info.hwnd = handle
+        tool_info.uId = handle
+        tool_info.lpszText = ctypes.cast(buffer, wintypes.LPWSTR)
+        info_pointer = ctypes.cast(ctypes.byref(tool_info), ctypes.c_void_p).value
+
+        if tooltip_handle is None:
+            tooltip_handle = self._user32.CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                TOOLTIPS_CLASS,
+                None,
+                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                0,
+                0,
+                0,
+                0,
+                handle,
+                None,
+                self._kernel32.GetModuleHandleW(None),
+                None,
+            )
+            if not tooltip_handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._configure_tooltip_theme(tooltip_handle)
+            self._user32.SendMessageW(
+                tooltip_handle, TTM_SETMAXTIPWIDTH, 0, _TOOLTIP_MAX_WIDTH
+            )
+            if not self._user32.SendMessageW(
+                tooltip_handle, TTM_ADDTOOLW, 0, info_pointer
+            ):
+                self._user32.DestroyWindow(tooltip_handle)
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._tooltip_handles[handle] = tooltip_handle
+        else:
+            self._user32.SendMessageW(
+                tooltip_handle, TTM_UPDATETIPTEXTW, 0, info_pointer
+            )
+
+        # The tooltip control keeps this pointer rather than copying its text.
+        self._tooltip_buffers[handle] = buffer
+        if tooltip_is_active:
+            # Redraw the existing tracking popup in place. TRACKACTIVATE is not
+            # repeated, so the once-per-second age update cannot restart its
+            # hover lifecycle or make the popup disappear and reappear.
+            self._user32.SendMessageW(tooltip_handle, TTM_UPDATE, 0, 0)
+            try:
+                label_rect = self.get_rect(handle)
+            except OSError:
+                return
+            self._position_tooltip_above_label(
+                label_rect=label_rect,
+                tooltip_handle=tooltip_handle,
+            )
+
+    def _configure_tooltip_theme(self, tooltip_handle: int) -> None:
+        """Ask Windows to render the tooltip with Explorer's current styling."""
+        theme_name = "Explorer" if self._uses_light_theme else "DarkMode_Explorer"
+        if self._uxtheme.SetWindowTheme(tooltip_handle, theme_name, None) == 0:
+            return
+        if self._uses_light_theme:
+            # The default common-control theme is already an appropriate light
+            # fallback when this Windows build does not expose Explorer's theme.
+            return
+
+        # Older builds can reject the dark Explorer theme. Tooltip color
+        # messages are ignored while visual styles remain enabled, so disable
+        # them only for this fallback and retain readable light-on-dark colors.
+        self._uxtheme.SetWindowTheme(tooltip_handle, "", "")
+        self._user32.SendMessageW(
+            tooltip_handle, TTM_SETTIPBKCOLOR, _TOOLTIP_BACKGROUND_COLOR, 0
+        )
+        self._user32.SendMessageW(
+            tooltip_handle, TTM_SETTIPTEXTCOLOR, _TOOLTIP_TEXT_COLOR, 0
+        )
+
     def _request_repaint(self, handle: int) -> None:
         """Mark the whole label dirty so the next paint redraws it completely."""
         # The TRUE erase flag clears the old glyphs with the black background
@@ -410,11 +639,16 @@ class Win32TaskbarWindow:
         the label is a taskbar child the message never arrives and the
         controller polls this instead.
         """
-        color = foreground_color_for_theme(uses_light_theme=system_uses_light_theme())
+        uses_light_theme = system_uses_light_theme()
+        color = foreground_color_for_theme(uses_light_theme=uses_light_theme)
         if color == self._foreground_color:
             return
+        self._uses_light_theme = uses_light_theme
         self._foreground_color = color
         self._request_repaint(handle)
+        tooltip_handle = self._tooltip_handles.get(handle)
+        if tooltip_handle is not None:
+            self._configure_tooltip_theme(tooltip_handle)
 
     def message_font(self) -> int | None:
         """Return the system UI font, creating it once from the current metrics.
@@ -443,8 +677,66 @@ class Win32TaskbarWindow:
             self._font_handle = self._gdi32.GetStockObject(DEFAULT_GUI_FONT)
         return self._font_handle
 
+    def measure_text_width(self, text: str) -> int:
+        """Return the pixel width the message font renders this text at.
+
+        A memory device context needs no window of its own, so this can be
+        called before the label exists to size it to its very first text.
+        """
+        device_context = self._gdi32.CreateCompatibleDC(None)
+        try:
+            self._gdi32.SelectObject(device_context, self.message_font())
+            size = SIZE()
+            self._gdi32.GetTextExtentPoint32W(
+                device_context, text, len(text), ctypes.byref(size)
+            )
+            return size.cx
+        finally:
+            self._gdi32.DeleteDC(device_context)
+
+    def content_width_for(self, text: str) -> int:
+        """Return the label width that fits the icon and this text exactly,
+        so short strings never leave dead space before the notification area."""
+        return (
+            _ICON_LEFT_INSET
+            + _ICON_SIZE
+            + _ICON_TEXT_GAP
+            + self.measure_text_width(text)
+            + _ICON_CONTENT_RIGHT_PADDING
+        )
+
+    def _icon_pixels(self) -> tuple[bytes, BITMAPINFO]:
+        """Return the cached BGR pixel buffer and DIB header for the Claude glyph."""
+        if self._icon_bytes is None or self._icon_info is None:
+            image = _load_claude_icon()
+            self._icon_bytes = _icon_bgr_bytes(image)
+            self._icon_info = _bitmap_info_for(width=image.width, height=image.height)
+        return self._icon_bytes, self._icon_info
+
+    def _draw_icon(self, device_context: int, client_rect: wintypes.RECT) -> None:
+        """Blit the Claude glyph against the label's left edge, vertically centered."""
+        pixels, bitmap_info = self._icon_pixels()
+        icon_top = client_rect.top + (
+            (client_rect.bottom - client_rect.top - _ICON_SIZE) // 2
+        )
+        self._gdi32.SetDIBitsToDevice(
+            device_context,
+            client_rect.left + _ICON_LEFT_INSET,
+            icon_top,
+            _ICON_SIZE,
+            _ICON_SIZE,
+            0,
+            0,
+            0,
+            _ICON_SIZE,
+            pixels,
+            ctypes.byref(bitmap_info),
+            DIB_RGB_COLORS,
+        )
+
     def _paint_label(self, hwnd: int) -> None:
-        """Draw the current usage text centered in the label's client area."""
+        """Draw the Claude glyph and the current usage text in the label's
+        client area, the glyph anchored left and the text left-aligned beside it."""
         # PAINTSTRUCT receives bookkeeping that must be passed back to EndPaint
         # after drawing finishes.
         paint = PAINTSTRUCT()
@@ -458,25 +750,133 @@ class Win32TaskbarWindow:
             client_rect = wintypes.RECT()
             self._user32.GetClientRect(hwnd, ctypes.byref(client_rect))
 
-            # Draw only text. The black background is removed by color-key
-            # transparency, allowing the real taskbar to show through.
+            # The black background is removed by color-key transparency,
+            # allowing the real taskbar to show through both the icon and text.
             self._gdi32.SetBkMode(device_context, TRANSPARENT_BACKGROUND)
             self._gdi32.SetTextColor(device_context, self._foreground_color)
             self._gdi32.SelectObject(device_context, self.message_font())
 
-            # DrawTextW lays out the complete Python string (-1 means
-            # null-terminated) inside client_rect using the centering flags.
+            self._draw_icon(device_context, client_rect)
+
+            # The text starts right after the icon rather than centering across
+            # the whole remaining width, which otherwise reads as a large gap
+            # between the glyph and short strings like "100% (not started)".
+            text_rect = wintypes.RECT(
+                client_rect.left + _ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP,
+                client_rect.top,
+                client_rect.right,
+                client_rect.bottom,
+            )
             self._user32.DrawTextW(
                 device_context,
                 self._window_text,
                 -1,
-                ctypes.byref(client_rect),
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                ctypes.byref(text_rect),
+                DT_VCENTER | DT_SINGLELINE,
             )
         finally:
             # Every successful BeginPaint must be paired with EndPaint so
             # Windows clears the dirty region and releases the drawing context.
             self._user32.EndPaint(hwnd, ctypes.byref(paint))
+
+    def _poll_tooltip_hover(self) -> None:
+        """Open the label tooltip while the cursor is inside its full rectangle."""
+        cursor = wintypes.POINT()
+        if not self._user32.GetCursorPos(ctypes.byref(cursor)):
+            return
+
+        for label_handle, tooltip_handle in list(self._tooltip_handles.items()):
+            try:
+                label_rect = self.get_rect(label_handle)
+            except OSError:
+                self._hide_tooltip(label_handle)
+                continue
+
+            cursor_is_inside = (
+                label_rect.left <= cursor.x < label_rect.right
+                and label_rect.top <= cursor.y < label_rect.bottom
+            )
+            if not cursor_is_inside:
+                self._hide_tooltip(label_handle)
+                continue
+            if label_handle in self._active_tooltip_labels:
+                continue
+
+            # Tracking mode is designed for controls that supply their own
+            # hover detection. It also works in the color-keyed gaps where the
+            # layered label itself never receives ordinary mouse messages.
+            label_center = label_rect.left + (label_rect.width // 2)
+            position = (
+                ((label_rect.top & 0xFFFF) << 16) | (label_center & 0xFFFF)
+            )
+            self._user32.SendMessageW(
+                tooltip_handle,
+                TTM_TRACKPOSITION,
+                0,
+                position,
+            )
+            tool_info = self._tracking_tool_info(label_handle)
+            info_pointer = ctypes.cast(ctypes.byref(tool_info), ctypes.c_void_p).value
+            self._user32.SendMessageW(
+                tooltip_handle,
+                TTM_TRACKACTIVATE,
+                True,
+                info_pointer,
+            )
+            self._position_tooltip_above_label(
+                label_rect=label_rect,
+                tooltip_handle=tooltip_handle,
+            )
+            self._active_tooltip_labels.add(label_handle)
+
+    def _position_tooltip_above_label(
+        self,
+        *,
+        label_rect: Rect,
+        tooltip_handle: int,
+    ) -> None:
+        """Center the open tooltip immediately above its taskbar label."""
+        try:
+            tooltip_rect = self.get_rect(tooltip_handle)
+        except OSError:
+            return
+
+        left = label_rect.left + ((label_rect.width - tooltip_rect.width) // 2)
+        top = label_rect.top - tooltip_rect.height - _TOOLTIP_TASKBAR_GAP
+        self._user32.SetWindowPos(
+            tooltip_handle,
+            HWND_TOPMOST,
+            left,
+            top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+
+    def _hide_tooltip(self, label_handle: int) -> None:
+        """Close an explicitly opened tooltip once its label is no longer hovered."""
+        if label_handle not in self._active_tooltip_labels:
+            return
+        self._active_tooltip_labels.discard(label_handle)
+        tooltip_handle = self._tooltip_handles.get(label_handle)
+        if tooltip_handle is not None:
+            tool_info = self._tracking_tool_info(label_handle)
+            info_pointer = ctypes.cast(ctypes.byref(tool_info), ctypes.c_void_p).value
+            self._user32.SendMessageW(
+                tooltip_handle,
+                TTM_TRACKACTIVATE,
+                False,
+                info_pointer,
+            )
+
+    def _tracking_tool_info(self, label_handle: int) -> TOOLINFOW:
+        """Build the matching TOOLINFO identifier used by tracking messages."""
+        tool_info = TOOLINFOW()
+        tool_info.cbSize = ctypes.sizeof(TOOLINFOW)
+        tool_info.uFlags = TTF_IDISHWND | TTF_TRACK
+        tool_info.hwnd = label_handle
+        tool_info.uId = label_handle
+        return tool_info
 
     def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
         """Route Windows messages, handling only painting and theme changes."""
@@ -510,6 +910,7 @@ class Win32TaskbarWindow:
 
         # Event.wait doubles as a short sleep and a prompt shutdown signal.
         while not stop_requested.wait(_PUMP_POLL_SECONDS):
+            self._poll_tooltip_hover()
             # PeekMessageW returns nonzero while a queued message exists. Passing
             # no HWND and a zero range accepts every message for this UI thread.
             while self._user32.PeekMessageW(

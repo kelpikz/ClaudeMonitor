@@ -127,6 +127,9 @@ class _FakeNativeWindow:
         self.taskbar_rect = TASKBAR
         self.sibling_rects: list[Rect] = []
         self.next_handle = 30
+        # Matches the width every existing placement test already expects;
+        # tests exercising per-text sizing override this attribute directly.
+        self.content_width = 180
         # Raise this error from the next matching call, then clear it.
         self.fail_once_on: str | None = None
         self.always_fail_on: str | None = None
@@ -155,6 +158,10 @@ class _FakeNativeWindow:
         self._record("get_rect", handle)
         return self.taskbar_rect if handle == 10 else self.notification_rect
 
+    def content_width_for(self, text):
+        self._record("content_width_for", text)
+        return self.content_width
+
     def create_window(self, *, text):
         self._record("create_window", text)
         self.next_handle += 1
@@ -180,6 +187,9 @@ class _FakeNativeWindow:
 
     def set_text(self, handle, text):
         self._record("set_text", handle, text)
+
+    def set_tooltip(self, handle, tooltip):
+        self._record("set_tooltip", handle, tooltip)
 
     def set_visible(self, handle, visible):
         self._record("set_visible", handle, visible)
@@ -270,20 +280,21 @@ class TestStartupSequence:
 
         assert _calls_named(native, "create_window")[0] == (
             "create_window",
-            "Claude: loading...",
+            "loading...",
         )
 
     def test_usage_text_supplied_before_start_is_rendered_initially(self):
         native = _FakeNativeWindow()
         companion = TaskbarCompanion(native=native)
-        companion.update("Claude: 80% (3 hours)")
+        companion.update("80% (3h 0m)", "Claude usage\n5h: 80% left")
 
         companion._run()
 
         assert _calls_named(native, "create_window")[0] == (
             "create_window",
-            "Claude: 80% (3 hours)",
+            "80% (3h 0m)",
         )
+        assert ("set_tooltip", _handle(native), "Claude usage\n5h: 80% left") in native.calls
 
     def test_window_is_positioned_before_it_is_ever_shown(self):
         # Showing first would flash a 1x1 speck at the taskbar's left edge.
@@ -337,14 +348,15 @@ class TestVisibility:
         original_pump = native.pump_messages
 
         def update_during_first_pump(stop_requested, duration_seconds):
-            companion.update("Claude: 80% (3 hours)")
+            companion.update("80% (3h 0m)", "Claude usage\n5h: 80% left")
             original_pump(stop_requested, duration_seconds)
 
         native.pump_messages = update_during_first_pump
 
         companion._run()
 
-        assert ("set_text", _handle(native), "Claude: 80% (3 hours)") in native.calls
+        assert ("set_text", _handle(native), "80% (3h 0m)") in native.calls
+        assert ("set_tooltip", _handle(native), "Claude usage\n5h: 80% left") in native.calls
 
     def test_visibility_updates_while_native_window_is_running(self):
         native = _FakeNativeWindow()
@@ -413,6 +425,28 @@ class TestPlacement:
         move_calls = _calls_named(native, "move_window")
         assert move_calls[0][2] == Rect(left=1362, top=0, right=1542, bottom=48)
         assert move_calls[-1][2] == Rect(left=1320, top=0, right=1500, bottom=48)
+
+    def test_repositioning_widens_when_new_text_measures_wider(self):
+        # A short label like "40%" must not keep the width an earlier, longer
+        # string needed — the slot is re-measured for whatever text is current.
+        native = _FakeNativeWindow(pump_rounds=2)
+        native.content_width = 100
+        companion = TaskbarCompanion(native=native)
+        companion.update("40%")
+        original_pump = native.pump_messages
+
+        def pump_and_widen_text(stop_requested, duration_seconds):
+            native.content_width = 160
+            companion.update("100% (not started)")
+            original_pump(stop_requested, duration_seconds)
+
+        native.pump_messages = pump_and_widen_text
+
+        companion._run()
+
+        move_calls = _calls_named(native, "move_window")
+        assert move_calls[0][2].width == 100
+        assert move_calls[-1][2].width == 160
 
     def test_an_empty_slot_is_never_pushed_to_windows(self, caplog):
         # SetWindowPos rejects a negative width, which would restart the whole
@@ -680,7 +714,7 @@ class TestCompanionFactory:
         companion = DisabledTaskbarCompanion()
 
         companion.start()
-        companion.update("Claude: 80% (3 hours)")
+        companion.update("80% (3h 0m)", "Claude usage\n5h: 80% left")
         companion.set_visible(True)
         companion.stop()
 

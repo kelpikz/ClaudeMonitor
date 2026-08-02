@@ -19,6 +19,7 @@ WS_POPUP = 0x80000000  # Create a top-level window before taskbar attachment.
 WS_CHILD = 0x40000000  # Make coordinates and lifetime belong to the taskbar.
 WS_EX_TOOLWINDOW = 0x00000080  # Keep the helper out of Alt+Tab.
 WS_EX_NOACTIVATE = 0x08000000  # Never steal keyboard focus.
+WS_EX_TOPMOST = 0x00000008  # Keep a tooltip above the taskbar it describes.
 GWL_STYLE = -16  # Select the ordinary style field in Get/SetWindowLongPtr.
 GWL_EXSTYLE = -20  # Select the extended-style field in Get/SetWindowLongPtr.
 
@@ -49,6 +50,23 @@ WM_SETTINGCHANGE = 0x001A  # A system setting, including light/dark mode, change
 WM_THEMECHANGED = 0x031A  # The visual style changed.
 PM_REMOVE = 0x0001  # Remove messages as PeekMessage reads them.
 
+# Standard Windows tooltip-control messages and tracking behavior.
+TOOLTIPS_CLASS = "tooltips_class32"
+TTS_ALWAYSTIP = 0x0001
+TTS_NOPREFIX = 0x0002
+TTF_IDISHWND = 0x0001
+TTF_TRACK = 0x0020
+WM_USER = 0x0400
+TTM_SETMAXTIPWIDTH = WM_USER + 24
+TTM_SETTIPBKCOLOR = WM_USER + 19
+TTM_SETTIPTEXTCOLOR = WM_USER + 20
+TTM_TRACKACTIVATE = WM_USER + 17
+TTM_TRACKPOSITION = WM_USER + 18
+TTM_UPDATE = WM_USER + 29
+TTM_ADDTOOLW = WM_USER + 50
+TTM_UPDATETIPTEXTW = WM_USER + 57
+ICC_WIN95_CLASSES = 0x000000FF  # Includes the standard tooltip control class.
+
 # Text drawing options: center one line both horizontally and vertically and
 # draw without a background rectangle.
 DT_CENTER = 0x00000001  # Center text horizontally.
@@ -75,6 +93,11 @@ ERROR_CLASS_ALREADY_EXISTS = 1410  # A second instance registered the class firs
 
 # Font metrics.
 SPI_GETNONCLIENTMETRICS = 0x0029  # Ask Windows for the current UI font metrics.
+
+# Blitting the small Claude glyph beside the usage text as an uncompressed,
+# top-down 24bpp bitmap.
+BI_RGB = 0  # Uncompressed pixel data; no compression bookkeeping needed.
+DIB_RGB_COLORS = 0  # The DIB's color table holds literal RGB values (unused at 24bpp).
 
 
 def _int_resource(identifier: int) -> wintypes.LPCWSTR:
@@ -136,6 +159,31 @@ class PAINTSTRUCT(ctypes.Structure):
     ]
 
 
+class TOOLINFOW(ctypes.Structure):
+    """Python layout describing one window tracked by a tooltip control."""
+
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+        ("uId", ctypes.c_size_t),
+        ("rect", wintypes.RECT),
+        ("hinst", wintypes.HINSTANCE),
+        ("lpszText", wintypes.LPWSTR),
+        ("lParam", wintypes.LPARAM),
+        ("lpReserved", wintypes.LPVOID),
+    ]
+
+
+class INITCOMMONCONTROLSEX(ctypes.Structure):
+    """Python layout selecting which common-control classes Windows registers."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("dwICC", wintypes.DWORD),
+    ]
+
+
 class LOGFONTW(ctypes.Structure):
     """Python layout of a Windows font description."""
 
@@ -154,6 +202,45 @@ class LOGFONTW(ctypes.Structure):
         ("lfQuality", wintypes.BYTE),  # Anti-aliasing preference.
         ("lfPitchAndFamily", wintypes.BYTE),  # Pitch plus stylistic family.
         ("lfFaceName", wintypes.WCHAR * 32),  # Typeface name such as "Segoe UI".
+    ]
+
+
+class SIZE(ctypes.Structure):
+    """Python layout of a GDI text measurement, in logical pixels."""
+
+    _fields_ = [
+        ("cx", ctypes.c_long),
+        ("cy", ctypes.c_long),
+    ]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    """Python layout of the header describing an uncompressed DIB's pixel data."""
+
+    _fields_ = [
+        ("biSize", wintypes.DWORD),  # Byte size, used for versioning the structure.
+        ("biWidth", ctypes.c_long),
+        # Negative height marks a top-down DIB, so row 0 is the top row PIL
+        # already produced rather than the bottom-up order DIBs default to.
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", wintypes.WORD),  # Always 1 for device-independent bitmaps.
+        ("biBitCount", wintypes.WORD),  # Bits per pixel; 24 needs no color table.
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),  # May be 0 for uncompressed BI_RGB data.
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    """Python layout of a DIB description; ``bmiColors`` is unused at 24bpp
+    but must still be present so the structure's size matches Windows'."""
+
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", wintypes.DWORD * 3),
     ]
 
 
@@ -191,6 +278,7 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     ),
     "GetWindowRect": ((wintypes.HWND, ctypes.POINTER(wintypes.RECT)), wintypes.BOOL),
     "GetClientRect": ((wintypes.HWND, ctypes.POINTER(wintypes.RECT)), wintypes.BOOL),
+    "GetCursorPos": ((ctypes.POINTER(wintypes.POINT),), wintypes.BOOL),
     # Create, move, show, parent, and enumerate windows.
     "CreateWindowExW": (
         (
@@ -255,6 +343,10 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     ),
     "TranslateMessage": ((ctypes.POINTER(wintypes.MSG),), wintypes.BOOL),
     "DispatchMessageW": ((ctypes.POINTER(wintypes.MSG),), ctypes.c_ssize_t),
+    "SendMessageW": (
+        (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM),
+        ctypes.c_ssize_t,
+    ),
     # Register the custom class and paint its contents.
     "RegisterClassExW": ((ctypes.POINTER(WNDCLASSEXW),), wintypes.ATOM),
     "LoadCursorW": ((wintypes.HINSTANCE, wintypes.LPCWSTR), wintypes.HANDLE),
@@ -288,6 +380,44 @@ GDI32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     "SetTextColor": ((wintypes.HDC, wintypes.COLORREF), wintypes.COLORREF),
     "GetStockObject": ((ctypes.c_int,), wintypes.HGDIOBJ),
     "SelectObject": ((wintypes.HDC, wintypes.HGDIOBJ), wintypes.HGDIOBJ),
+    # Measuring text width to size the label to its actual content.
+    "CreateCompatibleDC": ((wintypes.HDC,), wintypes.HDC),
+    "DeleteDC": ((wintypes.HDC,), wintypes.BOOL),
+    "GetTextExtentPoint32W": (
+        (wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(SIZE)),
+        wintypes.BOOL,
+    ),
+    "SetDIBitsToDevice": (
+        (
+            wintypes.HDC,
+            ctypes.c_int,  # xDest
+            ctypes.c_int,  # yDest
+            wintypes.DWORD,  # dwWidth
+            wintypes.DWORD,  # dwHeight
+            ctypes.c_int,  # xSrc
+            ctypes.c_int,  # ySrc
+            wintypes.UINT,  # uStartScan
+            wintypes.UINT,  # cScanLines
+            ctypes.c_void_p,  # lpvBits
+            ctypes.POINTER(BITMAPINFO),  # lpbmi
+            wintypes.UINT,  # fuColorUse
+        ),
+        ctypes.c_int,
+    ),
+}
+
+COMCTL32_SIGNATURES: dict[str, tuple[tuple, object]] = {
+    "InitCommonControlsEx": (
+        (ctypes.POINTER(INITCOMMONCONTROLSEX),),
+        wintypes.BOOL,
+    ),
+}
+
+UXTHEME_SIGNATURES: dict[str, tuple[tuple, object]] = {
+    "SetWindowTheme": (
+        (wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR),
+        ctypes.c_long,  # HRESULT
+    ),
 }
 
 KERNEL32_SIGNATURES: dict[str, tuple[tuple, object]] = {

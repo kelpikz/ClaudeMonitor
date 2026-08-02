@@ -24,10 +24,11 @@ NOTIFICATION = Rect(left=1542, top=1032, right=1920, bottom=1080)
 
 
 class _RecordingNativeWindow:
-    """Capture the text the Windows layer would paint, without touching Win32."""
+    """Capture what Windows would paint and show on hover, without touching Win32."""
 
     def __init__(self) -> None:
         self.painted: list[str] = []
+        self.tooltips: list[str] = []
 
     def find_taskbar(self) -> int:
         return 10
@@ -37,6 +38,9 @@ class _RecordingNativeWindow:
 
     def get_rect(self, handle: int) -> Rect:
         return TASKBAR if handle == 10 else NOTIFICATION
+
+    def content_width_for(self, text: str) -> int:
+        return 180
 
     def create_window(self, *, text: str) -> int:
         self.painted.append(text)
@@ -59,6 +63,9 @@ class _RecordingNativeWindow:
 
     def set_text(self, handle: int, text: str) -> None:
         self.painted.append(text)
+
+    def set_tooltip(self, handle: int, tooltip: str) -> None:
+        self.tooltips.append(tooltip)
 
     def set_visible(self, handle: int, visible: bool) -> None:
         pass
@@ -110,6 +117,9 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     main._apply_display(_StubIcon(), state, companion)
 
     companion._run()
+    # Every response case below proves the tray's processed detail reaches the
+    # native taskbar hover UI unchanged.
+    assert native.tooltips[-1] == state.tooltip
     return native.painted[-1]
 
 
@@ -123,7 +133,7 @@ class TestHappyPath:
             ),
         )
 
-        assert _painted_label(monkeypatch) == "Claude: 80% (3 hours)"
+        assert _painted_label(monkeypatch) == "80% (3h 0m)"
 
     def test_an_unstarted_session_is_labelled_honestly(self, monkeypatch):
         _respond_with(
@@ -131,7 +141,7 @@ class TestHappyPath:
             _usage_response({"utilization": 0.0, "resets_at": None}),
         )
 
-        assert _painted_label(monkeypatch) == "Claude: 100% (not started)"
+        assert _painted_label(monkeypatch) == "100% (not started)"
 
     def test_a_nearly_exhausted_window_reaches_the_native_label(self, monkeypatch):
         _respond_with(
@@ -141,7 +151,7 @@ class TestHappyPath:
             ),
         )
 
-        assert _painted_label(monkeypatch) == "Claude: 0% (12 minutes)"
+        assert _painted_label(monkeypatch) == "0% (12m)"
 
 
 class TestErrorPaths:
@@ -154,7 +164,7 @@ class TestErrorPaths:
             httpx.Response(401, request=httpx.Request("GET", "https://example.test")),
         )
 
-        assert _painted_label(monkeypatch) == "Claude: token expired"
+        assert _painted_label(monkeypatch) == "token expired"
 
     def test_rate_limited_without_previous_data(self, monkeypatch):
         _respond_with(
@@ -162,7 +172,7 @@ class TestErrorPaths:
             httpx.Response(429, request=httpx.Request("GET", "https://example.test")),
         )
 
-        assert _painted_label(monkeypatch) == "Claude: rate limited"
+        assert _painted_label(monkeypatch) == "rate limited"
 
     def test_network_failure(self, monkeypatch):
         monkeypatch.setattr(
@@ -176,7 +186,7 @@ class TestErrorPaths:
 
         monkeypatch.setattr(httpx, "get", refuse)
 
-        assert _painted_label(monkeypatch) == "Claude: offline"
+        assert _painted_label(monkeypatch) == "offline"
 
     def test_missing_credentials(self, monkeypatch):
         def missing():
@@ -184,14 +194,14 @@ class TestErrorPaths:
 
         monkeypatch.setattr(fetcher, "_read_credentials", missing)
 
-        assert _painted_label(monkeypatch) == "Claude: not logged in"
+        assert _painted_label(monkeypatch) == "not logged in"
 
     def test_unexpected_response_shape(self, monkeypatch):
         _respond_with(monkeypatch, _usage_response({"nonsense": True}))
 
-        assert _painted_label(monkeypatch) == "Claude: bad response"
+        assert _painted_label(monkeypatch) == "bad response"
 
     def test_response_without_usage_windows(self, monkeypatch):
         _respond_with(monkeypatch, _usage_response(None))
 
-        assert _painted_label(monkeypatch) == "Claude: no data"
+        assert _painted_label(monkeypatch) == "no data"

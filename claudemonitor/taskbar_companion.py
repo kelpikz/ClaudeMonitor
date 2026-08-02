@@ -20,13 +20,10 @@ from .processor import LOADING_TASKBAR_TEXT
 
 log = logging.getLogger(__name__)
 
-# Width of the label in pixels. ClaudeMonitor does not declare DPI awareness, so
-# Windows virtualizes every coordinate this module sees to 96 DPI and scales the
-# result for the monitor: one constant is correct at any display scaling.
-_COMPANION_WIDTH = 180
-
-# Below this width the usage text would be clipped into meaninglessness, so
-# placement stops yielding space to neighbouring taskbar plugins.
+# Fallback minimum width for companion_slot() callers that do not size the
+# label to measured content. ClaudeMonitor does not declare DPI awareness, so
+# Windows virtualizes every coordinate this module sees to 96 DPI: a constant
+# in that space is correct at any display scaling.
 _MIN_COMPANION_WIDTH = 60
 
 # While visible, re-check taskbar geometry once per second so the label follows
@@ -136,6 +133,7 @@ class NativeWindow(Protocol):
     def find_taskbar(self) -> int: ...
     def find_notification_area(self, taskbar: int) -> int: ...
     def get_rect(self, handle: int) -> Rect: ...
+    def content_width_for(self, text: str) -> int: ...
     def create_window(self, *, text: str) -> int: ...
     def attach_to_taskbar(self, handle: int, taskbar: int) -> bool: ...
     def list_sibling_rects(self, taskbar: int, exclude_handle: int) -> list[Rect]: ...
@@ -143,6 +141,7 @@ class NativeWindow(Protocol):
     def refresh_theme(self, handle: int) -> None: ...
     def move_window(self, handle: int, rect: Rect, *, topmost: bool) -> None: ...
     def set_text(self, handle: int, text: str) -> None: ...
+    def set_tooltip(self, handle: int, tooltip: str) -> None: ...
     def set_visible(self, handle: int, visible: bool) -> None: ...
     def pump_messages(self, stop_requested: threading.Event, duration_seconds: float) -> None: ...
     def close_window(self, handle: int) -> None: ...
@@ -155,6 +154,7 @@ class _NativeSession:
     handle: int
     attached: bool
     rendered_text: str
+    rendered_tooltip: str
     rendered_visible: bool = False
     position: Rect | None = None
     topmost_asserted_at: float | None = None
@@ -192,6 +192,7 @@ class TaskbarCompanion:
         self._thread: threading.Thread | None = None
         self._display_changed = threading.Condition()
         self._text = LOADING_TASKBAR_TEXT
+        self._tooltip = "Claude Monitor — loading…"
         self._visible = initial_visible
         self._healthy = True
 
@@ -210,10 +211,12 @@ class TaskbarCompanion:
         """
         return self._healthy
 
-    def update(self, text: str) -> None:
-        """Store text for the UI thread to paint on its next visible pass."""
+    def update(self, text: str, tooltip: str | None = None) -> None:
+        """Store taskbar text and hover detail for the next UI-thread pass."""
         with self._display_changed:
             self._text = text
+            if tooltip is not None:
+                self._tooltip = tooltip
             self._display_changed.notify_all()
 
     def set_visible(self, visible: bool) -> None:
@@ -252,10 +255,10 @@ class TaskbarCompanion:
                 return
         self._thread = None
 
-    def _display_state(self) -> tuple[str, bool]:
-        """Take one consistent snapshot of text and visibility requests."""
+    def _display_state(self) -> tuple[str, str, bool]:
+        """Take one consistent snapshot of text, tooltip, and visibility."""
         with self._display_changed:
-            return self._text, self._visible
+            return self._text, self._tooltip, self._visible
 
     def _wait_until_visible(self) -> None:
         """Sleep without polling until the user shows the companion or quits."""
@@ -325,7 +328,7 @@ class TaskbarCompanion:
         Any failure after the window exists destroys it before propagating,
         because the caller has no handle to clean up with.
         """
-        rendered_text, _requested_visible = self._display_state()
+        rendered_text, rendered_tooltip, _requested_visible = self._display_state()
         taskbar = self._native.find_taskbar()
         handle = self._native.create_window(text=rendered_text)
         try:
@@ -339,6 +342,7 @@ class TaskbarCompanion:
             # Both a child and a popup need the black background keyed out;
             # skipping it would paint a solid rectangle over the taskbar.
             self._native.set_colorkey_transparency(handle)
+            self._native.set_tooltip(handle, rendered_tooltip)
         except Exception:
             self._native.close_window(handle)
             raise
@@ -352,6 +356,7 @@ class TaskbarCompanion:
             handle=handle,
             attached=attached,
             rendered_text=rendered_text,
+            rendered_tooltip=rendered_tooltip,
         )
 
     def _close_session(self, session: _NativeSession | None) -> None:
@@ -361,11 +366,15 @@ class TaskbarCompanion:
 
     def _run_one_pass(self, session: _NativeSession) -> None:
         """Synchronize one round of text, placement, visibility, and messages."""
-        requested_text, requested_visible = self._display_state()
+        requested_text, requested_tooltip, requested_visible = self._display_state()
 
         if requested_text != session.rendered_text:
             self._native.set_text(session.handle, requested_text)
             session.rendered_text = requested_text
+
+        if requested_tooltip != session.rendered_tooltip:
+            self._native.set_tooltip(session.handle, requested_tooltip)
+            session.rendered_tooltip = requested_tooltip
 
         if not requested_visible:
             self._hide(session)
@@ -457,18 +466,29 @@ class TaskbarCompanion:
         return now - session.topmost_asserted_at >= _TOPMOST_REASSERT_INTERVAL_SECONDS
 
     def _compute_position(self, session: _NativeSession) -> Rect:
-        """Calculate the label's coordinates from the taskbar and clock areas."""
+        """Calculate the label's coordinates from the taskbar and clock areas.
+
+        The width is measured from the text currently on screen rather than a
+        fixed constant, so a short label like an error code never leaves dead
+        space between it and the notification area, and a long one is never
+        clipped.
+        """
         taskbar = self._native.find_taskbar()
         notification = self._native.find_notification_area(taskbar)
         taskbar_rect = self._native.get_rect(taskbar)
         notification_rect = self._native.get_rect(notification)
         siblings = self._native.list_sibling_rects(taskbar, session.handle)
+        content_width = self._native.content_width_for(session.rendered_text)
 
+        # The minimum equals the requested width: with the slot sized to fit
+        # exactly, any narrower slot would clip content rather than merely
+        # look cramped, so there is no partial-degradation width to accept.
         position = companion_slot(
             taskbar_rect,
             notification_rect,
             siblings,
-            width=_COMPANION_WIDTH,
+            width=content_width,
+            minimum_width=content_width,
         )
         if session.attached:
             # Child windows use coordinates relative to their parent taskbar.
@@ -495,8 +515,8 @@ class DisabledTaskbarCompanion:
     visible = False
     healthy = False
 
-    def update(self, text: str) -> None:
-        """Discard display text; there is no window to paint it on."""
+    def update(self, text: str, tooltip: str | None = None) -> None:
+        """Discard display text and hover detail; there is no window for them."""
 
     def set_visible(self, visible: bool) -> None:
         """Ignore visibility changes; the feature is unavailable."""

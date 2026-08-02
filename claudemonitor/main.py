@@ -36,7 +36,7 @@ def _apply_display(
 ) -> None:
     """Apply one processed state to the tray and taskbar surfaces."""
     tray.apply(icon, state)
-    companion.update(state.taskbar_text)
+    companion.update(state.taskbar_text, state.tooltip)
 
 
 def _toggle_taskbar_visibility(

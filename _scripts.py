@@ -7,5 +7,6 @@ def build():
         "--windowed",
         "--name", "ClaudeMonitor",
         "--collect-submodules", "claudemonitor",
+        "--add-data", "claudemonitor/assets;claudemonitor/assets",
         "run.py",
     ])

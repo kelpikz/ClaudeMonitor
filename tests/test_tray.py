@@ -71,7 +71,7 @@ class TestApplyNeverExceedsTooltipLimit:
             icon_color="grey",
             tooltip="z" * 500,
             menu_status_label="Updated 1s ago",
-            taskbar_text="Claude: unavailable",
+            taskbar_text="unavailable",
         )
         tray.apply(icon, state)
         assert len(icon.title) <= _MAX_TOOLTIP_LEN
@@ -114,7 +114,7 @@ class TestTaskbarMenuItem:
             icon_color="green",
             tooltip="usage",
             menu_status_label="Updated 1s ago",
-            taskbar_text="Claude: 80% (3 hours)",
+            taskbar_text="80% (3h 0m)",
         )
         icon = _FakeIcon()
         tray.apply(icon, state)
