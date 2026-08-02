@@ -10,3 +10,4 @@ venv/
 *.egg-info/
 .claude
 docs/
+.artifacts
