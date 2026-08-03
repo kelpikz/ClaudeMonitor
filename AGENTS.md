@@ -10,6 +10,7 @@ claudemonitor/
   fetcher.py              — calls Anthropic API; always returns AnthropicUsageData (errors included, never raises)
   processor.py            — pure function: AnthropicUsageData -> DisplayState; owns all string formatting
   tray.py                 — drives pystray icon, tooltip, and menu; init() must be called before apply()
+  icon_art.py             — pure Pillow drawing of the tray status tile (no pystray, no Windows state)
   models.py               — shared cross-layer types: UsageWindow, AnthropicUsageData, DisplayState, Rect
   config.py               — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config
   notifications.py        — decides when a threshold crossing warrants a desktop notification

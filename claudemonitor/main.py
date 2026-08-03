@@ -13,7 +13,7 @@ from typing import Callable
 
 import pystray
 
-from . import fetcher, processor, tray
+from . import autostart, fetcher, processor, tray
 from .config import load_config, save_taskbar_enabled
 from .notifications import ThresholdNotifier
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
@@ -56,6 +56,34 @@ def _toggle_taskbar_visibility(
         persist(visible)
     except Exception:
         log.exception("unable to persist taskbar visibility")
+
+
+def _startup_registration_enabled(check: Callable[[], bool]) -> bool:
+    """Read startup state without allowing a registry error into pystray."""
+    try:
+        return check()
+    except OSError:
+        log.exception("unable to read Windows startup registration")
+        return False
+
+
+def _toggle_startup_registration(
+    check: Callable[[], bool],
+    persist: Callable[[bool], None],
+) -> None:
+    """Flip per-user startup registration without crashing the tray callback."""
+    try:
+        persist(not check())
+    except OSError:
+        log.exception("unable to update Windows startup registration")
+
+
+def _repair_startup_registration(repair: Callable[[], bool]) -> None:
+    """Self-heal an opted-in startup command after the application moves."""
+    try:
+        repair()
+    except OSError:
+        log.exception("unable to repair Windows startup registration")
 
 
 def _wait_with_display_refresh(
@@ -186,6 +214,8 @@ def main() -> None:
 
     log.info("ClaudeMonitor starting")
 
+    _repair_startup_registration(autostart.repair_if_enabled)
+
     cfg = load_config()
     manual_refresh = threading.Event()
     shutdown_requested = threading.Event()
@@ -198,6 +228,11 @@ def main() -> None:
         taskbar_visible=lambda: companion.visible,
         toggle_taskbar=lambda: _toggle_taskbar_visibility(companion, save_taskbar_enabled),
         taskbar_healthy=lambda: companion.healthy,
+        startup_enabled=lambda: _startup_registration_enabled(autostart.is_enabled),
+        toggle_startup=lambda: _toggle_startup_registration(
+            autostart.is_enabled,
+            autostart.set_enabled,
+        ),
     )
     companion.start()
 

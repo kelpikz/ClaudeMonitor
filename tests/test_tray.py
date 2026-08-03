@@ -149,3 +149,54 @@ class TestTaskbarMenuItem:
 
         assert toggles == [None]
         assert icon.menu_updates == 1
+
+
+class TestStartWithWindowsMenuItem:
+    """The tray exposes Windows startup registration as a checked toggle."""
+
+    def _menu_item(self):
+        icon = _FakeIcon()
+        tray.apply(
+            icon,
+            DisplayState(
+                icon_color="green",
+                tooltip="usage",
+                menu_status_label="Updated 1s ago",
+                taskbar_text="80% (3h 0m)",
+            ),
+        )
+        return next(item for item in icon.menu.items if item.text == "Start with Windows")
+
+    def test_menu_offers_the_startup_toggle(self):
+        tray.init(threading.Event(), Path("."), startup_enabled=lambda: False)
+
+        assert self._menu_item() is not None
+
+    def test_checkmark_follows_the_windows_startup_registration(self):
+        enabled = [False]
+        tray.init(
+            threading.Event(),
+            Path("."),
+            startup_enabled=lambda: enabled[0],
+        )
+
+        assert self._menu_item().checked is False
+
+        enabled[0] = True
+
+        assert self._menu_item().checked is True
+
+    def test_toggle_updates_registration_and_refreshes_the_menu(self):
+        toggles: list[None] = []
+        tray.init(
+            threading.Event(),
+            Path("."),
+            startup_enabled=lambda: False,
+            toggle_startup=lambda: toggles.append(None),
+        )
+        icon = _FakeIcon()
+
+        tray._on_toggle_startup(icon, None)
+
+        assert toggles == [None]
+        assert icon.menu_updates == 1

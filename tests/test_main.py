@@ -68,6 +68,60 @@ class TestToggleTaskbarVisibility:
         assert "taskbar visibility" in caplog.text
 
 
+class TestToggleStartupRegistration:
+    def test_toggle_enables_startup_when_currently_disabled(self):
+        saved: list[bool] = []
+
+        main._toggle_startup_registration(lambda: False, saved.append)
+
+        assert saved == [True]
+
+    def test_toggle_disables_startup_when_currently_enabled(self):
+        saved: list[bool] = []
+
+        main._toggle_startup_registration(lambda: True, saved.append)
+
+        assert saved == [False]
+
+    def test_toggle_survives_a_registry_failure(self, caplog):
+        def unavailable() -> bool:
+            raise OSError("registry unavailable")
+
+        with caplog.at_level(logging.ERROR):
+            main._toggle_startup_registration(unavailable, lambda enabled: None)
+
+        assert "Windows startup registration" in caplog.text
+
+
+def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
+    def unavailable() -> bool:
+        raise OSError("registry unavailable")
+
+    with caplog.at_level(logging.ERROR):
+        enabled = main._startup_registration_enabled(unavailable)
+
+    assert enabled is False
+    assert "Windows startup registration" in caplog.text
+
+
+def test_startup_repair_runs_during_initialization():
+    calls: list[None] = []
+
+    main._repair_startup_registration(lambda: calls.append(None) or True)
+
+    assert calls == [None]
+
+
+def test_startup_repair_survives_a_registry_failure(caplog):
+    def unavailable() -> bool:
+        raise OSError("registry unavailable")
+
+    with caplog.at_level(logging.ERROR):
+        main._repair_startup_registration(unavailable)
+
+    assert "Windows startup registration" in caplog.text
+
+
 def test_apply_display_updates_tray_and_taskbar(monkeypatch):
     icon = _FakeIcon()
     companion = _FakeCompanion()

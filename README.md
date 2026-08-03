@@ -2,7 +2,7 @@
 
 A Windows system-tray app that monitors your Claude usage limits at a glance.
 
-The tray icon changes color based on how much of your **5-hour** usage you have left. Hover the icon to see your current 5-hour and 7-day utilization and when each window resets. Right-click for actions like manual refresh and opening the log folder.
+The tray icon changes color based on how much of your **5-hour** usage you have left. Hover the icon to see your current 5-hour and 7-day utilization and when each window resets. Right-click for actions like manual refresh, opening the log folder, and enabling **Start with Windows** for the current Windows user.
 
 ## Development
 

@@ -34,6 +34,8 @@ _log_dir: Path | None = None
 _taskbar_visible: Callable[[], bool] | None = None
 _toggle_taskbar: Callable[[], None] | None = None
 _taskbar_healthy: Callable[[], bool] | None = None
+_startup_enabled: Callable[[], bool] | None = None
+_toggle_startup: Callable[[], None] | None = None
 
 _TASKBAR_MENU_LABEL = "Show taskbar usage"
 _TASKBAR_UNAVAILABLE_MENU_LABEL = "Show taskbar usage (unavailable — see log)"
@@ -46,16 +48,21 @@ def init(
     taskbar_visible: Callable[[], bool] | None = None,
     toggle_taskbar: Callable[[], None] | None = None,
     taskbar_healthy: Callable[[], bool] | None = None,
+    startup_enabled: Callable[[], bool] | None = None,
+    toggle_startup: Callable[[], None] | None = None,
 ) -> None:
     """Prepare tray dependencies, including the event that ends the poll loop."""
     global _manual_refresh, _shutdown_requested, _log_dir
     global _taskbar_visible, _toggle_taskbar, _taskbar_healthy
+    global _startup_enabled, _toggle_startup
     _manual_refresh = manual_refresh
     _shutdown_requested = shutdown_requested
     _log_dir = log_dir
     _taskbar_visible = taskbar_visible
     _toggle_taskbar = toggle_taskbar
     _taskbar_healthy = taskbar_healthy
+    _startup_enabled = startup_enabled
+    _toggle_startup = toggle_startup
     _build_icons()
 
 
@@ -98,6 +105,11 @@ def _build_menu(status_label: str) -> pystray.Menu:
         pystray.MenuItem("Open Anthropic console", _on_open_console),
         pystray.MenuItem("Open log folder", _on_open_log_folder),
         _taskbar_menu_item(),
+        pystray.MenuItem(
+            "Start with Windows",
+            _on_toggle_startup,
+            checked=lambda item: bool(_startup_enabled and _startup_enabled()),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _on_quit),
     )
@@ -143,6 +155,13 @@ def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
     """Toggle the companion and refresh the menu checkmark."""
     if _toggle_taskbar is not None:
         _toggle_taskbar()
+    icon.update_menu()
+
+
+def _on_toggle_startup(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    """Toggle Windows startup registration and refresh the menu checkmark."""
+    if _toggle_startup is not None:
+        _toggle_startup()
     icon.update_menu()
 
 
