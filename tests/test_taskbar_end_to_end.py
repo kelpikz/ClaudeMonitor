@@ -1,7 +1,8 @@
 """End-to-end coverage for the taskbar label.
 
 Every test here starts at the Anthropic API response and finishes at the exact
-string the native window is asked to paint, so no layer can drift from another.
+string the native window is asked to paint, driven through the real poll cycle
+so no layer can drift from another.
 """
 
 from __future__ import annotations
@@ -12,9 +13,10 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from claudemonitor import fetcher, main, processor
+from claudemonitor import fetcher, main
 from claudemonitor.config import Config
 from claudemonitor.models import Rect
+from claudemonitor.poll_cycle import PollCycle
 from claudemonitor.taskbar_companion import TaskbarCompanion
 
 
@@ -77,15 +79,6 @@ class _RecordingNativeWindow:
         pass
 
 
-class _StubIcon:
-    """Absorb the tray half of the display update so only the taskbar is asserted."""
-
-    def __init__(self) -> None:
-        self.icon = None
-        self.title = None
-        self.menu = None
-
-
 class _StubPresenter:
     """Absorb the tray half of the display so only the taskbar is asserted."""
 
@@ -115,15 +108,27 @@ def _usage_response(five_hour: dict | None, seven_day: dict | None = None) -> ht
     return httpx.Response(200, json=body, request=httpx.Request("GET", "https://example.test"))
 
 
-def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
+def _cycle_painting_into(native: _RecordingNativeWindow, presenter=None) -> tuple:
+    """Build the real poll cycle wired to a recording native window."""
+    companion = TaskbarCompanion(native=native)
+    cycle = PollCycle(
+        Config(),
+        display=main.TrayAndTaskbarDisplay(
+            presenter or _StubPresenter(), object(), companion
+        ),
+        fetch=fetcher.fetch,
+        # Freeze the clock so reset countdowns are deterministic.
+        now=lambda: NOW,
+    )
+    return cycle, companion
+
+
+def _painted_label() -> str:
     """Run one full fetch -> process -> display -> native paint cycle."""
     native = _RecordingNativeWindow()
-    companion = TaskbarCompanion(native=native)
-    data = fetcher.fetch()
-    # Freeze the clock so reset countdowns are deterministic.
-    state = processor.getDataToDisplay(data, now=NOW, config=Config())
+    cycle, companion = _cycle_painting_into(native)
 
-    main._apply_display(_StubPresenter(), _StubIcon(), state, companion)
+    state = cycle.run_once()
 
     companion._run()
     # Every response case below proves the tray's processed detail reaches the
@@ -142,7 +147,7 @@ class TestHappyPath:
             ),
         )
 
-        assert _painted_label(monkeypatch) == "80% (3h 0m)"
+        assert _painted_label() == "80% (3h 0m)"
 
     def test_an_unstarted_session_is_labelled_honestly(self, monkeypatch):
         _respond_with(
@@ -150,7 +155,7 @@ class TestHappyPath:
             _usage_response({"utilization": 0.0, "resets_at": None}),
         )
 
-        assert _painted_label(monkeypatch) == "100% (not started)"
+        assert _painted_label() == "100% (not started)"
 
     def test_a_nearly_exhausted_window_reaches_the_native_label(self, monkeypatch):
         _respond_with(
@@ -160,7 +165,7 @@ class TestHappyPath:
             ),
         )
 
-        assert _painted_label(monkeypatch) == "0% (12m)"
+        assert _painted_label() == "0% (12m)"
 
 
 class TestErrorPaths:
@@ -173,7 +178,7 @@ class TestErrorPaths:
             httpx.Response(401, request=httpx.Request("GET", "https://example.test")),
         )
 
-        assert _painted_label(monkeypatch) == "token expired"
+        assert _painted_label() == "token expired"
 
     def test_rate_limited_without_previous_data(self, monkeypatch):
         _respond_with(
@@ -181,7 +186,7 @@ class TestErrorPaths:
             httpx.Response(429, request=httpx.Request("GET", "https://example.test")),
         )
 
-        assert _painted_label(monkeypatch) == "rate limited"
+        assert _painted_label() == "rate limited"
 
     def test_network_failure(self, monkeypatch):
         monkeypatch.setattr(
@@ -195,7 +200,7 @@ class TestErrorPaths:
 
         monkeypatch.setattr(httpx, "get", refuse)
 
-        assert _painted_label(monkeypatch) == "offline"
+        assert _painted_label() == "offline"
 
     def test_missing_credentials(self, monkeypatch):
         def missing():
@@ -203,14 +208,40 @@ class TestErrorPaths:
 
         monkeypatch.setattr(fetcher, "_read_credentials", missing)
 
-        assert _painted_label(monkeypatch) == "not logged in"
+        assert _painted_label() == "not logged in"
 
     def test_unexpected_response_shape(self, monkeypatch):
         _respond_with(monkeypatch, _usage_response({"nonsense": True}))
 
-        assert _painted_label(monkeypatch) == "bad response"
+        assert _painted_label() == "bad response"
 
     def test_response_without_usage_windows(self, monkeypatch):
         _respond_with(monkeypatch, _usage_response(None))
 
-        assert _painted_label(monkeypatch) == "no data"
+        assert _painted_label() == "no data"
+
+
+class TestResilience:
+    """A tray surface that raises must not end the loop feeding the taskbar."""
+
+    class _BrokenPresenter:
+        def apply(self, icon, state):
+            raise ValueError("string too long")
+
+        def notify(self, icon, title, message):
+            pass
+
+    def test_a_failing_tray_does_not_stop_the_next_cycle(self, monkeypatch):
+        _respond_with(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 20.0, "resets_at": (NOW + timedelta(hours=3)).isoformat()}
+            ),
+        )
+        native = _RecordingNativeWindow()
+        cycle, _companion = _cycle_painting_into(native, self._BrokenPresenter())
+
+        cycle.run_once()
+        second = cycle.run_once()
+
+        assert second.taskbar_text == "80% (3h 0m)"

@@ -59,12 +59,47 @@ class _RecordingPresenter:
         self.notified.append((title, message))
 
 
-class _MenuIcon:
-    def __init__(self):
-        self.menu_updates = 0
+def a_state() -> DisplayState:
+    return DisplayState(
+        icon_color="green",
+        tooltip="usage",
+        menu_status_label="updated",
+        taskbar_text="80% (3h 0m)",
+    )
 
-    def update_menu(self) -> None:
-        self.menu_updates += 1
+
+# ===========================================================================
+# TrayAndTaskbarDisplay — the production adapter behind PollCycle's seam.
+# ===========================================================================
+
+
+class TestTrayAndTaskbarDisplay:
+    def test_apply_updates_both_surfaces_from_one_state(self):
+        presenter = _RecordingPresenter()
+        companion = _FakeCompanion()
+        icon = object()
+        state = a_state()
+
+        main.TrayAndTaskbarDisplay(presenter, icon, companion).apply(state)
+
+        assert presenter.applied == [(icon, state)]
+        assert companion.updates == [("80% (3h 0m)", "usage")]
+
+    def test_notify_reaches_the_tray_icon(self):
+        presenter = _RecordingPresenter()
+
+        main.TrayAndTaskbarDisplay(presenter, object(), _FakeCompanion()).notify(
+            "Claude usage below 50%", "5h usage has 49% remaining."
+        )
+
+        assert presenter.notified == [
+            ("Claude usage below 50%", "5h usage has 49% remaining.")
+        ]
+
+
+# ===========================================================================
+# Startup wiring.
+# ===========================================================================
 
 
 def test_startup_repair_runs_during_initialization():
@@ -83,23 +118,6 @@ def test_startup_repair_survives_a_registry_failure(caplog):
         main._repair_startup_registration(unavailable)
 
     assert "Windows startup registration" in caplog.text
-
-
-def test_apply_display_updates_tray_and_taskbar():
-    presenter = _RecordingPresenter()
-    icon = _FakeIcon()
-    companion = _FakeCompanion()
-    state = DisplayState(
-        icon_color="green",
-        tooltip="usage",
-        menu_status_label="updated",
-        taskbar_text="80% (3h 0m)",
-    )
-
-    main._apply_display(presenter, icon, state, companion)
-
-    assert presenter.applied == [(icon, state)]
-    assert companion.updates == [("80% (3h 0m)", "usage")]
 
 
 class TestTrayPresenterWiring:
@@ -136,6 +154,19 @@ class TestTrayPresenterWiring:
         )
 
         assert nudger.enabled is False
+
+
+class _MenuIcon:
+    def __init__(self):
+        self.menu_updates = 0
+
+    def update_menu(self) -> None:
+        self.menu_updates += 1
+
+
+# ===========================================================================
+# Session nudger construction.
+# ===========================================================================
 
 
 class TestSessionNudgerWiring:
@@ -176,6 +207,11 @@ class TestSessionNudgerWiring:
 
         assert nudger.maybe_nudge(data) is True
         assert nudger.maybe_nudge(data) is False
+
+
+# ===========================================================================
+# Waiting between polls.
+# ===========================================================================
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():
@@ -243,91 +279,3 @@ def test_ctrl_c_requests_shutdown_wakes_poll_and_stops_tray_icon():
     assert shutdown_requested.is_set()
     assert manual_refresh.is_set()
     assert icon.stop_calls == 1
-
-
-def test_poll_interval_doubles_after_rate_limit():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
-
-
-def test_poll_interval_backoff_is_capped():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-    )
-
-    assert main._next_poll_interval_seconds(400, data, baseline_seconds=60) == 600
-    assert main._next_poll_interval_seconds(600, data, baseline_seconds=60) == 600
-
-
-def test_poll_interval_honors_retry_after_on_rate_limit():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=224,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 224
-
-
-def test_poll_interval_retry_after_is_floored_at_baseline():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=30,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_falls_back_to_backoff_without_retry_after():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=None,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
-
-
-def test_poll_interval_decreases_by_five_seconds_after_success():
-    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 85
-
-
-def test_poll_interval_never_drops_below_baseline_after_success():
-    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_clamps_to_baseline_when_less_than_step_above_it():
-    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(63, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_stays_same_after_non_rate_limit_error():
-    data = AnthropicUsageData(
-        fetch_error="token_expired",
-        fetched_at=NOW,
-        status_code=401,
-    )
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
-
-
-def test_poll_interval_stays_same_after_offline_error_without_status():
-    data = AnthropicUsageData(fetch_error="offline", fetched_at=NOW)
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
