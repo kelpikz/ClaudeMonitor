@@ -111,7 +111,7 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     companion = TaskbarCompanion(native=native)
     data = fetcher.fetch()
     # Freeze the clock so reset countdowns are deterministic.
-    state = processor.process(data, now=NOW, config=Config())
+    state = processor.getDataToDisplay(data, now=NOW, config=Config())
 
     monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
     main._apply_display(_StubIcon(), state, companion)

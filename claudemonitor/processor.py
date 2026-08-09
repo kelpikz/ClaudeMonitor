@@ -186,7 +186,7 @@ def _stale_state(last_good: AnthropicUsageData, now: datetime, config: Config) -
     )
 
 
-def process(
+def getDataToDisplay(
     data: AnthropicUsageData,
     now: datetime,
     config: Config,

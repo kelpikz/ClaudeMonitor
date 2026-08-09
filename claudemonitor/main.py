@@ -304,7 +304,7 @@ def main() -> None:
                     # Read `exhausted` per call, not per poll: the nudge runs on
                     # its own thread, so the breaker can trip mid-wait and the
                     # tooltip should say so without waiting for the next fetch.
-                    return processor.process(
+                    return processor.getDataToDisplay(
                         data,
                         now=datetime.now(timezone.utc),
                         config=cfg,
