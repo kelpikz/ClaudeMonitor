@@ -726,3 +726,56 @@ class TestTaskbarText:
         state = process(data, NOW, Config(), last_good=last_good)
 
         assert state.taskbar_text == "75% (2h 0m)"
+
+
+class TestSignInNeededWording:
+    """Once the CLI nudge has given up, "start Claude Code to refresh" is advice
+    that cannot work — the credentials are dead and only a sign-in fixes them."""
+
+    def _state(self, *, exhausted: bool, fetched_at: datetime = NOW):
+        data = make_data(fetch_error="token_expired", fetched_at=fetched_at)
+        return process(data, NOW, Config(), session_refresh_exhausted=exhausted)
+
+    def test_tooltip_asks_the_user_to_sign_in(self):
+        lines = self._state(exhausted=True).tooltip.split("\n")
+        assert lines[0] == "Claude sign-in needed — run: claude /login"
+
+    def test_menu_label_reports_the_sign_in(self):
+        state = self._state(exhausted=True, fetched_at=NOW - timedelta(minutes=5))
+        assert state.menu_status_label == "Sign-in needed — last update 5m ago"
+
+    def test_taskbar_asks_for_a_sign_in(self):
+        assert self._state(exhausted=True).taskbar_text == "sign in"
+
+    def test_icon_stays_grey(self):
+        assert self._state(exhausted=True).icon_color == "grey"
+
+    def test_untripped_breaker_keeps_the_original_wording(self):
+        state = self._state(exhausted=False, fetched_at=NOW - timedelta(minutes=5))
+        assert state.tooltip.split("\n")[0] == (
+            "Claude token expired — start Claude Code to refresh"
+        )
+        assert state.menu_status_label == "Token expired — last update 5m ago"
+        assert state.taskbar_text == "token expired"
+
+    def test_the_flag_defaults_to_the_original_wording(self):
+        data = make_data(fetch_error="token_expired")
+        assert process(data, NOW, Config()).taskbar_text == "token expired"
+
+    def test_other_errors_are_unaffected_by_the_tripped_breaker(self):
+        # The breaker can also trip on a missing CLI while fetches succeed, so a
+        # tripped flag must not relabel errors a sign-in would not fix.
+        data = make_data(fetch_error="no_credentials", fetched_at=NOW)
+        state = process(data, NOW, Config(), session_refresh_exhausted=True)
+        assert state.taskbar_text == "not logged in"
+        assert state.tooltip.split("\n")[0] == (
+            "Claude credentials not found — log in via Claude Code"
+        )
+
+    def test_successful_usage_is_unaffected_by_the_tripped_breaker(self):
+        data = make_data(
+            five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(hours=1))
+        )
+        state = process(data, NOW, Config(), session_refresh_exhausted=True)
+        assert state.taskbar_text == "80% (1h 0m)"
+        assert state.icon_color == "green"

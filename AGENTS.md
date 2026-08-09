@@ -14,6 +14,7 @@ claudemonitor/
   models.py               — shared cross-layer types: UsageWindow, AnthropicUsageData, DisplayState, Rect
   config.py               — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config
   notifications.py        — decides when a threshold crossing warrants a desktop notification
+  cli_refresher.py        — runs `claude -p --model haiku "hi"` to wake an idle session or expired token
   taskbar_companion.py    — controller for the taskbar usage label: owns its UI thread and placement maths
   win32_taskbar_window.py — the only module that calls user32/gdi32; implements the NativeWindow protocol
   win32_bindings.py       — Windows constants, C structs, and function signature tables (no behavior)

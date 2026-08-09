@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timezone
 
 from claudemonitor import main
+from claudemonitor.config import Config, SessionRefreshConfig
 from claudemonitor.models import AnthropicUsageData
 
 NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
@@ -138,6 +139,72 @@ def test_apply_display_updates_tray_and_taskbar(monkeypatch):
 
     assert applied == [(icon, state)]
     assert companion.updates == [("80% (3h 0m)", "usage")]
+
+
+class TestSessionNudgerWiring:
+    """A completed CLI refresh must wake the poll loop so the tray shows it at once."""
+
+    def _nudger(self, **session_refresh):
+        """Build the production nudger with a synchronous, always-succeeding CLI."""
+        cfg = Config(session_refresh=SessionRefreshConfig(**session_refresh))
+        manual_refresh = threading.Event()
+        nudger = main.create_session_nudger(
+            cfg,
+            manual_refresh,
+            invoke=lambda: True,
+            start_background=lambda work: work(),
+        )
+        return nudger, manual_refresh
+
+    def test_a_successful_refresh_sets_the_manual_refresh_event(self):
+        nudger, manual_refresh = self._nudger()
+
+        data = AnthropicUsageData(fetch_error="token_expired", fetched_at=NOW)
+
+        assert nudger.maybe_nudge(data) is True
+        assert manual_refresh.is_set()
+
+    def test_disabling_the_config_section_disables_the_nudger(self):
+        nudger, manual_refresh = self._nudger(enabled=False)
+
+        data = AnthropicUsageData(fetch_error="token_expired", fetched_at=NOW)
+
+        assert nudger.maybe_nudge(data) is False
+        assert not manual_refresh.is_set()
+
+    def test_toggle_flips_the_nudger_and_persists_the_choice(self):
+        nudger, _manual_refresh = self._nudger()
+        saved: list[bool] = []
+
+        main._toggle_session_refresh(nudger, saved.append)
+
+        assert nudger.enabled is False
+        assert saved == [False]
+
+        main._toggle_session_refresh(nudger, saved.append)
+
+        assert nudger.enabled is True
+        assert saved == [False, True]
+
+    def test_toggle_survives_a_failing_config_write(self, caplog):
+        nudger, _manual_refresh = self._nudger()
+
+        def unavailable(_enabled: bool) -> None:
+            raise OSError("config is read-only")
+
+        with caplog.at_level(logging.ERROR):
+            main._toggle_session_refresh(nudger, unavailable)
+
+        assert nudger.enabled is False
+        assert "session refresh" in caplog.text
+
+    def test_the_configured_cooldown_gates_the_second_attempt(self):
+        nudger, _manual_refresh = self._nudger(cooldown_seconds=10_000)
+
+        data = AnthropicUsageData(fetch_error="token_expired", fetched_at=NOW)
+
+        assert nudger.maybe_nudge(data) is True
+        assert nudger.maybe_nudge(data) is False
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():

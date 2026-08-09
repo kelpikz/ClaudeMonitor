@@ -13,8 +13,13 @@ from typing import Callable
 
 import pystray
 
-from . import autostart, fetcher, processor, tray
-from .config import load_config, save_taskbar_enabled
+from . import autostart, cli_refresher, fetcher, processor, tray
+from .config import (
+    Config,
+    load_config,
+    save_session_refresh_enabled,
+    save_taskbar_enabled,
+)
 from .notifications import ThresholdNotifier
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 from .win32_taskbar_window import enable_per_monitor_dpi_awareness
@@ -56,6 +61,19 @@ def _toggle_taskbar_visibility(
         persist(visible)
     except Exception:
         log.exception("unable to persist taskbar visibility")
+
+
+def _toggle_session_refresh(
+    nudger: cli_refresher.SessionNudger,
+    persist: Callable[[bool], None],
+) -> None:
+    """Toggle Session refresh"""
+    enabled = not nudger.enabled
+    nudger.set_enabled(enabled)
+    try:
+        persist(enabled)
+    except Exception:
+        log.exception("unable to persist session refresh setting")
 
 
 def _startup_registration_enabled(check: Callable[[], bool]) -> bool:
@@ -157,6 +175,24 @@ def _remove_console_shutdown_handler(handler: ctypes._CFuncPtr) -> None:
     kernel32.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), False)
 
 
+def create_session_nudger(
+    cfg: Config,
+    manual_refresh: threading.Event,
+    **overrides,
+) -> cli_refresher.SessionNudger:
+    """Build the CLI session nudger, re-polling as soon as a refresh succeeds.
+
+    Waking the loop matters because the whole point of the nudge is that the
+    numbers it produces are newer than the ones that triggered it.
+    """
+    return cli_refresher.SessionNudger(
+        enabled=cfg.session_refresh.enabled,
+        cooldown_seconds=cfg.session_refresh.cooldown_seconds,
+        on_refreshed=manual_refresh.set,
+        **overrides,
+    )
+
+
 def _next_poll_interval_seconds(
     current_interval_seconds: int,
     data: fetcher.AnthropicUsageData,
@@ -220,6 +256,9 @@ def main() -> None:
     manual_refresh = threading.Event()
     shutdown_requested = threading.Event()
     companion = create_taskbar_companion(initial_visible=cfg.taskbar.enabled)
+    # Built before the tray so its menu toggle has something to flip; the poll
+    # loop starts later and closes over the same instance.
+    session_nudger = create_session_nudger(cfg, manual_refresh)
 
     tray.init(
         manual_refresh,
@@ -232,6 +271,11 @@ def main() -> None:
         toggle_startup=lambda: _toggle_startup_registration(
             autostart.is_enabled,
             autostart.set_enabled,
+        ),
+        session_refresh_enabled=lambda: session_nudger.enabled,
+        toggle_session_refresh=lambda: _toggle_session_refresh(
+            session_nudger,
+            save_session_refresh_enabled,
         ),
     )
     companion.start()
@@ -248,6 +292,7 @@ def main() -> None:
             try:
                 data = fetcher.fetch()
                 notifications = threshold_notifier.check(data)
+                session_nudger.maybe_nudge(data)
                 if data.fetch_error is None and data.five_hour is not None:
                     last_good = data
                 current_poll_interval_seconds = _next_poll_interval_seconds(
@@ -256,11 +301,15 @@ def main() -> None:
                     baseline_seconds=cfg.polling.interval_seconds,
                 )
                 def build_state() -> processor.DisplayState:
+                    # Read `exhausted` per call, not per poll: the nudge runs on
+                    # its own thread, so the breaker can trip mid-wait and the
+                    # tooltip should say so without waiting for the next fetch.
                     return processor.process(
                         data,
                         now=datetime.now(timezone.utc),
                         config=cfg,
                         last_good=last_good,
+                        session_refresh_exhausted=session_nudger.exhausted,
                     )
             except Exception:
                 log.exception("unhandled error in poll loop")

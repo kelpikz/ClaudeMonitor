@@ -26,6 +26,14 @@ red_below   = 20
 [taskbar]
 # Show the compact Claude usage summary in the Windows taskbar.
 enabled = true
+
+[session_refresh]
+# When the token has expired or the 5h window is completely untouched, run
+# `claude -p --model haiku "hi"` so Claude Code renews the token and opens the
+# session. Costs a negligible amount of usage; disable to never spend any.
+enabled = true
+# Shortest gap between two such calls, in seconds.
+cooldown_seconds = 900
 """
 
 
@@ -42,10 +50,16 @@ class TaskbarConfig(BaseModel):
     enabled: bool = True
 
 
+class SessionRefreshConfig(BaseModel):
+    enabled: bool = True
+    cooldown_seconds: float = 900
+
+
 class Config(BaseModel):
     polling: PollingConfig = PollingConfig()
     thresholds: ThresholdsConfig = ThresholdsConfig()
     taskbar: TaskbarConfig = TaskbarConfig()
+    session_refresh: SessionRefreshConfig = SessionRefreshConfig()
 
 
 _Section = TypeVar("_Section", bound=BaseModel)
@@ -100,6 +114,7 @@ def load_config() -> Config:
         polling=_section(PollingConfig, raw, "polling"),
         thresholds=_section(ThresholdsConfig, raw, "thresholds"),
         taskbar=_section(TaskbarConfig, raw, "taskbar"),
+        session_refresh=_section(SessionRefreshConfig, raw, "session_refresh"),
     )
 
 
@@ -117,15 +132,25 @@ def _editable_document(path: Path) -> tomlkit.TOMLDocument:
         return tomlkit.parse(_DEFAULT_TOML)
 
 
-def save_taskbar_enabled(enabled: bool) -> None:
-    """Persist taskbar visibility using a comment-preserving TOML document."""
+def _save_setting(section_name: str, key: str, value: object) -> None:
+    """Write one setting back, preserving the comments around every other one."""
     path = _config_path()
     if not path.exists():
         _seed_default_config(path)
     document = _editable_document(path)
-    taskbar = document.get("taskbar")
-    if taskbar is None:
-        taskbar = tomlkit.table()
-        document["taskbar"] = taskbar
-    taskbar["enabled"] = enabled
+    section = document.get(section_name)
+    if section is None:
+        section = tomlkit.table()
+        document[section_name] = section
+    section[key] = value
     _write_atomically(path, tomlkit.dumps(document))
+
+
+def save_taskbar_enabled(enabled: bool) -> None:
+    """Persist whether the taskbar usage label is shown."""
+    _save_setting("taskbar", "enabled", enabled)
+
+
+def save_session_refresh_enabled(enabled: bool) -> None:
+    """Persist whether an idle session may be woken with a Claude CLI prompt."""
+    _save_setting("session_refresh", "enabled", enabled)

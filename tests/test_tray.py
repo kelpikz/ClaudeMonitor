@@ -151,6 +151,67 @@ class TestTaskbarMenuItem:
         assert icon.menu_updates == 1
 
 
+class TestSessionRefreshMenuItem:
+    """The nudge spends real usage, so the tray must expose an obvious off switch."""
+
+    def _menu_item(self):
+        icon = _FakeIcon()
+        tray.apply(
+            icon,
+            DisplayState(
+                icon_color="green",
+                tooltip="usage",
+                menu_status_label="Updated 1s ago",
+                taskbar_text="80% (3h 0m)",
+            ),
+        )
+        return next(
+            item for item in icon.menu.items if item.text == "Auto-refresh Claude session"
+        )
+
+    def test_menu_offers_the_session_refresh_toggle(self):
+        tray.init(threading.Event(), Path("."), session_refresh_enabled=lambda: True)
+
+        assert self._menu_item() is not None
+
+    def test_checkmark_follows_the_configured_setting(self):
+        enabled = [True]
+        tray.init(
+            threading.Event(),
+            Path("."),
+            session_refresh_enabled=lambda: enabled[0],
+        )
+
+        assert self._menu_item().checked is True
+
+        enabled[0] = False
+
+        assert self._menu_item().checked is False
+
+    def test_toggle_runs_the_configured_action_and_refreshes_the_menu(self):
+        toggles: list[None] = []
+        tray.init(
+            threading.Event(),
+            Path("."),
+            session_refresh_enabled=lambda: True,
+            toggle_session_refresh=lambda: toggles.append(None),
+        )
+        icon = _FakeIcon()
+
+        tray._on_toggle_session_refresh(icon, None)
+
+        assert toggles == [None]
+        assert icon.menu_updates == 1
+
+    def test_unwired_toggle_still_refreshes_the_menu(self):
+        tray.init(threading.Event(), Path("."))
+        icon = _FakeIcon()
+
+        tray._on_toggle_session_refresh(icon, None)
+
+        assert icon.menu_updates == 1
+
+
 class TestStartWithWindowsMenuItem:
     """The tray exposes Windows startup registration as a checked toggle."""
 

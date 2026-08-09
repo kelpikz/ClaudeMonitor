@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from claudemonitor import config
-from claudemonitor.config import PollingConfig, TaskbarConfig
+from claudemonitor.config import PollingConfig, SessionRefreshConfig, TaskbarConfig
 
 
 @pytest.fixture
@@ -27,6 +27,55 @@ def test_default_polling_interval_is_one_minute():
 
 def test_taskbar_display_is_enabled_by_default():
     assert TaskbarConfig().enabled is True
+
+
+def test_session_refresh_is_enabled_with_a_fifteen_minute_cooldown_by_default():
+    assert SessionRefreshConfig().enabled is True
+    assert SessionRefreshConfig().cooldown_seconds == 900
+
+
+def test_session_refresh_can_be_turned_off_in_the_config_file(config_path):
+    _write_config(config_path, "[session_refresh]\nenabled = false\ncooldown_seconds = 60\n")
+
+    loaded = config.load_config()
+
+    assert loaded.session_refresh.enabled is False
+    assert loaded.session_refresh.cooldown_seconds == 60
+
+
+def test_session_refresh_toggle_is_persisted_without_touching_other_settings(config_path):
+    _write_config(
+        config_path,
+        "[polling]\ninterval_seconds = 30\n\n[session_refresh]\ncooldown_seconds = 120\n",
+    )
+
+    config.save_session_refresh_enabled(False)
+
+    loaded = config.load_config()
+    assert loaded.session_refresh.enabled is False
+    assert loaded.session_refresh.cooldown_seconds == 120
+    assert loaded.polling.interval_seconds == 30
+
+    config.save_session_refresh_enabled(True)
+
+    assert config.load_config().session_refresh.enabled is True
+
+
+def test_session_refresh_toggle_seeds_the_section_when_it_is_absent(config_path):
+    _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
+
+    config.save_session_refresh_enabled(False)
+
+    saved_text = config_path.read_text(encoding="utf-8")
+    assert config.load_config().session_refresh.enabled is False
+    assert "# Keep this user note" in saved_text
+
+
+def test_seeded_config_documents_the_session_refresh_section(config_path):
+    loaded = config.load_config()
+
+    assert "[session_refresh]" in config_path.read_text(encoding="utf-8")
+    assert loaded.session_refresh.enabled is True
 
 
 def test_taskbar_visibility_is_persisted_in_existing_config(config_path):

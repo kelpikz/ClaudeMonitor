@@ -21,6 +21,7 @@ _TASKBAR_ERROR_TEXTS = {
     "rate_limited": "rate limited",
 }
 _TASKBAR_UNKNOWN_ERROR_TEXT = "unavailable"
+_TASKBAR_SIGN_IN_TEXT = "sign in"
 _TASKBAR_NO_DATA_TEXT = "no data"
 _TASKBAR_INTERNAL_ERROR_TEXT = "error"
 
@@ -68,9 +69,21 @@ def _taskbar_text(window: UsageWindow, now: datetime) -> str:
     return f"{remaining_usage}% ({_taskbar_reset_text(window.resets_at, now)})"
 
 
-def _taskbar_error_text(error: str | None) -> str:
+def _taskbar_error_text(error: str | None, session_refresh_exhausted: bool = False) -> str:
     """Map a fetch error to a short label that still says what went wrong."""
+    if _needs_sign_in(error, session_refresh_exhausted):
+        return _TASKBAR_SIGN_IN_TEXT
     return _TASKBAR_ERROR_TEXTS.get(error or "", _TASKBAR_UNKNOWN_ERROR_TEXT)
+
+
+def _needs_sign_in(error: str | None, session_refresh_exhausted: bool) -> bool:
+    """Return whether an expired token has outlived every automatic refresh.
+
+    Only ``token_expired`` changes wording here. The nudge can also exhaust itself
+    on a missing CLI while fetches succeed, and no other error is something a
+    sign-in would fix.
+    """
+    return error == "token_expired" and session_refresh_exhausted
 
 
 def _updated_at_line(fetched_at: datetime, now: datetime) -> str:
@@ -89,11 +102,17 @@ def _format_elapsed(seconds: int) -> str:
     return f"{hours}h"
 
 
-def _menu_label(data: AnthropicUsageData, now: datetime) -> str:
+def _menu_label(
+    data: AnthropicUsageData,
+    now: datetime,
+    session_refresh_exhausted: bool = False,
+) -> str:
     elapsed = int((now - data.fetched_at).total_seconds())
     elapsed_str = _format_elapsed(max(0, elapsed))
     if data.fetch_error in ("timeout", "offline"):
         return f"Offline — last update {elapsed_str} ago"
+    if _needs_sign_in(data.fetch_error, session_refresh_exhausted):
+        return f"Sign-in needed — last update {elapsed_str} ago"
     if data.fetch_error == "token_expired":
         return f"Token expired — last update {elapsed_str} ago"
     if data.fetch_error == "no_credentials":
@@ -172,6 +191,7 @@ def process(
     now: datetime,
     config: Config,
     last_good: AnthropicUsageData | None = None,
+    session_refresh_exhausted: bool = False,
 ) -> DisplayState:
     # A rate-limit doesn't mean our data is wrong, just unrefreshed. If we have a
     # previous successful result, show it (flagged stale) instead of going grey.
@@ -182,16 +202,16 @@ def process(
     ):
         return _stale_state(last_good, now, config)
 
-    label = _menu_label(data, now)
+    label = _menu_label(data, now, session_refresh_exhausted)
 
     if data.fetch_error:
-        tooltip = _error_tooltip(data.fetch_error, data, now)
+        tooltip = _error_tooltip(data.fetch_error, data, now, session_refresh_exhausted)
         tooltip += f"\n{_updated_at_line(data.fetched_at, now)}"
         return DisplayState(
             icon_color="grey",
             tooltip=tooltip,
             menu_status_label=label,
-            taskbar_text=_taskbar_error_text(data.fetch_error),
+            taskbar_text=_taskbar_error_text(data.fetch_error, session_refresh_exhausted),
         )
 
     if data.five_hour is None:
@@ -213,7 +233,16 @@ def process(
     )
 
 
-def _error_tooltip(error: str, data: AnthropicUsageData, now: datetime) -> str:
+def _error_tooltip(
+    error: str,
+    data: AnthropicUsageData,
+    now: datetime,
+    session_refresh_exhausted: bool = False,
+) -> str:
+    if _needs_sign_in(error, session_refresh_exhausted):
+        # "Start Claude Code to refresh" is advice that cannot work once the
+        # automatic refresh has already tried and failed.
+        return "Claude sign-in needed — run: claude /login"
     if error == "token_expired":
         return "Claude token expired — start Claude Code to refresh"
     if error in ("timeout", "offline"):

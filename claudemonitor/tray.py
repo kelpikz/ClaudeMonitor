@@ -36,9 +36,12 @@ _toggle_taskbar: Callable[[], None] | None = None
 _taskbar_healthy: Callable[[], bool] | None = None
 _startup_enabled: Callable[[], bool] | None = None
 _toggle_startup: Callable[[], None] | None = None
+_session_refresh_enabled: Callable[[], bool] | None = None
+_toggle_session_refresh: Callable[[], None] | None = None
 
 _TASKBAR_MENU_LABEL = "Show taskbar usage"
 _TASKBAR_UNAVAILABLE_MENU_LABEL = "Show taskbar usage (unavailable — see log)"
+_SESSION_REFRESH_MENU_LABEL = "Auto-refresh Claude session"
 
 
 def init(
@@ -50,11 +53,14 @@ def init(
     taskbar_healthy: Callable[[], bool] | None = None,
     startup_enabled: Callable[[], bool] | None = None,
     toggle_startup: Callable[[], None] | None = None,
+    session_refresh_enabled: Callable[[], bool] | None = None,
+    toggle_session_refresh: Callable[[], None] | None = None,
 ) -> None:
     """Prepare tray dependencies, including the event that ends the poll loop."""
     global _manual_refresh, _shutdown_requested, _log_dir
     global _taskbar_visible, _toggle_taskbar, _taskbar_healthy
     global _startup_enabled, _toggle_startup
+    global _session_refresh_enabled, _toggle_session_refresh
     _manual_refresh = manual_refresh
     _shutdown_requested = shutdown_requested
     _log_dir = log_dir
@@ -63,6 +69,8 @@ def init(
     _taskbar_healthy = taskbar_healthy
     _startup_enabled = startup_enabled
     _toggle_startup = toggle_startup
+    _session_refresh_enabled = session_refresh_enabled
+    _toggle_session_refresh = toggle_session_refresh
     _build_icons()
 
 
@@ -105,6 +113,13 @@ def _build_menu(status_label: str) -> pystray.Menu:
         pystray.MenuItem("Open Anthropic console", _on_open_console),
         pystray.MenuItem("Open log folder", _on_open_log_folder),
         _taskbar_menu_item(),
+        pystray.MenuItem(
+            _SESSION_REFRESH_MENU_LABEL,
+            _on_toggle_session_refresh,
+            checked=lambda item: bool(
+                _session_refresh_enabled and _session_refresh_enabled()
+            ),
+        ),
         pystray.MenuItem(
             "Start with Windows",
             _on_toggle_startup,
@@ -155,6 +170,13 @@ def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
     """Toggle the companion and refresh the menu checkmark."""
     if _toggle_taskbar is not None:
         _toggle_taskbar()
+    icon.update_menu()
+
+
+def _on_toggle_session_refresh(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    """Toggle the Claude CLI session nudge and refresh the menu checkmark."""
+    if _toggle_session_refresh is not None:
+        _toggle_session_refresh()
     icon.update_menu()
 
 
