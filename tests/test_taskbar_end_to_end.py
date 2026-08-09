@@ -86,6 +86,16 @@ class _StubIcon:
         self.menu = None
 
 
+class _StubPresenter:
+    """Absorb the tray half of the display so only the taskbar is asserted."""
+
+    def apply(self, icon, state) -> None:
+        pass
+
+    def notify(self, icon, title, message) -> None:
+        pass
+
+
 def _respond_with(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> None:
     """Make fetcher.fetch see one canned Anthropic API response."""
     monkeypatch.setattr(
@@ -113,8 +123,7 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     # Freeze the clock so reset countdowns are deterministic.
     state = processor.getDataToDisplay(data, now=NOW, config=Config())
 
-    monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
-    main._apply_display(_StubIcon(), state, companion)
+    main._apply_display(_StubPresenter(), _StubIcon(), state, companion)
 
     companion._run()
     # Every response case below proves the tray's processed detail reaches the

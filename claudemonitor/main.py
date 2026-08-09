@@ -31,12 +31,13 @@ _CTRL_BREAK_EVENT = 1
 
 
 def _apply_display(
+    presenter: tray.TrayPresenter,
     icon: pystray.Icon,
     state: processor.DisplayState,
     companion: TaskbarDisplay,
 ) -> None:
     """Apply one processed state to the tray and taskbar surfaces."""
-    tray.apply(icon, state)
+    presenter.apply(icon, state)
     companion.update(state.taskbar_text, state.tooltip)
 
 
@@ -137,6 +138,28 @@ def create_session_nudger(
     )
 
 
+def create_tray_presenter(
+    *,
+    manual_refresh: threading.Event,
+    shutdown_requested: threading.Event,
+    log_dir: Path,
+    companion: TaskbarDisplay,
+    session_nudger: cli_refresher.SessionNudger,
+) -> tray.TrayPresenter:
+    """Wire every tray menu entry to the setting that owns its value."""
+    return tray.TrayPresenter(
+        tray.TrayActions(
+            manual_refresh=manual_refresh,
+            log_dir=log_dir,
+            shutdown_requested=shutdown_requested,
+            taskbar=settings.taskbar_setting(companion),
+            session_refresh=settings.session_refresh_setting(session_nudger),
+            startup=settings.startup_setting(),
+            taskbar_healthy=lambda: companion.healthy,
+        )
+    )
+
+
 def _next_poll_interval_seconds(
     current_interval_seconds: int,
     data: fetcher.AnthropicUsageData,
@@ -204,29 +227,12 @@ def main() -> None:
     # loop starts later and closes over the same instance.
     session_nudger = create_session_nudger(cfg, manual_refresh)
 
-    taskbar = settings.taskbar_setting(companion)
-    session_refresh = settings.session_refresh_setting(session_nudger)
-    startup = settings.startup_setting()
-
-    def flip(setting: settings.Setting) -> Callable[[], None]:
-        """Adapt a Setting to the no-result callback the tray menu expects."""
-
-        def toggle() -> None:
-            setting.toggle()
-
-        return toggle
-
-    tray.init(
-        manual_refresh,
-        log_dir,
-        shutdown_requested,
-        taskbar_visible=lambda: taskbar.enabled,
-        toggle_taskbar=flip(taskbar),
-        taskbar_healthy=lambda: companion.healthy,
-        startup_enabled=lambda: startup.enabled,
-        toggle_startup=flip(startup),
-        session_refresh_enabled=lambda: session_refresh.enabled,
-        toggle_session_refresh=flip(session_refresh),
+    presenter = create_tray_presenter(
+        manual_refresh=manual_refresh,
+        shutdown_requested=shutdown_requested,
+        log_dir=log_dir,
+        companion=companion,
+        session_nudger=session_nudger,
     )
     companion.start()
 
@@ -266,22 +272,24 @@ def main() -> None:
                 def build_state() -> processor.DisplayState:
                     return processor.internal_error_state(now=datetime.now(timezone.utc))
 
-            _apply_display(icon, build_state(), companion)
+            _apply_display(presenter, icon, build_state(), companion)
             for notification in notifications:
-                tray.notify(icon, title=notification.title, message=notification.message)
+                presenter.notify(icon, notification.title, notification.message)
             manual_refresh.clear()
             if shutdown_requested.is_set():
                 break
             _wait_with_display_refresh(
                 manual_refresh,
                 interval_seconds=current_poll_interval_seconds,
-                refresh_display=lambda: _apply_display(icon, build_state(), companion),
+                refresh_display=lambda: _apply_display(
+                    presenter, icon, build_state(), companion
+                ),
                 shutdown_requested=shutdown_requested,
             )
 
     icon = pystray.Icon(
         "ClaudeMonitor",
-        icon=tray.loading_icon(),
+        icon=presenter.loading_icon(),
         title="Claude Monitor — loading…",
         menu=pystray.Menu(),
     )

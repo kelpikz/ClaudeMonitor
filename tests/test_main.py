@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 from claudemonitor import main
 from claudemonitor.config import Config, SessionRefreshConfig
-from claudemonitor.models import AnthropicUsageData
+from claudemonitor.models import AnthropicUsageData, DisplayState
 
 NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
 
@@ -35,12 +36,35 @@ class _FakeCompanion:
     def __init__(self, visible: bool = True):
         self.updates: list[tuple[str, str]] = []
         self.visible = visible
+        self.healthy = True
 
     def update(self, text: str, tooltip: str) -> None:
         self.updates.append((text, tooltip))
 
     def set_visible(self, visible: bool) -> None:
         self.visible = visible
+
+
+class _RecordingPresenter:
+    """Absorb the tray half of a display update so only the wiring is asserted."""
+
+    def __init__(self):
+        self.applied: list[tuple[object, DisplayState]] = []
+        self.notified: list[tuple[str, str]] = []
+
+    def apply(self, icon, state) -> None:
+        self.applied.append((icon, state))
+
+    def notify(self, icon, title, message) -> None:
+        self.notified.append((title, message))
+
+
+class _MenuIcon:
+    def __init__(self):
+        self.menu_updates = 0
+
+    def update_menu(self) -> None:
+        self.menu_updates += 1
 
 
 def test_startup_repair_runs_during_initialization():
@@ -61,22 +85,57 @@ def test_startup_repair_survives_a_registry_failure(caplog):
     assert "Windows startup registration" in caplog.text
 
 
-def test_apply_display_updates_tray_and_taskbar(monkeypatch):
+def test_apply_display_updates_tray_and_taskbar():
+    presenter = _RecordingPresenter()
     icon = _FakeIcon()
     companion = _FakeCompanion()
-    state = main.processor.DisplayState(
+    state = DisplayState(
         icon_color="green",
         tooltip="usage",
         menu_status_label="updated",
         taskbar_text="80% (3h 0m)",
     )
-    applied: list[object] = []
-    monkeypatch.setattr(main.tray, "apply", lambda target, value: applied.append((target, value)))
 
-    main._apply_display(icon, state, companion)
+    main._apply_display(presenter, icon, state, companion)
 
-    assert applied == [(icon, state)]
+    assert presenter.applied == [(icon, state)]
     assert companion.updates == [("80% (3h 0m)", "usage")]
+
+
+class TestTrayPresenterWiring:
+    """The tray menu must reach the settings that own each live value."""
+
+    def _presenter(self, companion, nudger):
+        return main.create_tray_presenter(
+            manual_refresh=threading.Event(),
+            shutdown_requested=threading.Event(),
+            log_dir=Path("."),
+            companion=companion,
+            session_nudger=nudger,
+        )
+
+    def test_the_taskbar_menu_entry_hides_the_real_companion(self, monkeypatch):
+        saved: list[tuple] = []
+        monkeypatch.setattr(
+            main.settings.config, "save_setting", lambda *args: saved.append(args)
+        )
+        companion = _FakeCompanion(visible=True)
+        nudger = main.create_session_nudger(Config(), threading.Event())
+
+        self._presenter(companion, nudger)._on_toggle_taskbar(_MenuIcon(), None)
+
+        assert companion.visible is False
+        assert saved == [("taskbar", "enabled", False)]
+
+    def test_the_session_refresh_entry_flips_the_real_nudger(self, monkeypatch):
+        monkeypatch.setattr(main.settings.config, "save_setting", lambda *args: None)
+        nudger = main.create_session_nudger(Config(), threading.Event())
+
+        self._presenter(_FakeCompanion(), nudger)._on_toggle_session_refresh(
+            _MenuIcon(), None
+        )
+
+        assert nudger.enabled is False
 
 
 class TestSessionNudgerWiring:
