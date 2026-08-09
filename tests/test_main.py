@@ -43,68 +43,6 @@ class _FakeCompanion:
         self.visible = visible
 
 
-class TestToggleTaskbarVisibility:
-    """Toggling runs inside pystray's message loop, where an escaping exception
-    would surface only as an invisible stderr traceback in a windowed build."""
-
-    def test_toggle_flips_visibility_and_persists_the_choice(self):
-        companion = _FakeCompanion(visible=True)
-        saved: list[bool] = []
-
-        main._toggle_taskbar_visibility(companion, saved.append)
-
-        assert companion.visible is False
-        assert saved == [False]
-
-    def test_toggle_survives_a_failing_config_write(self, caplog):
-        companion = _FakeCompanion(visible=False)
-
-        def unwritable(_visible: bool) -> None:
-            raise OSError("config file is locked")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_taskbar_visibility(companion, unwritable)
-
-        assert companion.visible is True
-        assert "taskbar visibility" in caplog.text
-
-
-class TestToggleStartupRegistration:
-    def test_toggle_enables_startup_when_currently_disabled(self):
-        saved: list[bool] = []
-
-        main._toggle_startup_registration(lambda: False, saved.append)
-
-        assert saved == [True]
-
-    def test_toggle_disables_startup_when_currently_enabled(self):
-        saved: list[bool] = []
-
-        main._toggle_startup_registration(lambda: True, saved.append)
-
-        assert saved == [False]
-
-    def test_toggle_survives_a_registry_failure(self, caplog):
-        def unavailable() -> bool:
-            raise OSError("registry unavailable")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_startup_registration(unavailable, lambda enabled: None)
-
-        assert "Windows startup registration" in caplog.text
-
-
-def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
-    def unavailable() -> bool:
-        raise OSError("registry unavailable")
-
-    with caplog.at_level(logging.ERROR):
-        enabled = main._startup_registration_enabled(unavailable)
-
-    assert enabled is False
-    assert "Windows startup registration" in caplog.text
-
-
 def test_startup_repair_runs_during_initialization():
     calls: list[None] = []
 
@@ -171,32 +109,6 @@ class TestSessionNudgerWiring:
 
         assert nudger.maybe_nudge(data) is False
         assert not manual_refresh.is_set()
-
-    def test_toggle_flips_the_nudger_and_persists_the_choice(self):
-        nudger, _manual_refresh = self._nudger()
-        saved: list[bool] = []
-
-        main._toggle_session_refresh(nudger, saved.append)
-
-        assert nudger.enabled is False
-        assert saved == [False]
-
-        main._toggle_session_refresh(nudger, saved.append)
-
-        assert nudger.enabled is True
-        assert saved == [False, True]
-
-    def test_toggle_survives_a_failing_config_write(self, caplog):
-        nudger, _manual_refresh = self._nudger()
-
-        def unavailable(_enabled: bool) -> None:
-            raise OSError("config is read-only")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_session_refresh(nudger, unavailable)
-
-        assert nudger.enabled is False
-        assert "session refresh" in caplog.text
 
     def test_the_configured_cooldown_gates_the_second_attempt(self):
         nudger, _manual_refresh = self._nudger(cooldown_seconds=10_000)

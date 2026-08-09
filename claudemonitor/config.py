@@ -132,8 +132,12 @@ def _editable_document(path: Path) -> tomlkit.TOMLDocument:
         return tomlkit.parse(_DEFAULT_TOML)
 
 
-def _save_setting(section_name: str, key: str, value: object) -> None:
-    """Write one setting back, preserving the comments around every other one."""
+def save_setting(section_name: str, key: str, value: object) -> None:
+    """Write one setting back, preserving the comments around every other one.
+
+    Deliberately generic: a new user-toggleable setting needs a new entry in the
+    seeded TOML above, not a new function here.
+    """
     path = _config_path()
     if not path.exists():
         _seed_default_config(path)
@@ -144,13 +148,3 @@ def _save_setting(section_name: str, key: str, value: object) -> None:
         document[section_name] = section
     section[key] = value
     _write_atomically(path, tomlkit.dumps(document))
-
-
-def save_taskbar_enabled(enabled: bool) -> None:
-    """Persist whether the taskbar usage label is shown."""
-    _save_setting("taskbar", "enabled", enabled)
-
-
-def save_session_refresh_enabled(enabled: bool) -> None:
-    """Persist whether an idle session may be woken with a Claude CLI prompt."""
-    _save_setting("session_refresh", "enabled", enabled)

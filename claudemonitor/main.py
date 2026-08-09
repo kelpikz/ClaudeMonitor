@@ -13,13 +13,8 @@ from typing import Callable
 
 import pystray
 
-from . import autostart, cli_refresher, fetcher, processor, tray
-from .config import (
-    Config,
-    load_config,
-    save_session_refresh_enabled,
-    save_taskbar_enabled,
-)
+from . import autostart, cli_refresher, fetcher, processor, settings, tray
+from .config import Config, load_config
 from .notifications import ThresholdNotifier
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 from .win32_taskbar_window import enable_per_monitor_dpi_awareness
@@ -43,57 +38,6 @@ def _apply_display(
     """Apply one processed state to the tray and taskbar surfaces."""
     tray.apply(icon, state)
     companion.update(state.taskbar_text, state.tooltip)
-
-
-def _toggle_taskbar_visibility(
-    companion: TaskbarDisplay,
-    persist: Callable[[bool], None],
-) -> None:
-    """Flip the taskbar label on or off and remember the choice for next launch.
-
-    This runs inside pystray's message loop, where an escaping exception would
-    surface only as a stderr traceback nobody sees in a windowed build, so a
-    failed config write is logged and the toggle still takes effect.
-    """
-    visible = not companion.visible
-    companion.set_visible(visible)
-    try:
-        persist(visible)
-    except Exception:
-        log.exception("unable to persist taskbar visibility")
-
-
-def _toggle_session_refresh(
-    nudger: cli_refresher.SessionNudger,
-    persist: Callable[[bool], None],
-) -> None:
-    """Toggle Session refresh"""
-    enabled = not nudger.enabled
-    nudger.set_enabled(enabled)
-    try:
-        persist(enabled)
-    except Exception:
-        log.exception("unable to persist session refresh setting")
-
-
-def _startup_registration_enabled(check: Callable[[], bool]) -> bool:
-    """Read startup state without allowing a registry error into pystray."""
-    try:
-        return check()
-    except OSError:
-        log.exception("unable to read Windows startup registration")
-        return False
-
-
-def _toggle_startup_registration(
-    check: Callable[[], bool],
-    persist: Callable[[bool], None],
-) -> None:
-    """Flip per-user startup registration without crashing the tray callback."""
-    try:
-        persist(not check())
-    except OSError:
-        log.exception("unable to update Windows startup registration")
 
 
 def _repair_startup_registration(repair: Callable[[], bool]) -> None:
@@ -260,23 +204,29 @@ def main() -> None:
     # loop starts later and closes over the same instance.
     session_nudger = create_session_nudger(cfg, manual_refresh)
 
+    taskbar = settings.taskbar_setting(companion)
+    session_refresh = settings.session_refresh_setting(session_nudger)
+    startup = settings.startup_setting()
+
+    def flip(setting: settings.Setting) -> Callable[[], None]:
+        """Adapt a Setting to the no-result callback the tray menu expects."""
+
+        def toggle() -> None:
+            setting.toggle()
+
+        return toggle
+
     tray.init(
         manual_refresh,
         log_dir,
         shutdown_requested,
-        taskbar_visible=lambda: companion.visible,
-        toggle_taskbar=lambda: _toggle_taskbar_visibility(companion, save_taskbar_enabled),
+        taskbar_visible=lambda: taskbar.enabled,
+        toggle_taskbar=flip(taskbar),
         taskbar_healthy=lambda: companion.healthy,
-        startup_enabled=lambda: _startup_registration_enabled(autostart.is_enabled),
-        toggle_startup=lambda: _toggle_startup_registration(
-            autostart.is_enabled,
-            autostart.set_enabled,
-        ),
-        session_refresh_enabled=lambda: session_nudger.enabled,
-        toggle_session_refresh=lambda: _toggle_session_refresh(
-            session_nudger,
-            save_session_refresh_enabled,
-        ),
+        startup_enabled=lambda: startup.enabled,
+        toggle_startup=flip(startup),
+        session_refresh_enabled=lambda: session_refresh.enabled,
+        toggle_session_refresh=flip(session_refresh),
     )
     companion.start()
 

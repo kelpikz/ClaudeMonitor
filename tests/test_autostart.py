@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from claudemonitor import autostart, main, tray
+from claudemonitor import autostart, settings, tray
 from claudemonitor.models import DisplayState
 
 
@@ -132,14 +132,12 @@ def test_tray_toggle_registers_startup_and_updates_its_checkmark(
 ):
     """Exercise the complete user path from tray click to registry-backed UI state."""
     monkeypatch.setattr(autostart, "startup_command", lambda: "expected command")
+    startup = settings.startup_setting()
     tray.init(
         threading.Event(),
         Path("."),
-        startup_enabled=autostart.is_enabled,
-        toggle_startup=lambda: main._toggle_startup_registration(
-            autostart.is_enabled,
-            autostart.set_enabled,
-        ),
+        startup_enabled=lambda: startup.enabled,
+        toggle_startup=lambda: startup.toggle(),
     )
 
     class Icon:
