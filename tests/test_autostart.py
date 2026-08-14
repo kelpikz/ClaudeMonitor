@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from claudemonitor import autostart, main, tray
+from claudemonitor import autostart, settings, tray
 from claudemonitor.models import DisplayState
 
 
@@ -132,14 +132,12 @@ def test_tray_toggle_registers_startup_and_updates_its_checkmark(
 ):
     """Exercise the complete user path from tray click to registry-backed UI state."""
     monkeypatch.setattr(autostart, "startup_command", lambda: "expected command")
-    tray.init(
-        threading.Event(),
-        Path("."),
-        startup_enabled=autostart.is_enabled,
-        toggle_startup=lambda: main._toggle_startup_registration(
-            autostart.is_enabled,
-            autostart.set_enabled,
-        ),
+    presenter = tray.TrayPresenter(
+        tray.TrayActions(
+            manual_refresh=threading.Event(),
+            log_dir=Path("."),
+            startup=settings.startup_setting(),
+        )
     )
 
     class Icon:
@@ -156,13 +154,13 @@ def test_tray_toggle_registers_startup_and_updates_its_checkmark(
         menu_status_label="Updated 1s ago",
         taskbar_text="80% (3h 0m)",
     )
-    tray.apply(icon, state)
+    presenter.apply(icon, state)
     menu_item = next(
         item for item in icon.menu.items if item.text == "Start with Windows"
     )
     assert menu_item.checked is False
 
-    tray._on_toggle_startup(icon, menu_item)
+    presenter._on_toggle_startup(icon, menu_item)
 
     assert fake_registry.value == "expected command"
     assert menu_item.checked is True

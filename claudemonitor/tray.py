@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import threading
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 import pystray
 from PIL import Image
@@ -27,63 +28,41 @@ _CONSOLE_URL = "https://console.anthropic.com/settings/usage"
 # crashing.
 _MAX_TOOLTIP_LEN = 127
 
-_icons: dict[str, Image.Image] = {}
-_manual_refresh: threading.Event | None = None
-_shutdown_requested: threading.Event | None = None
-_log_dir: Path | None = None
-_taskbar_visible: Callable[[], bool] | None = None
-_toggle_taskbar: Callable[[], None] | None = None
-_taskbar_healthy: Callable[[], bool] | None = None
-_startup_enabled: Callable[[], bool] | None = None
-_toggle_startup: Callable[[], None] | None = None
-_session_refresh_enabled: Callable[[], bool] | None = None
-_toggle_session_refresh: Callable[[], None] | None = None
-
 _TASKBAR_MENU_LABEL = "Show taskbar usage"
 _TASKBAR_UNAVAILABLE_MENU_LABEL = "Show taskbar usage (unavailable — see log)"
 _SESSION_REFRESH_MENU_LABEL = "Auto-refresh Claude session"
+_STARTUP_MENU_LABEL = "Start with Windows"
 
 
-def init(
-    manual_refresh: threading.Event,
-    log_dir: Path,
-    shutdown_requested: threading.Event | None = None,
-    taskbar_visible: Callable[[], bool] | None = None,
-    toggle_taskbar: Callable[[], None] | None = None,
-    taskbar_healthy: Callable[[], bool] | None = None,
-    startup_enabled: Callable[[], bool] | None = None,
-    toggle_startup: Callable[[], None] | None = None,
-    session_refresh_enabled: Callable[[], bool] | None = None,
-    toggle_session_refresh: Callable[[], None] | None = None,
-) -> None:
-    """Prepare tray dependencies, including the event that ends the poll loop."""
-    global _manual_refresh, _shutdown_requested, _log_dir
-    global _taskbar_visible, _toggle_taskbar, _taskbar_healthy
-    global _startup_enabled, _toggle_startup
-    global _session_refresh_enabled, _toggle_session_refresh
-    _manual_refresh = manual_refresh
-    _shutdown_requested = shutdown_requested
-    _log_dir = log_dir
-    _taskbar_visible = taskbar_visible
-    _toggle_taskbar = toggle_taskbar
-    _taskbar_healthy = taskbar_healthy
-    _startup_enabled = startup_enabled
-    _toggle_startup = toggle_startup
-    _session_refresh_enabled = session_refresh_enabled
-    _toggle_session_refresh = toggle_session_refresh
-    _build_icons()
+class Toggle(Protocol):
+    """A checkable menu entry: something that reports a boolean and flips it.
+
+    ``settings.Setting`` satisfies this, and so does any two-line test double —
+    which is the point of stating it as a protocol rather than importing the
+    concrete type.
+    """
+
+    @property
+    def enabled(self) -> bool: ...
+    def toggle(self) -> bool: ...
 
 
-def loading_icon() -> Image.Image:
-    if not _icons:
-        raise RuntimeError("tray.init() must be called before loading_icon()")
-    return _icons["grey"]
+@dataclass(frozen=True)
+class TrayActions:
+    """Everything the tray menu can reach, gathered into one value.
 
+    Handed to the presenter at construction, so there is no init-before-use
+    ordering for a caller to learn and no process-wide state for one tray to
+    leak into the next.
+    """
 
-def _build_icons() -> None:
-    """Render one status tile per color, once, so each poll only swaps images."""
-    for name, fill in _COLORS.items():
-        _icons[name] = tile_icon(fill)
+    manual_refresh: threading.Event
+    log_dir: Path
+    shutdown_requested: threading.Event | None = None
+    taskbar: Toggle | None = None
+    session_refresh: Toggle | None = None
+    startup: Toggle | None = None
+    taskbar_healthy: Callable[[], bool] | None = None
 
 
 def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
@@ -94,103 +73,128 @@ def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
     return text[: limit - 1] + "…"
 
 
-def apply(icon: pystray.Icon, state: DisplayState) -> None:
-    icon.icon = _icons[state.icon_color]
-    icon.title = _truncate_tooltip(state.tooltip)
-    icon.menu = _build_menu(state.menu_status_label)
+class TrayPresenter:
+    """Drive one pystray icon, tooltip, and menu from processed display state."""
 
+    def __init__(self, actions: TrayActions) -> None:
+        self._actions = actions
+        # Rendered once so each poll only swaps images, and held per instance so
+        # two presenters cannot see each other's tiles.
+        self._icons: dict[str, Image.Image] = {
+            name: tile_icon(fill) for name, fill in _COLORS.items()
+        }
 
-def notify(icon: pystray.Icon, title: str, message: str) -> None:
-    """Show a desktop notification through the active tray icon."""
-    icon.notify(message, title=title)
+    def loading_icon(self) -> Image.Image:
+        """Return the grey tile shown until the first fetch completes."""
+        return self._icons["grey"]
 
+    def apply(self, icon: pystray.Icon, state: DisplayState) -> None:
+        """Show one processed state on the icon, tooltip, and menu."""
+        icon.icon = self._icons[state.icon_color]
+        icon.title = _truncate_tooltip(state.tooltip)
+        icon.menu = self._build_menu(state.menu_status_label)
 
-def _build_menu(status_label: str) -> pystray.Menu:
-    return pystray.Menu(
-        pystray.MenuItem(status_label, None, enabled=False),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Refresh now", _on_refresh),
-        pystray.MenuItem("Open Anthropic console", _on_open_console),
-        pystray.MenuItem("Open log folder", _on_open_log_folder),
-        _taskbar_menu_item(),
-        pystray.MenuItem(
-            _SESSION_REFRESH_MENU_LABEL,
-            _on_toggle_session_refresh,
-            checked=lambda item: bool(
-                _session_refresh_enabled and _session_refresh_enabled()
+    def notify(self, icon: pystray.Icon, title: str, message: str) -> None:
+        """Show a desktop notification through the active tray icon."""
+        icon.notify(message, title=title)
+
+    # --- Menu construction ------------------------------------------------
+
+    def _build_menu(self, status_label: str) -> pystray.Menu:
+        return pystray.Menu(
+            pystray.MenuItem(status_label, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Refresh now", self._on_refresh),
+            pystray.MenuItem("Open Anthropic console", self._on_open_console),
+            pystray.MenuItem("Open log folder", self._on_open_log_folder),
+            self._taskbar_menu_item(),
+            self._toggle_menu_item(
+                _SESSION_REFRESH_MENU_LABEL,
+                self._actions.session_refresh,
+                self._on_toggle_session_refresh,
             ),
-        ),
-        pystray.MenuItem(
-            "Start with Windows",
-            _on_toggle_startup,
-            checked=lambda item: bool(_startup_enabled and _startup_enabled()),
-        ),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", _on_quit),
-    )
+            self._toggle_menu_item(
+                _STARTUP_MENU_LABEL,
+                self._actions.startup,
+                self._on_toggle_startup,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._on_quit),
+        )
 
+    def _toggle_menu_item(
+        self,
+        label: str,
+        toggle: Toggle | None,
+        on_click: Callable[[pystray.Icon, pystray.MenuItem], None],
+    ) -> pystray.MenuItem:
+        """Build one checked menu entry backed by a Toggle."""
+        return pystray.MenuItem(
+            label,
+            on_click,
+            checked=lambda item: bool(toggle is not None and toggle.enabled),
+        )
 
-def _taskbar_is_available() -> bool:
-    """Return whether a native taskbar label is actually being shown."""
-    return _taskbar_healthy is None or _taskbar_healthy()
+    def _taskbar_is_available(self) -> bool:
+        """Return whether a native taskbar label is actually being shown."""
+        healthy = self._actions.taskbar_healthy
+        return healthy is None or healthy()
 
+    def _taskbar_menu_item(self) -> pystray.MenuItem:
+        """Build the taskbar toggle, disabled when no label can be displayed.
 
-def _taskbar_menu_item() -> pystray.MenuItem:
-    """Build the taskbar toggle, disabled when no label can be displayed.
+        Leaving a checked, clickable entry in place while the native window is
+        gone would tell the user the feature is working when it is not.
+        """
+        available = self._taskbar_is_available()
+        toggle = self._actions.taskbar
+        return pystray.MenuItem(
+            _TASKBAR_MENU_LABEL if available else _TASKBAR_UNAVAILABLE_MENU_LABEL,
+            self._on_toggle_taskbar,
+            checked=lambda item: bool(
+                available and toggle is not None and toggle.enabled
+            ),
+            enabled=available,
+        )
 
-    Leaving a checked, clickable entry in place while the native window is gone
-    would tell the user the feature is working when it is not.
-    """
-    available = _taskbar_is_available()
-    return pystray.MenuItem(
-        _TASKBAR_MENU_LABEL if available else _TASKBAR_UNAVAILABLE_MENU_LABEL,
-        _on_toggle_taskbar,
-        checked=lambda item: bool(
-            available and _taskbar_visible and _taskbar_visible()
-        ),
-        enabled=available,
-    )
+    # --- Menu callbacks ---------------------------------------------------
 
+    def _on_refresh(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self._actions.manual_refresh.set()
 
-def _on_refresh(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    if _manual_refresh is not None:
-        _manual_refresh.set()
+    def _on_open_console(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        webbrowser.open(_CONSOLE_URL)
 
+    def _on_open_log_folder(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        os.startfile(str(self._actions.log_dir))
 
-def _on_open_console(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    webbrowser.open(_CONSOLE_URL)
+    def _on_toggle_taskbar(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """Flip the taskbar label and refresh the menu checkmark."""
+        self._flip(self._actions.taskbar, icon)
 
+    def _on_toggle_session_refresh(
+        self, icon: pystray.Icon, item: pystray.MenuItem
+    ) -> None:
+        """Flip the Claude CLI session nudge and refresh the menu checkmark."""
+        self._flip(self._actions.session_refresh, icon)
 
-def _on_open_log_folder(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    if _log_dir is not None:
-        os.startfile(str(_log_dir))
+    def _on_toggle_startup(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """Flip Windows startup registration and refresh the menu checkmark."""
+        self._flip(self._actions.startup, icon)
 
+    def _flip(self, toggle: Toggle | None, icon: pystray.Icon) -> None:
+        """Apply one toggle, then redraw the menu so its checkmark agrees.
 
-def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Toggle the companion and refresh the menu checkmark."""
-    if _toggle_taskbar is not None:
-        _toggle_taskbar()
-    icon.update_menu()
+        The menu is redrawn even when nothing is wired up, because pystray keeps
+        showing the old checkmark until it is asked to update.
+        """
+        if toggle is not None:
+            toggle.toggle()
+        icon.update_menu()
 
-
-def _on_toggle_session_refresh(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Toggle the Claude CLI session nudge and refresh the menu checkmark."""
-    if _toggle_session_refresh is not None:
-        _toggle_session_refresh()
-    icon.update_menu()
-
-
-def _on_toggle_startup(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Toggle Windows startup registration and refresh the menu checkmark."""
-    if _toggle_startup is not None:
-        _toggle_startup()
-    icon.update_menu()
-
-
-def _on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """End the poll loop before asking pystray to join its setup thread."""
-    if _shutdown_requested is not None:
-        _shutdown_requested.set()
-    if _manual_refresh is not None:
-        _manual_refresh.set()
-    icon.stop()
+    def _on_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """End the poll loop before asking pystray to join its setup thread."""
+        if self._actions.shutdown_requested is not None:
+            self._actions.shutdown_requested.set()
+        self._actions.manual_refresh.set()
+        icon.stop()

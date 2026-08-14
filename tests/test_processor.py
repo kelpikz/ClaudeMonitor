@@ -17,7 +17,7 @@ from claudemonitor.processor import (
     _updated_at_line,
     _usage_lines,
     internal_error_state,
-    process,
+    getDataToDisplay,
 )
 
 # The 5h rolling window only begins once the user sends their first message;
@@ -84,7 +84,7 @@ class TestProcessHappyPath:
             ),
             fetched_at=NOW - timedelta(seconds=15),
         )
-        return process(data, NOW, Config())
+        return getDataToDisplay(data, NOW, Config())
 
     def test_icon_is_green_with_plenty_remaining(self):
         # 70% remaining > amber_below (50) -> green branch of process().
@@ -98,7 +98,7 @@ class TestProcessHappyPath:
             )
         )
 
-        assert process(data, NOW, Config()).taskbar_text == "80% (3h 0m)"
+        assert getDataToDisplay(data, NOW, Config()).taskbar_text == "80% (3h 0m)"
 
     def test_taskbar_text_shows_minutes_alongside_hours(self):
         data = make_data(
@@ -108,7 +108,7 @@ class TestProcessHappyPath:
             )
         )
 
-        assert process(data, NOW, Config()).taskbar_text == "80% (3h 45m)"
+        assert getDataToDisplay(data, NOW, Config()).taskbar_text == "80% (3h 45m)"
 
     def test_tooltip_has_full_three_line_body_plus_timestamp(self):
         # Verifies the exact assembled tooltip: header, 5h line, week line,
@@ -151,7 +151,7 @@ class TestProcessColors:
         data = make_data(
             five_hour=UsageWindow(utilization=utilization, resets_at=NOW + timedelta(hours=1))
         )
-        assert process(data, NOW, Config()).icon_color == expected
+        assert getDataToDisplay(data, NOW, Config()).icon_color == expected
 
     def test_custom_thresholds_are_respected(self):
         # With amber_below=80/red_below=40, 30% remaining falls below 40 -> red,
@@ -160,7 +160,7 @@ class TestProcessColors:
         data = make_data(
             five_hour=UsageWindow(utilization=70.0, resets_at=NOW + timedelta(hours=1))
         )
-        assert process(data, NOW, config).icon_color == "red"
+        assert getDataToDisplay(data, NOW, config).icon_color == "red"
 
 
 class TestProcessTooltipDetails:
@@ -171,7 +171,7 @@ class TestProcessTooltipDetails:
         data = make_data(
             five_hour=UsageWindow(utilization=30.0, resets_at=NOW + timedelta(hours=2))
         )
-        lines = process(data, NOW, Config()).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config()).tooltip.split("\n")
         assert not any(line.startswith("Week:") for line in lines)
 
     def test_remaining_percentage_is_rounded_to_whole_number(self):
@@ -179,13 +179,13 @@ class TestProcessTooltipDetails:
         data = make_data(
             five_hour=UsageWindow(utilization=33.6, resets_at=NOW + timedelta(hours=1))
         )
-        assert "66% left" in process(data, NOW, Config()).tooltip
+        assert "66% left" in getDataToDisplay(data, NOW, Config()).tooltip
 
     def test_unknown_reset_when_resets_at_is_none(self):
         # A window with no reset timestamp should surface "unknown" (from
         # _format_time_left) rather than crashing or showing a bogus duration.
         data = make_data(five_hour=UsageWindow(utilization=10.0, resets_at=None))
-        assert "resets in unknown" in process(data, NOW, Config()).tooltip
+        assert "resets in unknown" in getDataToDisplay(data, NOW, Config()).tooltip
 
 
 class TestProcessFiveHourNotStarted:
@@ -207,19 +207,19 @@ class TestProcessFiveHourNotStarted:
         )
 
     def test_five_hour_line_explains_countdown_not_started(self):
-        lines = process(self._data(), NOW, Config()).tooltip.split("\n")
+        lines = getDataToDisplay(self._data(), NOW, Config()).tooltip.split("\n")
         assert lines[0] == "Claude usage"
         assert lines[1] == FIVE_HOUR_NOT_STARTED_LINE
 
     def test_does_not_show_bogus_full_window(self):
         # The old behavior leaked through as "100% left" / "resets in unknown".
-        tooltip = process(self._data(), NOW, Config()).tooltip
+        tooltip = getDataToDisplay(self._data(), NOW, Config()).tooltip
         assert "100% left" not in tooltip
         assert "resets in unknown" not in tooltip
 
     def test_weekly_window_still_shown_normally(self):
         # Only the 5h line changes; the live weekly window renders as usual.
-        lines = process(self._data(), NOW, Config()).tooltip.split("\n")
+        lines = getDataToDisplay(self._data(), NOW, Config()).tooltip.split("\n")
         assert lines[2] == "Week: 95% left · resets in 4d 3h"
 
     def test_week_line_explains_when_weekly_session_has_not_started(self):
@@ -227,21 +227,21 @@ class TestProcessFiveHourNotStarted:
             five_hour=UsageWindow(utilization=0.0, resets_at=None),
             seven_day=UsageWindow(utilization=0.0, resets_at=None),
         )
-        lines = process(data, NOW, Config()).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config()).tooltip.split("\n")
         assert lines[1] == WEEK_NOT_STARTED_LINE
         assert not any(line.startswith("5h:") for line in lines)
 
     def test_icon_is_green_because_full_usage_is_available(self):
         # Nothing has been spent yet, so the user has their whole 5h budget.
-        assert process(self._data(), NOW, Config()).icon_color == "green"
+        assert getDataToDisplay(self._data(), NOW, Config()).icon_color == "green"
 
     def test_tooltip_still_ends_with_updated_line(self):
         data = self._data(fetched_at=NOW - timedelta(seconds=15))
-        last = process(data, NOW, Config()).tooltip.split("\n")[-1]
+        last = getDataToDisplay(data, NOW, Config()).tooltip.split("\n")[-1]
         assert last == "Updated (15 seconds ago)"
 
     def test_tooltip_fits_windows_tooltip_limit(self):
-        assert len(process(self._data(), NOW, Config()).tooltip) <= 128
+        assert len(getDataToDisplay(self._data(), NOW, Config()).tooltip) <= 128
 
 
 class TestProcessNoData:
@@ -250,13 +250,13 @@ class TestProcessNoData:
 
     def test_missing_five_hour_is_grey_with_explanatory_tooltip(self):
         data = make_data(five_hour=None)
-        state = process(data, NOW, Config())
+        state = getDataToDisplay(data, NOW, Config())
         assert state.icon_color == "grey"
         assert "No usage data available" in state.tooltip
 
     def test_no_data_tooltip_still_ends_with_updated_line(self):
         data = make_data(five_hour=None)
-        last_line = process(data, NOW, Config()).tooltip.split("\n")[-1]
+        last_line = getDataToDisplay(data, NOW, Config()).tooltip.split("\n")[-1]
         assert last_line == "Updated (0 seconds ago)"
 
 
@@ -267,18 +267,18 @@ class TestProcessErrors:
 
     def test_error_yields_grey_icon(self):
         data = make_data(fetch_error="timeout", fetched_at=NOW - timedelta(minutes=1))
-        assert process(data, NOW, Config()).icon_color == "grey"
+        assert getDataToDisplay(data, NOW, Config()).icon_color == "grey"
 
     def test_error_tooltip_is_message_then_updated_line(self):
         # First line is the human-readable error, last line is the timestamp.
         data = make_data(fetch_error="token_expired", fetched_at=NOW)
-        lines = process(data, NOW, Config()).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config()).tooltip.split("\n")
         assert lines[0] == "Claude token expired — start Claude Code to refresh"
         assert lines[-1] == "Updated (0 seconds ago)"
 
     def test_error_sets_matching_menu_label(self):
         data = make_data(fetch_error="no_credentials", fetched_at=NOW - timedelta(minutes=2))
-        assert process(data, NOW, Config()).menu_status_label == "Not logged in — last update 2m ago"
+        assert getDataToDisplay(data, NOW, Config()).menu_status_label == "Not logged in — last update 2m ago"
 
     def test_error_takes_precedence_over_present_usage_data(self):
         # Even with a perfectly good five_hour window, an error must win and
@@ -287,7 +287,7 @@ class TestProcessErrors:
             five_hour=UsageWindow(utilization=10.0, resets_at=NOW + timedelta(hours=1)),
             fetch_error="bad_response",
         )
-        assert process(data, NOW, Config()).icon_color == "grey"
+        assert getDataToDisplay(data, NOW, Config()).icon_color == "grey"
 
 
 class TestProcessRateLimited:
@@ -313,12 +313,12 @@ class TestProcessRateLimited:
     def test_shows_last_good_usage_color(self):
         # 70% remaining -> green, computed from last_good rather than greyed out.
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        state = process(data, NOW, Config(), last_good=self._last_good())
+        state = getDataToDisplay(data, NOW, Config(), last_good=self._last_good())
         assert state.icon_color == "green"
 
     def test_tooltip_shows_last_good_usage_lines(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        lines = process(data, NOW, Config(), last_good=self._last_good()).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config(), last_good=self._last_good()).tooltip.split("\n")
         assert lines[0] == "Claude usage"
         assert lines[1] == "5h:   70% left · resets in 2h 15m"
         assert lines[2] == "Week: 90% left · resets in 3d 4h"
@@ -326,7 +326,7 @@ class TestProcessRateLimited:
     def test_tooltip_flags_unable_to_fetch_recent_data(self):
         # The user-facing message requested in step 1.
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        tooltip = process(data, NOW, Config(), last_good=self._last_good()).tooltip
+        tooltip = getDataToDisplay(data, NOW, Config(), last_good=self._last_good()).tooltip
         assert "Unable to fetch recent data" in tooltip
 
     def test_stale_note_uses_elapsed_since_last_good_fetch(self):
@@ -336,7 +336,7 @@ class TestProcessRateLimited:
         # tray-tooltip limit.
         last_good = self._last_good()  # fetched 2 minutes before NOW
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        last_line = process(data, NOW, Config(), last_good=last_good).tooltip.split("\n")[-1]
+        last_line = getDataToDisplay(data, NOW, Config(), last_good=last_good).tooltip.split("\n")[-1]
         assert last_line == "Unable to fetch recent data (2m ago)"
 
     def test_stale_tooltip_fits_windows_tooltip_limit(self):
@@ -348,22 +348,22 @@ class TestProcessRateLimited:
             fetched_at=NOW - timedelta(minutes=2),
         )
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        tooltip = process(data, NOW, Config(), last_good=last_good).tooltip
+        tooltip = getDataToDisplay(data, NOW, Config(), last_good=last_good).tooltip
         assert len(tooltip) <= 128
 
     def test_menu_label_reports_rate_limited_since_last_good(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        state = process(data, NOW, Config(), last_good=self._last_good())
+        state = getDataToDisplay(data, NOW, Config(), last_good=self._last_good())
         assert state.menu_status_label == "Rate limited — last update 2m ago"
 
     def test_without_last_good_falls_back_to_grey(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW - timedelta(seconds=5))
-        state = process(data, NOW, Config(), last_good=None)
+        state = getDataToDisplay(data, NOW, Config(), last_good=None)
         assert state.icon_color == "grey"
 
     def test_without_last_good_uses_rate_limited_messaging(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW - timedelta(seconds=5))
-        state = process(data, NOW, Config(), last_good=None)
+        state = getDataToDisplay(data, NOW, Config(), last_good=None)
         assert state.menu_status_label == "Rate limited — last update 5s ago"
         assert state.tooltip.split("\n")[0] == "Rate limited — too many requests, will retry"
 
@@ -372,7 +372,7 @@ class TestProcessRateLimited:
         # enough to display, so we treat it as if we had nothing.
         last_good = make_data(five_hour=None, fetched_at=NOW - timedelta(minutes=1))
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        assert process(data, NOW, Config(), last_good=last_good).icon_color == "grey"
+        assert getDataToDisplay(data, NOW, Config(), last_good=last_good).icon_color == "grey"
 
 
 # ===========================================================================
@@ -652,7 +652,7 @@ class TestTaskbarText:
     short message rather than one undifferentiated placeholder."""
 
     def _taskbar_text(self, **kwargs) -> str:
-        return process(make_data(**kwargs), NOW, Config()).taskbar_text
+        return getDataToDisplay(make_data(**kwargs), NOW, Config()).taskbar_text
 
     def test_remaining_usage_is_floored_so_full_only_means_untouched(self):
         # 99.6% remaining must not round up to a reassuring "100%".
@@ -723,7 +723,7 @@ class TestTaskbarText:
         )
         data = make_data(fetch_error="rate_limited")
 
-        state = process(data, NOW, Config(), last_good=last_good)
+        state = getDataToDisplay(data, NOW, Config(), last_good=last_good)
 
         assert state.taskbar_text == "75% (2h 0m)"
 
@@ -734,7 +734,7 @@ class TestSignInNeededWording:
 
     def _state(self, *, exhausted: bool, fetched_at: datetime = NOW):
         data = make_data(fetch_error="token_expired", fetched_at=fetched_at)
-        return process(data, NOW, Config(), session_refresh_exhausted=exhausted)
+        return getDataToDisplay(data, NOW, Config(), session_refresh_exhausted=exhausted)
 
     def test_tooltip_asks_the_user_to_sign_in(self):
         lines = self._state(exhausted=True).tooltip.split("\n")
@@ -760,13 +760,13 @@ class TestSignInNeededWording:
 
     def test_the_flag_defaults_to_the_original_wording(self):
         data = make_data(fetch_error="token_expired")
-        assert process(data, NOW, Config()).taskbar_text == "token expired"
+        assert getDataToDisplay(data, NOW, Config()).taskbar_text == "token expired"
 
     def test_other_errors_are_unaffected_by_the_tripped_breaker(self):
         # The breaker can also trip on a missing CLI while fetches succeed, so a
         # tripped flag must not relabel errors a sign-in would not fix.
         data = make_data(fetch_error="no_credentials", fetched_at=NOW)
-        state = process(data, NOW, Config(), session_refresh_exhausted=True)
+        state = getDataToDisplay(data, NOW, Config(), session_refresh_exhausted=True)
         assert state.taskbar_text == "not logged in"
         assert state.tooltip.split("\n")[0] == (
             "Claude credentials not found — log in via Claude Code"
@@ -776,6 +776,6 @@ class TestSignInNeededWording:
         data = make_data(
             five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(hours=1))
         )
-        state = process(data, NOW, Config(), session_refresh_exhausted=True)
+        state = getDataToDisplay(data, NOW, Config(), session_refresh_exhausted=True)
         assert state.taskbar_text == "80% (1h 0m)"
         assert state.icon_color == "green"

@@ -49,14 +49,14 @@ def test_session_refresh_toggle_is_persisted_without_touching_other_settings(con
         "[polling]\ninterval_seconds = 30\n\n[session_refresh]\ncooldown_seconds = 120\n",
     )
 
-    config.save_session_refresh_enabled(False)
+    config.save_setting("session_refresh", "enabled", False)
 
     loaded = config.load_config()
     assert loaded.session_refresh.enabled is False
     assert loaded.session_refresh.cooldown_seconds == 120
     assert loaded.polling.interval_seconds == 30
 
-    config.save_session_refresh_enabled(True)
+    config.save_setting("session_refresh", "enabled", True)
 
     assert config.load_config().session_refresh.enabled is True
 
@@ -64,7 +64,7 @@ def test_session_refresh_toggle_is_persisted_without_touching_other_settings(con
 def test_session_refresh_toggle_seeds_the_section_when_it_is_absent(config_path):
     _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
 
-    config.save_session_refresh_enabled(False)
+    config.save_setting("session_refresh", "enabled", False)
 
     saved_text = config_path.read_text(encoding="utf-8")
     assert config.load_config().session_refresh.enabled is False
@@ -81,12 +81,12 @@ def test_seeded_config_documents_the_session_refresh_section(config_path):
 def test_taskbar_visibility_is_persisted_in_existing_config(config_path):
     _write_config(config_path, "[polling]\ninterval_seconds = 30\n")
 
-    config.save_taskbar_enabled(False)
+    config.save_setting("taskbar", "enabled", False)
 
     assert config.load_config().taskbar.enabled is False
     assert config.load_config().polling.interval_seconds == 30
 
-    config.save_taskbar_enabled(True)
+    config.save_setting("taskbar", "enabled", True)
 
     assert config.load_config().taskbar.enabled is True
     assert config.load_config().polling.interval_seconds == 30
@@ -99,7 +99,7 @@ def test_taskbar_visibility_updates_dotted_toml_without_duplicate_tables(config_
         "# Keep this user note\ntaskbar.enabled = true\n\n[polling]\ninterval_seconds = 45\n",
     )
 
-    config.save_taskbar_enabled(False)
+    config.save_setting("taskbar", "enabled", False)
 
     saved_text = config_path.read_text(encoding="utf-8")
     assert config.load_config().taskbar.enabled is False
@@ -120,7 +120,7 @@ def test_missing_config_is_seeded_with_the_documented_defaults(config_path):
 
 
 def test_saving_seeds_a_missing_config_before_editing_it(config_path):
-    config.save_taskbar_enabled(False)
+    config.save_setting("taskbar", "enabled", False)
 
     assert config.load_config().taskbar.enabled is False
     assert "# ClaudeMonitor config" in config_path.read_text(encoding="utf-8")
@@ -149,19 +149,35 @@ def test_wrongly_typed_values_fall_back_to_that_section_defaults(config_path):
     assert loaded.taskbar.enabled is False
 
 
-def test_saving_never_leaves_a_truncated_config_behind(config_path):
+def test_saving_never_leaves_a_truncated_config_behind(config_path, monkeypatch):
     """The write is atomic, so an interrupted save cannot corrupt the file."""
     _write_config(config_path, "[polling]\ninterval_seconds = 30\n")
-    original_replace = config.os.replace
 
     def fail_before_replacing(source, destination):
         raise OSError("simulated crash during save")
 
-    config.os.replace = fail_before_replacing
-    try:
-        with pytest.raises(OSError):
-            config.save_taskbar_enabled(False)
-    finally:
-        config.os.replace = original_replace
+    # Patched through monkeypatch rather than by assignment: `config.os` is the
+    # real `os` module, so a bare assignment breaks os.replace process-wide.
+    monkeypatch.setattr(config.os, "replace", fail_before_replacing)
+
+    with pytest.raises(OSError):
+        config.save_setting("taskbar", "enabled", False)
 
     assert config_path.read_text(encoding="utf-8") == "[polling]\ninterval_seconds = 30\n"
+
+
+def test_any_section_and_key_can_be_saved_without_a_dedicated_function(config_path):
+    """One generic saver, so a new setting never adds a new public function."""
+    config.save_setting("polling", "interval_seconds", 45)
+
+    assert config.load_config().polling.interval_seconds == 45
+
+
+def test_saving_creates_a_section_that_does_not_exist_yet(config_path):
+    _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
+
+    config.save_setting("taskbar", "enabled", False)
+
+    saved_text = config_path.read_text(encoding="utf-8")
+    assert config.load_config().taskbar.enabled is False
+    assert "# Keep this user note" in saved_text

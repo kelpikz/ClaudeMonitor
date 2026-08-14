@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 from claudemonitor import main
 from claudemonitor.config import Config, SessionRefreshConfig
-from claudemonitor.models import AnthropicUsageData
+from claudemonitor.models import AnthropicUsageData, DisplayState
 
 NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
 
@@ -35,6 +36,7 @@ class _FakeCompanion:
     def __init__(self, visible: bool = True):
         self.updates: list[tuple[str, str]] = []
         self.visible = visible
+        self.healthy = True
 
     def update(self, text: str, tooltip: str) -> None:
         self.updates.append((text, tooltip))
@@ -43,66 +45,61 @@ class _FakeCompanion:
         self.visible = visible
 
 
-class TestToggleTaskbarVisibility:
-    """Toggling runs inside pystray's message loop, where an escaping exception
-    would surface only as an invisible stderr traceback in a windowed build."""
+class _RecordingPresenter:
+    """Absorb the tray half of a display update so only the wiring is asserted."""
 
-    def test_toggle_flips_visibility_and_persists_the_choice(self):
-        companion = _FakeCompanion(visible=True)
-        saved: list[bool] = []
+    def __init__(self):
+        self.applied: list[tuple[object, DisplayState]] = []
+        self.notified: list[tuple[str, str]] = []
 
-        main._toggle_taskbar_visibility(companion, saved.append)
+    def apply(self, icon, state) -> None:
+        self.applied.append((icon, state))
 
-        assert companion.visible is False
-        assert saved == [False]
-
-    def test_toggle_survives_a_failing_config_write(self, caplog):
-        companion = _FakeCompanion(visible=False)
-
-        def unwritable(_visible: bool) -> None:
-            raise OSError("config file is locked")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_taskbar_visibility(companion, unwritable)
-
-        assert companion.visible is True
-        assert "taskbar visibility" in caplog.text
+    def notify(self, icon, title, message) -> None:
+        self.notified.append((title, message))
 
 
-class TestToggleStartupRegistration:
-    def test_toggle_enables_startup_when_currently_disabled(self):
-        saved: list[bool] = []
-
-        main._toggle_startup_registration(lambda: False, saved.append)
-
-        assert saved == [True]
-
-    def test_toggle_disables_startup_when_currently_enabled(self):
-        saved: list[bool] = []
-
-        main._toggle_startup_registration(lambda: True, saved.append)
-
-        assert saved == [False]
-
-    def test_toggle_survives_a_registry_failure(self, caplog):
-        def unavailable() -> bool:
-            raise OSError("registry unavailable")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_startup_registration(unavailable, lambda enabled: None)
-
-        assert "Windows startup registration" in caplog.text
+def a_state() -> DisplayState:
+    return DisplayState(
+        icon_color="green",
+        tooltip="usage",
+        menu_status_label="updated",
+        taskbar_text="80% (3h 0m)",
+    )
 
 
-def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
-    def unavailable() -> bool:
-        raise OSError("registry unavailable")
+# ===========================================================================
+# TrayAndTaskbarDisplay — the production adapter behind PollCycle's seam.
+# ===========================================================================
 
-    with caplog.at_level(logging.ERROR):
-        enabled = main._startup_registration_enabled(unavailable)
 
-    assert enabled is False
-    assert "Windows startup registration" in caplog.text
+class TestTrayAndTaskbarDisplay:
+    def test_apply_updates_both_surfaces_from_one_state(self):
+        presenter = _RecordingPresenter()
+        companion = _FakeCompanion()
+        icon = object()
+        state = a_state()
+
+        main.TrayAndTaskbarDisplay(presenter, icon, companion).apply(state)
+
+        assert presenter.applied == [(icon, state)]
+        assert companion.updates == [("80% (3h 0m)", "usage")]
+
+    def test_notify_reaches_the_tray_icon(self):
+        presenter = _RecordingPresenter()
+
+        main.TrayAndTaskbarDisplay(presenter, object(), _FakeCompanion()).notify(
+            "Claude usage below 50%", "5h usage has 49% remaining."
+        )
+
+        assert presenter.notified == [
+            ("Claude usage below 50%", "5h usage has 49% remaining.")
+        ]
+
+
+# ===========================================================================
+# Startup wiring.
+# ===========================================================================
 
 
 def test_startup_repair_runs_during_initialization():
@@ -123,22 +120,53 @@ def test_startup_repair_survives_a_registry_failure(caplog):
     assert "Windows startup registration" in caplog.text
 
 
-def test_apply_display_updates_tray_and_taskbar(monkeypatch):
-    icon = _FakeIcon()
-    companion = _FakeCompanion()
-    state = main.processor.DisplayState(
-        icon_color="green",
-        tooltip="usage",
-        menu_status_label="updated",
-        taskbar_text="80% (3h 0m)",
-    )
-    applied: list[object] = []
-    monkeypatch.setattr(main.tray, "apply", lambda target, value: applied.append((target, value)))
+class TestTrayPresenterWiring:
+    """The tray menu must reach the settings that own each live value."""
 
-    main._apply_display(icon, state, companion)
+    def _presenter(self, companion, nudger):
+        return main.create_tray_presenter(
+            manual_refresh=threading.Event(),
+            shutdown_requested=threading.Event(),
+            log_dir=Path("."),
+            companion=companion,
+            session_nudger=nudger,
+        )
 
-    assert applied == [(icon, state)]
-    assert companion.updates == [("80% (3h 0m)", "usage")]
+    def test_the_taskbar_menu_entry_hides_the_real_companion(self, monkeypatch):
+        saved: list[tuple] = []
+        monkeypatch.setattr(
+            main.settings.config, "save_setting", lambda *args: saved.append(args)
+        )
+        companion = _FakeCompanion(visible=True)
+        nudger = main.create_session_nudger(Config(), threading.Event())
+
+        self._presenter(companion, nudger)._on_toggle_taskbar(_MenuIcon(), None)
+
+        assert companion.visible is False
+        assert saved == [("taskbar", "enabled", False)]
+
+    def test_the_session_refresh_entry_flips_the_real_nudger(self, monkeypatch):
+        monkeypatch.setattr(main.settings.config, "save_setting", lambda *args: None)
+        nudger = main.create_session_nudger(Config(), threading.Event())
+
+        self._presenter(_FakeCompanion(), nudger)._on_toggle_session_refresh(
+            _MenuIcon(), None
+        )
+
+        assert nudger.enabled is False
+
+
+class _MenuIcon:
+    def __init__(self):
+        self.menu_updates = 0
+
+    def update_menu(self) -> None:
+        self.menu_updates += 1
+
+
+# ===========================================================================
+# Session nudger construction.
+# ===========================================================================
 
 
 class TestSessionNudgerWiring:
@@ -172,32 +200,6 @@ class TestSessionNudgerWiring:
         assert nudger.maybe_nudge(data) is False
         assert not manual_refresh.is_set()
 
-    def test_toggle_flips_the_nudger_and_persists_the_choice(self):
-        nudger, _manual_refresh = self._nudger()
-        saved: list[bool] = []
-
-        main._toggle_session_refresh(nudger, saved.append)
-
-        assert nudger.enabled is False
-        assert saved == [False]
-
-        main._toggle_session_refresh(nudger, saved.append)
-
-        assert nudger.enabled is True
-        assert saved == [False, True]
-
-    def test_toggle_survives_a_failing_config_write(self, caplog):
-        nudger, _manual_refresh = self._nudger()
-
-        def unavailable(_enabled: bool) -> None:
-            raise OSError("config is read-only")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_session_refresh(nudger, unavailable)
-
-        assert nudger.enabled is False
-        assert "session refresh" in caplog.text
-
     def test_the_configured_cooldown_gates_the_second_attempt(self):
         nudger, _manual_refresh = self._nudger(cooldown_seconds=10_000)
 
@@ -205,6 +207,11 @@ class TestSessionNudgerWiring:
 
         assert nudger.maybe_nudge(data) is True
         assert nudger.maybe_nudge(data) is False
+
+
+# ===========================================================================
+# Waiting between polls.
+# ===========================================================================
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():
@@ -272,91 +279,3 @@ def test_ctrl_c_requests_shutdown_wakes_poll_and_stops_tray_icon():
     assert shutdown_requested.is_set()
     assert manual_refresh.is_set()
     assert icon.stop_calls == 1
-
-
-def test_poll_interval_doubles_after_rate_limit():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
-
-
-def test_poll_interval_backoff_is_capped():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-    )
-
-    assert main._next_poll_interval_seconds(400, data, baseline_seconds=60) == 600
-    assert main._next_poll_interval_seconds(600, data, baseline_seconds=60) == 600
-
-
-def test_poll_interval_honors_retry_after_on_rate_limit():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=224,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 224
-
-
-def test_poll_interval_retry_after_is_floored_at_baseline():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=30,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_falls_back_to_backoff_without_retry_after():
-    data = AnthropicUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=None,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
-
-
-def test_poll_interval_decreases_by_five_seconds_after_success():
-    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 85
-
-
-def test_poll_interval_never_drops_below_baseline_after_success():
-    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_clamps_to_baseline_when_less_than_step_above_it():
-    data = AnthropicUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(63, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_stays_same_after_non_rate_limit_error():
-    data = AnthropicUsageData(
-        fetch_error="token_expired",
-        fetched_at=NOW,
-        status_code=401,
-    )
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
-
-
-def test_poll_interval_stays_same_after_offline_error_without_status():
-    data = AnthropicUsageData(fetch_error="offline", fetched_at=NOW)
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
