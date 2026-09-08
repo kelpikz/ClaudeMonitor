@@ -12,7 +12,9 @@ import tomlkit
 log = logging.getLogger(__name__)
 
 _DEFAULT_TOML = """\
-# ClaudeMonitor config — edit and restart the app
+# ClaudeMonitor config. Everything here is also in the settings window
+# (tray icon -> Settings...), which writes this file and takes effect at once.
+# Edited by hand, these values are read at the next launch.
 
 [polling]
 # How often to check Anthropic for usage updates, in seconds.
@@ -24,7 +26,13 @@ amber_below = 50
 red_below   = 20
 
 [taskbar]
-# Show the compact Claude usage summary in the Windows taskbar.
+# Show the compact usage summary in the Windows taskbar.
+enabled = true
+
+[codex]
+# Track OpenAI Codex usage alongside Claude: a second tray icon, and a
+# second reading in the taskbar label. Reads ~/.codex/auth.json, which the
+# Codex CLI writes when you log in.
 enabled = true
 
 [session_refresh]
@@ -50,6 +58,10 @@ class TaskbarConfig(BaseModel):
     enabled: bool = True
 
 
+class CodexConfig(BaseModel):
+    enabled: bool = True
+
+
 class SessionRefreshConfig(BaseModel):
     enabled: bool = True
     cooldown_seconds: float = 900
@@ -59,6 +71,7 @@ class Config(BaseModel):
     polling: PollingConfig = PollingConfig()
     thresholds: ThresholdsConfig = ThresholdsConfig()
     taskbar: TaskbarConfig = TaskbarConfig()
+    codex: CodexConfig = CodexConfig()
     session_refresh: SessionRefreshConfig = SessionRefreshConfig()
 
 
@@ -114,6 +127,7 @@ def load_config() -> Config:
         polling=_section(PollingConfig, raw, "polling"),
         thresholds=_section(ThresholdsConfig, raw, "thresholds"),
         taskbar=_section(TaskbarConfig, raw, "taskbar"),
+        codex=_section(CodexConfig, raw, "codex"),
         session_refresh=_section(SessionRefreshConfig, raw, "session_refresh"),
     )
 
@@ -154,3 +168,28 @@ def save_taskbar_enabled(enabled: bool) -> None:
 def save_session_refresh_enabled(enabled: bool) -> None:
     """Persist whether an idle session may be woken with a Claude CLI prompt."""
     _save_setting("session_refresh", "enabled", enabled)
+
+
+def save_codex_enabled(enabled: bool) -> None:
+    """Persist whether Codex usage is tracked alongside Claude."""
+    _save_setting("codex", "enabled", enabled)
+
+
+def save_poll_interval_seconds(seconds: int) -> None:
+    """Persist how often usage is fetched."""
+    _save_setting("polling", "interval_seconds", seconds)
+
+
+def save_amber_threshold(percent: float) -> None:
+    """Persist the remaining percentage below which the icon turns amber."""
+    _save_setting("thresholds", "amber_below", percent)
+
+
+def save_red_threshold(percent: float) -> None:
+    """Persist the remaining percentage below which the icon turns red."""
+    _save_setting("thresholds", "red_below", percent)
+
+
+def save_session_refresh_cooldown(seconds: float) -> None:
+    """Persist the shortest gap allowed between two CLI session nudges."""
+    _save_setting("session_refresh", "cooldown_seconds", seconds)

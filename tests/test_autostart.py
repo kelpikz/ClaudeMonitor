@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import subprocess
-import threading
 from pathlib import Path
 
 import pytest
 
-from claudemonitor import autostart, main, tray
-from claudemonitor.models import DisplayState
+from claudemonitor import autostart, main
+from claudemonitor.config import Config
+from claudemonitor.win32_bindings import (
+    BM_GETCHECK,
+    BM_SETCHECK,
+    BST_CHECKED,
+    IDOK,
+    WM_COMMAND,
+)
+from claudemonitor.win32_settings_window import (
+    _APPLY_ID,
+    _FIRST_FIELD_ID,
+    Win32SettingsWindow,
+)
 
 
 class _FakeRegistry:
@@ -127,43 +138,133 @@ class TestStartupRegistration:
         assert fake_registry.writes == []
 
 
-def test_tray_toggle_registers_startup_and_updates_its_checkmark(
+def _startup_window(monkeypatch):
+    """Open a real settings window over fake DLLs, and find its startup box."""
+    monkeypatch.setattr(autostart, "startup_command", lambda: "expected command")
+    model = main.build_settings_model(
+        companion=_UnusedCompanion(),
+        codex_tracking=main.CodexTracking(enabled=True),
+        nudgers=[],
+        pollers=[],
+        config=Config(),
+        log_dir=Path("."),
+    )
+    window = Win32SettingsWindow(model, uses_light_theme=lambda: True)
+    window._user32 = _RecordingUser32()
+    window._gdi32 = _RecordingDll()
+    window._kernel32 = _RecordingDll()
+    window._uxtheme = _RecordingDll()
+    window._dwmapi = _RecordingDll()
+    window._comctl32 = _RecordingDll()
+    window._create()
+    index = [field.key for field in model.fields()].index("startup")
+    return window, index
+
+
+def _tick_startup(window, index: int) -> None:
+    """Tick the startup box the way Windows does, then report the click."""
+    window._user32.checked[window._field_handles["startup"]] = BST_CHECKED
+    window._window_proc(window._handle, WM_COMMAND, _FIRST_FIELD_ID + index, 0)
+
+
+def test_ticking_start_with_windows_writes_nothing_until_it_is_applied(
     fake_registry, monkeypatch
 ):
-    """Exercise the complete user path from tray click to registry-backed UI state."""
-    monkeypatch.setattr(autostart, "startup_command", lambda: "expected command")
-    tray.init(
-        threading.Event(),
-        Path("."),
-        startup_enabled=autostart.is_enabled,
-        toggle_startup=lambda: main._toggle_startup_registration(
-            autostart.is_enabled,
-            autostart.set_enabled,
-        ),
-    )
+    """A tick is a proposal. Cancel has to be able to mean cancel."""
+    window, index = _startup_window(monkeypatch)
 
-    class Icon:
-        def __init__(self):
-            self.menu_updates = 0
+    _tick_startup(window, index)
 
-        def update_menu(self):
-            self.menu_updates += 1
+    assert fake_registry.value is None
 
-    icon = Icon()
-    state = DisplayState(
-        icon_color="green",
-        tooltip="usage",
-        menu_status_label="Updated 1s ago",
-        taskbar_text="80% (3h 0m)",
-    )
-    tray.apply(icon, state)
-    menu_item = next(
-        item for item in icon.menu.items if item.text == "Start with Windows"
-    )
-    assert menu_item.checked is False
 
-    tray._on_toggle_startup(icon, menu_item)
+def test_settings_window_registers_startup_and_updates_its_checkbox(
+    fake_registry, monkeypatch
+):
+    """The complete user path: a click in the settings window to the registry.
+
+    The box the window shows afterwards has to come back from the registry
+    rather than from the click — otherwise a refused write would leave it lying.
+    """
+    window, index = _startup_window(monkeypatch)
+    _tick_startup(window, index)
+    window._user32.calls.clear()
+
+    window._window_proc(window._handle, WM_COMMAND, _APPLY_ID, 0)
 
     assert fake_registry.value == "expected command"
-    assert menu_item.checked is True
-    assert icon.menu_updates == 1
+    checks = [
+        call
+        for call in window._user32.calls
+        if call[0] == "SendMessageW" and call[2] == BM_SETCHECK
+    ]
+    assert BST_CHECKED in [call[3] for call in checks]
+
+
+def test_ok_registers_startup_and_closes_the_window(fake_registry, monkeypatch):
+    window, index = _startup_window(monkeypatch)
+    _tick_startup(window, index)
+
+    window._window_proc(window._handle, WM_COMMAND, IDOK, 0)
+
+    assert fake_registry.value == "expected command"
+    assert any(call[0] == "DestroyWindow" for call in window._user32.calls)
+
+
+class _RecordingDll:
+    """Record every native call, returning a benign success value."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def __getattr__(self, name: str):
+        def call(*args):
+            self.calls.append((name, *args))
+            return 1
+
+        return call
+
+
+class _RecordingUser32(_RecordingDll):
+    """Hand out a fresh handle per created window, and remember what it holds.
+
+    The window reads a checkbox and a number box back out of Windows, so a
+    fake that forgets what it was told would answer every question with zero.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_handle = 500
+        self.text: dict[int, str] = {}
+        self.checked: dict[int, int] = {}
+
+    def CreateWindowExW(self, style, class_name, text, *rest):
+        self.calls.append(("CreateWindowExW", style, class_name, text, *rest))
+        self._next_handle += 1
+        self.text[self._next_handle] = text or ""
+        return self._next_handle
+
+    def SendMessageW(self, handle, message, wparam, lparam):
+        self.calls.append(("SendMessageW", handle, message, wparam, lparam))
+        if message == BM_SETCHECK:
+            self.checked[handle] = wparam
+        return self.checked.get(handle, 0) if message == BM_GETCHECK else 1
+
+    def SetWindowTextW(self, handle, text):
+        self.calls.append(("SetWindowTextW", handle, text))
+        self.text[handle] = text
+        return 1
+
+    def GetWindowTextLengthW(self, handle):
+        return len(self.text.get(handle, ""))
+
+    def GetWindowTextW(self, handle, buffer, size):
+        buffer.value = self.text.get(handle, "")
+        return len(buffer.value)
+
+
+class _UnusedCompanion:
+    """The taskbar companion, which this path never touches."""
+
+    visible = True
+    healthy = True

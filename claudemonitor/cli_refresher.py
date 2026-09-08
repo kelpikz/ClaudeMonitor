@@ -1,9 +1,12 @@
-"""Nudge the Claude CLI when the usage API says the session or token is idle.
+"""Nudge a provider's CLI when the usage API says its session or token is idle.
 
 The tray has no way to mint a fresh OAuth token or to open a usage window — only
-Claude Code can. Asking the CLI for one cheap Haiku reply makes it do both as a
+the provider's own CLI can. Asking it for one cheap reply makes it do both as a
 side effect: it refreshes an expired token before sending, and the reply itself
-starts the five-hour window so a real reset countdown appears.
+starts the usage window so a real reset countdown appears.
+
+Both providers use the same ``SessionNudger``; they differ only in the command
+run and in which fetch results are worth running it for.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import threading
 import time
 from typing import Callable
 
-from .models import AnthropicUsageData
+from .models import ProviderUsageData
 
 log = logging.getLogger(__name__)
 
@@ -23,20 +26,37 @@ COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_COOLDOWN_SECONDS = 900 # 15 mins
 MAX_CONSECUTIVE_FAILURES = 3
 
-_EXECUTABLE_NAME = "claude"
-_PROMPT_ARGUMENTS = ("-p", "--model", "haiku", "hi")
+_CLAUDE_EXECUTABLE_NAME = "claude"
+_CLAUDE_PROMPT_ARGUMENTS = ("-p", "--model", "haiku", "hi")
+
+_CODEX_EXECUTABLE_NAME = "codex"
+# read-only keeps a stray model reply from editing real files, and the repo
+# check would otherwise refuse to start from the tray app's working directory.
+_CODEX_PROMPT_ARGUMENTS = (
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--skip-git-repo-check",
+    "hi",
+)
 # A windowed build has no console, so an inherited one would flash on screen.
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _NUDGEABLE_FETCH_ERRORS = frozenset({"token_expired"})
 
 
-def needs_session_nudge(data: AnthropicUsageData) -> bool:
-    """Return whether this fetch result describes a session the CLI could wake.
+def needs_session_nudge(data: ProviderUsageData) -> bool:
+    """Return whether this fetch describes a session the CLI could wake.
 
-    Two situations qualify: an expired token, which only Claude Code can renew,
-    and a completely untouched five-hour window — whether or not it has started —
-    which one message converts into live usage the tray can count down.
+    Two situations qualify: an expired token, which only the provider's own CLI
+    can renew, and a completely untouched five-hour window — whether or not it
+    has started — which one message converts into live usage the tray can count
+    down. A fetch with no five-hour window at all is a shape we cannot read, and
+    a message spent finding out what it meant would tell the user nothing.
+
+    Both providers are judged by this one rule. Codex used to have a rule of its
+    own that fired on an expired token alone, which left an idle Codex window —
+    the state one message actually repairs — waiting for a manual `codex exec`.
     """
     if data.fetch_error is not None:
         return data.fetch_error in _NUDGEABLE_FETCH_ERRORS
@@ -47,26 +67,36 @@ def needs_session_nudge(data: AnthropicUsageData) -> bool:
 
 def _claude_command(executable: str) -> list[str]:
     """Build the argv for the cheapest prompt that still forces a real request."""
-    return [executable, *_PROMPT_ARGUMENTS]
+    return [executable, *_CLAUDE_PROMPT_ARGUMENTS]
 
 
-def run_claude_cli(
-    which: Callable[[str], str | None] = shutil.which,
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+def _codex_command(executable: str) -> list[str]:
+    """Build the argv for one throwaway Codex turn that renews the token."""
+    return [executable, *_CODEX_PROMPT_ARGUMENTS]
+
+
+def _run_cli(
+    *,
+    executable_name: str,
+    build_command,
+    which,
+    run,
 ) -> bool:
-    """Ask the Claude CLI for one Haiku reply and report whether it answered.
+    """Run one provider CLI prompt and report whether it answered.
 
     Never raises: this runs off the poll loop's thread, where an escaping error
     would be invisible in a windowed build.
     """
-    executable = which(_EXECUTABLE_NAME)
+    executable = which(executable_name)
     if executable is None:
-        log.warning("claude CLI not found on PATH — skipping session refresh")
+        log.warning(
+            "%s CLI not found on PATH — skipping session refresh", executable_name
+        )
         return False
 
     try:
         completed = run(
-            _claude_command(executable),
+            build_command(executable),
             capture_output=True,
             text=True,
             # capture_output only redirects stdout and stderr, so stdin would
@@ -80,29 +110,60 @@ def run_claude_cli(
             creationflags=_CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:
-        log.warning("claude CLI did not answer within %ss", COMMAND_TIMEOUT_SECONDS)
+        log.warning(
+            "%s CLI did not answer within %ss", executable_name, COMMAND_TIMEOUT_SECONDS
+        )
         return False
     except OSError as exc:
-        log.warning("unable to launch claude CLI: %s", exc)
+        log.warning("unable to launch %s CLI: %s", executable_name, exc)
         return False
     except Exception as exc:
-        log.warning("unexpected error running claude CLI: %r", exc)
+        log.warning("unexpected error running %s CLI: %r", executable_name, exc)
         return False
 
     if completed.returncode != 0:
         log.warning(
-            "claude CLI exited with %s: %s",
+            "%s CLI exited with %s: %s",
+            executable_name,
             completed.returncode,
             (completed.stderr or "").strip(),
         )
         return False
 
     if not (completed.stdout or "").strip():
-        log.warning("claude CLI returned no output — session may not have started")
+        log.warning(
+            "%s CLI returned no output — session may not have started", executable_name
+        )
         return False
 
-    log.info("claude CLI answered — token and session refreshed")
+    log.info("%s CLI answered — token and session refreshed", executable_name)
     return True
+
+
+def run_claude_cli(
+    which: Callable[[str], str | None] = shutil.which,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Ask the Claude CLI for one Haiku reply and report whether it answered."""
+    return _run_cli(
+        executable_name=_CLAUDE_EXECUTABLE_NAME,
+        build_command=_claude_command,
+        which=which,
+        run=run,
+    )
+
+
+def run_codex_cli(
+    which: Callable[[str], str | None] = shutil.which,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Ask the Codex CLI for one throwaway reply and report whether it answered."""
+    return _run_cli(
+        executable_name=_CODEX_EXECUTABLE_NAME,
+        build_command=_codex_command,
+        which=which,
+        run=run,
+    )
 
 
 def _start_daemon_thread(work: Callable[[], None]) -> None:
@@ -111,11 +172,11 @@ def _start_daemon_thread(work: Callable[[], None]) -> None:
     We are running in a separate thread because, 
     even if it fails, nothing will happen to our main code
     """
-    threading.Thread(target=work, name="claude-session-nudge", daemon=True).start()
+    threading.Thread(target=work, name="cli-session-nudge", daemon=True).start()
 
 
 class SessionNudger:
-    """Runs the Claude CLI at most once per cooldown while the session looks idle.
+    """Runs a provider CLI at most once per cooldown while its session looks idle.
 
     The API reflects a new session only after a short delay, so an ungated nudge
     would fire on every poll until the numbers caught up.
@@ -127,6 +188,7 @@ class SessionNudger:
         enabled: bool = True,
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         invoke: Callable[[], bool] = run_claude_cli,
+        needs_nudge: Callable[[ProviderUsageData], bool] = needs_session_nudge,
         on_refreshed: Callable[[], None] = lambda: None,
         clock: Callable[[], float] = time.monotonic,
         start_background: Callable[[Callable[[], None]], None] = _start_daemon_thread,
@@ -135,6 +197,7 @@ class SessionNudger:
         self._enabled = enabled
         self._cooldown_seconds = cooldown_seconds
         self._invoke = invoke
+        self._needs_nudge = needs_nudge
         self._on_refreshed = on_refreshed
         self._clock = clock
         self._start_background = start_background
@@ -165,8 +228,16 @@ class SessionNudger:
         """
         self._enabled = enabled
 
+    def set_cooldown_seconds(self, seconds: float) -> None:
+        """Change the shortest gap between nudges while the poll loop is running.
+
+        The last attempt is deliberately kept, so shortening the cooldown lets
+        the pending wait end early rather than starting it over.
+        """
+        self._cooldown_seconds = seconds
+
     # ENTRY POINT
-    def maybe_nudge(self, data: AnthropicUsageData) -> bool:
+    def maybe_nudge(self, data: ProviderUsageData) -> bool:
         """Start a background CLI refresh if this fetch warrants one, else do nothing.
 
         NUDGING RULES:
@@ -181,7 +252,7 @@ class SessionNudger:
             # Whatever was broken has resolved, so past failures are stale.
             self._consecutive_failures = 0
 
-        if not self._enabled or self._running or not needs_session_nudge(data):
+        if not self._enabled or self._running or not self._needs_nudge(data):
             return False
         if self.exhausted or self._within_cooldown():
             return False
@@ -191,7 +262,7 @@ class SessionNudger:
         self._start_background(self._nudge)
         return True
 
-    def _nothing_left_to_fix(self, data: AnthropicUsageData) -> bool:
+    def _nothing_left_to_fix(self, data: ProviderUsageData) -> bool:
         """Return whether a healthy fetch shows there is nothing to nudge about.
 
         This is what re-arms the breaker. Re-arming on any successful fetch would
@@ -199,7 +270,7 @@ class SessionNudger:
         would loop forever. Requiring live usage means the underlying problem is
         genuinely gone.
         """
-        return data.fetch_error is None and not needs_session_nudge(data)
+        return data.fetch_error is None and not self._needs_nudge(data)
 
     def _within_cooldown(self) -> bool:
         """Return whether the previous attempt is still too recent to repeat."""
@@ -212,8 +283,8 @@ class SessionNudger:
         self._consecutive_failures += 1
         if self.exhausted:
             log.warning(
-                "session refresh failed %s times — giving up until Claude usage "
-                "recovers; sign in with `claude /login`",
+                "session refresh failed %s times — giving up until usage "
+                "recovers; the provider CLI needs a manual sign-in",
                 self._consecutive_failures,
             )
 

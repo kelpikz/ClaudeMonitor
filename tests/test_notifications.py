@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from claudemonitor.models import AnthropicUsageData, UsageWindow
+from claudemonitor.models import ProviderUsageData, UsageWindow
 from claudemonitor.notifications import (
     ThresholdNotifier,
     UsageNotification,
@@ -17,9 +17,9 @@ def make_data(
     *,
     utilization: float,
     fetch_error: str | None = None,
-) -> AnthropicUsageData:
+) -> ProviderUsageData:
     """Build one successful usage response with a configurable 5h utilization."""
-    return AnthropicUsageData(
+    return ProviderUsageData(
         five_hour=UsageWindow(
             utilization=utilization,
             resets_at=NOW + timedelta(hours=2),
@@ -106,7 +106,7 @@ class TestThresholdNotifier:
 
     def test_missing_five_hour_does_not_notify(self):
         notifier = ThresholdNotifier()
-        data = AnthropicUsageData(five_hour=None, fetched_at=NOW)
+        data = ProviderUsageData(five_hour=None, fetched_at=NOW)
         assert notifier.check(data) == []
 
 
@@ -118,7 +118,7 @@ class TestRemainingPercent:
         assert _remaining_percent(data) == 66.4
 
     def test_returns_none_without_five_hour_window(self):
-        data = AnthropicUsageData(five_hour=None, fetched_at=NOW)
+        data = ProviderUsageData(five_hour=None, fetched_at=NOW)
         assert _remaining_percent(data) is None
 
     def test_returns_none_for_fetch_errors(self):
@@ -137,3 +137,27 @@ class TestCrossedThresholds:
 
     def test_no_crossing_when_usage_increases_remaining(self):
         assert _crossed_thresholds(previous=20.0, current=80.0) == []
+
+
+class TestProviderLabelledNotifications:
+    """A pop-up has to say whose quota is running out."""
+
+    def _cross_fifty(self, notifier) -> list:
+        notifier.check(make_data(utilization=40.0))
+        return notifier.check(make_data(utilization=60.0))
+
+    def test_claude_is_named_by_default(self):
+        notifications = self._cross_fifty(ThresholdNotifier())
+
+        assert notifications[0].title == "Claude usage below 50%"
+
+    def test_codex_is_named_when_configured(self):
+        notifications = self._cross_fifty(ThresholdNotifier(provider_label="Codex"))
+
+        assert notifications[0].title == "Codex usage below 50%"
+
+    def test_the_message_body_is_the_same_for_both(self):
+        claude = self._cross_fifty(ThresholdNotifier())
+        codex = self._cross_fifty(ThresholdNotifier(provider_label="Codex"))
+
+        assert claude[0].message == codex[0].message

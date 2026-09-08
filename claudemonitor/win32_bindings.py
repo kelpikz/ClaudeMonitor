@@ -22,12 +22,15 @@ WS_EX_NOACTIVATE = 0x08000000  # Never steal keyboard focus.
 WS_EX_TOPMOST = 0x00000008  # Keep a tooltip above the taskbar it describes.
 GWL_STYLE = -16  # Select the ordinary style field in Get/SetWindowLongPtr.
 GWL_EXSTYLE = -20  # Select the extended-style field in Get/SetWindowLongPtr.
+GWLP_WNDPROC = -4  # Select the window procedure, which is how a control is subclassed.
 
-# Transparency: pixels painted black become holes through which the taskbar's
-# own acrylic background remains visible.
+# Transparency: the label hands Windows a bitmap carrying an alpha value for
+# every pixel, so a half-covered edge is composited against whatever the
+# taskbar actually shows there rather than against a colour we had to guess.
 WS_EX_LAYERED = 0x00080000  # Allow per-pixel transparency configuration.
-LWA_COLORKEY = 0x00000001  # Treat one chosen color as fully transparent.
-TRANSPARENT_COLORKEY = 0x00000000  # Black pixels will reveal the taskbar.
+ULW_ALPHA = 0x00000002  # Read the source bitmap's own alpha channel.
+AC_SRC_OVER = 0x00  # The only blend operation Windows defines.
+AC_SRC_ALPHA = 0x01  # The source colours are already multiplied by their alpha.
 
 # Repositioning flags. Moving must not activate or accidentally show a window;
 # visibility is controlled separately through ShowWindow.
@@ -37,10 +40,118 @@ SWP_NOZORDER = 0x0004  # Preserve stacking order relative to other windows.
 SWP_NOACTIVATE = 0x0010  # Do not move keyboard focus to this window.
 SWP_FRAMECHANGED = 0x0020  # Recalculate the frame after changing styles.
 HWND_TOPMOST = -1  # Place the fallback popup above other normal windows.
+HWND_BOTTOM = 1  # Send a window below every sibling it shares a parent with.
 
 # ShowWindow commands: reveal without stealing focus, or hide entirely.
 SW_HIDE = 0
+SW_SHOW = 5
+SW_RESTORE = 9
 SW_SHOWNOACTIVATE = 8
+
+# An ordinary dialog: a caption bar with a close button, fixed size, and no
+# minimise or maximise box. The settings window is the only one of these.
+WS_OVERLAPPED = 0x00000000
+WS_CAPTION = 0x00C00000
+WS_SYSMENU = 0x00080000
+WS_VISIBLE = 0x10000000
+WS_TABSTOP = 0x00010000
+WS_GROUP = 0x00020000
+WS_EX_DLGMODALFRAME = 0x00000001
+CW_USEDEFAULT = -2147483648  # 0x80000000 as a signed int: "you choose".
+WS_CLIPCHILDREN = 0x02000000  # Never paint over a child; the tab page relies on it.
+WS_CLIPSIBLINGS = 0x04000000  # Keep a page control out of the tab control's paint.
+WS_BORDER = 0x00800000
+WS_EX_CONTROLPARENT = 0x00010000  # Let Tab reach the controls inside this window.
+IDOK = 1  # The command id Windows itself sends for Enter.
+IDCANCEL = 2  # The command id Windows itself sends for Escape.
+
+# The BUTTON class covers both the checkboxes and the push buttons; the style
+# bit is the only difference between them.
+BUTTON_CLASS = "BUTTON"
+BS_AUTOCHECKBOX = 0x00000003  # A checkbox that flips itself when clicked.
+BS_PUSHBUTTON = 0x00000000
+BS_DEFPUSHBUTTON = 0x00000001
+BS_GROUPBOX = 0x00000007  # The captioned box a group of settings sits in.
+BM_GETCHECK = 0x00F0
+BM_SETCHECK = 0x00F1
+BST_UNCHECKED = 0
+BST_CHECKED = 1
+BN_CLICKED = 0  # The WM_COMMAND notification a button press arrives as.
+
+# The static class prints a label and, with no text, paints the tab page.
+STATIC_CLASS = "STATIC"
+SS_LEFT = 0x00000000
+
+# The edit class holds a number; ES_NUMBER keeps letters out of it entirely.
+EDIT_CLASS = "EDIT"
+ES_LEFT = 0x00000000
+ES_NUMBER = 0x00002000
+ES_AUTOHSCROLL = 0x00000080
+EN_CHANGE = 0x0300  # The notification sent after the text has changed.
+
+# The tab strip across the top of the settings dialog.
+TAB_CONTROL_CLASS = "SysTabControl32"
+TCS_FOCUSNEVER = 0x00008000  # The tabs are reached with Ctrl+Tab, not Tab.
+TCM_FIRST = 0x1300
+TCM_GETCURSEL = TCM_FIRST + 11
+TCM_SETCURSEL = TCM_FIRST + 12
+TCM_ADJUSTRECT = TCM_FIRST + 40
+TCM_GETITEMCOUNT = TCM_FIRST + 4
+TCM_GETITEMRECT = TCM_FIRST + 10
+TCM_INSERTITEMW = TCM_FIRST + 62
+TCIF_TEXT = 0x0001
+TCN_FIRST = -550
+TCN_SELCHANGE = TCN_FIRST - 1  # The user moved to another tab.
+
+# The spin arrows beside a number box.
+UPDOWN_CLASS = "msctls_updown32"
+UDS_ALIGNRIGHT = 0x0004  # Sit against the right edge of the box it serves.
+UDS_SETBUDDYINT = 0x0002  # Write the new number into that box.
+UDS_ARROWKEYS = 0x0020  # Up and down on the keyboard count as clicks.
+UDS_NOTHOUSANDS = 0x0080  # 1000, never 1,000: the box is parsed as an int.
+# The spin messages live above WM_USER, which is defined with the tooltips.
+UDM_SETBUDDY = 0x0400 + 105  # Name the box the arrows write into.
+UDM_SETRANGE32 = 0x0400 + 111  # The lowest and highest the arrows may reach.
+UDM_SETPOS32 = 0x0400 + 113  # Where the arrows currently stand.
+
+# Messages a dialog handles: a control was used, the window should go away, and
+# the two colour requests that let a dark theme reach the controls.
+WM_DESTROY = 0x0002
+WM_CLOSE = 0x0010
+WM_ERASEBKGND = 0x0014
+# A themed control paints no background of its own. It asks its parent to
+# paint one, through this message, handing over its own device context.
+WM_PRINTCLIENT = 0x0318
+WM_SETFONT = 0x0030
+WM_COMMAND = 0x0111
+WM_NOTIFY = 0x004E  # How a common control, such as the tab strip, reports.
+WM_CTLCOLOREDIT = 0x0133
+WM_CTLCOLORSTATIC = 0x0138
+WM_CTLCOLORBTN = 0x0135
+
+# Screen metrics used to centre the window on the primary display.
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+
+# Dark mode. The title bar is Desktop Window Manager's to paint, and the
+# controls take their dark glyphs from the same visual style File Explorer uses.
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DARK_MODE_CONTROL_THEME = "DarkMode_Explorer"
+DARK_THEME_BACKGROUND = 0x00202020  # Near-black COLORREF in BGR byte order.
+LIGHT_THEME_BACKGROUND = 0x00F0F0F0  # The standard dialog grey.
+# A tab page is lighter than the dialog around it, and a text box lighter
+# still. Both are painted by us rather than by the theme, because the tab
+# control has no dark rendering of its own to inherit.
+DARK_THEME_PAGE_BACKGROUND = 0x002B2B2B
+LIGHT_THEME_PAGE_BACKGROUND = 0x00FFFFFF
+DARK_THEME_FIELD_BACKGROUND = 0x003C3C3C
+LIGHT_THEME_FIELD_BACKGROUND = 0x00FFFFFF
+# The tab strip is drawn by hand in dark mode, so it needs colours of its
+# own: a tab that is not the current one, the line around the page, and the
+# dimmer text an unselected tab is titled in.
+DARK_THEME_TAB_INACTIVE = 0x00262626
+DARK_THEME_BORDER = 0x00454545
+DARK_THEME_TAB_INACTIVE_FOREGROUND = 0x00B0B0B0
 
 # Windows sends messages to request painting, shutdown, and theme updates.
 # PeekMessage removes each message from the queue before it is dispatched.
@@ -49,6 +160,11 @@ WM_QUIT = 0x0012  # The thread's message loop should end.
 WM_SETTINGCHANGE = 0x001A  # A system setting, including light/dark mode, changed.
 WM_THEMECHANGED = 0x031A  # The visual style changed.
 PM_REMOVE = 0x0001  # Remove messages as PeekMessage reads them.
+# Redrawing a region of a window *and* the children sitting in that region.
+# InvalidateRect alone stops at a parent that clips its children.
+RDW_INVALIDATE = 0x0001
+RDW_ERASE = 0x0004
+RDW_ALLCHILDREN = 0x0080
 
 # Standard Windows tooltip-control messages and tracking behavior.
 TOOLTIPS_CLASS = "tooltips_class32"
@@ -66,6 +182,9 @@ TTM_UPDATE = WM_USER + 29
 TTM_ADDTOOLW = WM_USER + 50
 TTM_UPDATETIPTEXTW = WM_USER + 57
 ICC_WIN95_CLASSES = 0x000000FF  # Includes the standard tooltip control class.
+ICC_TAB_CLASSES = 0x00000008  # The tab strip.
+ICC_UPDOWN_CLASS = 0x00000010  # The spin arrows beside a number box.
+ICC_STANDARD_CLASSES = 0x00004000  # Button, edit, and static, themed.
 
 # Text drawing options: center one line both horizontally and vertically and
 # draw without a background rectangle.
@@ -74,6 +193,10 @@ DT_VCENTER = 0x00000004  # Center text vertically.
 DT_SINGLELINE = 0x00000020  # Keep the usage summary on one line.
 TRANSPARENT_BACKGROUND = 1  # Do not let GDI paint a background behind glyphs.
 DEFAULT_GUI_FONT = 17  # Windows stock font identifier for standard UI text.
+# ClearType tints each letter's edge to suit one known background colour, which
+# a per-pixel alpha window does not have. Grey anti-aliasing composites onto any
+# background correctly, so the label asks for it in place of the default.
+ANTIALIASED_QUALITY = 4
 
 # Taskbar text must contrast with the theme the user actually runs; near-white
 # glyphs are invisible on a Windows 11 light-mode taskbar.
@@ -87,6 +210,7 @@ _THEME_REGISTRY_VALUE = "SystemUsesLightTheme"
 CS_HREDRAW = 0x0002  # Repaint after horizontal resizing.
 CS_VREDRAW = 0x0001  # Repaint after vertical resizing.
 CLASS_NAME = "ClaudeMonitorTaskbarWindow"  # Process-local window type name.
+SETTINGS_CLASS_NAME = "ClaudeMonitorSettingsWindow"
 GW_HWNDNEXT = 2  # Continue to the next sibling window.
 GW_CHILD = 5  # Start at a parent's first child window.
 ERROR_CLASS_ALREADY_EXISTS = 1410  # A second instance registered the class first.
@@ -103,12 +227,12 @@ DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4  # Per-window DPI, updated live.
 DPI_AWARENESS_UNAWARE = 0  # Coordinates are virtualized to 96 DPI.
 DPI_AWARENESS_PER_MONITOR_AWARE = 2  # What Shell_TrayWnd itself reports.
 
-# Blitting the small Claude glyph beside the usage text as an uncompressed,
-# top-down 24bpp bitmap.
+# The label is drawn into an uncompressed, top-down 32bpp bitmap: one byte of
+# blue, green, red and alpha per pixel, which is exactly what the compositor
+# reads back out of it.
 BI_RGB = 0  # Uncompressed pixel data; no compression bookkeeping needed.
-DIB_RGB_COLORS = 0  # The DIB's color table holds literal RGB values (unused at 24bpp).
-SRCCOPY = 0x00CC0020  # Replace the destination pixels outright when stretching.
-STRETCH_HALFTONE = 4  # Average source pixels when rescaling, rather than dropping them.
+DIB_RGB_COLORS = 0  # The DIB's color table holds literal RGB values (unused at 32bpp).
+LABEL_BITS_PER_PIXEL = 32
 
 
 def _int_resource(identifier: int) -> wintypes.LPCWSTR:
@@ -195,6 +319,30 @@ class INITCOMMONCONTROLSEX(ctypes.Structure):
     ]
 
 
+class TCITEMW(ctypes.Structure):
+    """Python layout of one tab, of which only the caption is ever set."""
+
+    _fields_ = [
+        ("mask", wintypes.UINT),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("pszText", wintypes.LPWSTR),
+        ("cchTextMax", ctypes.c_int),
+        ("iImage", ctypes.c_int),
+        ("lParam", wintypes.LPARAM),
+    ]
+
+
+class NMHDR(ctypes.Structure):
+    """Python layout of the header every WM_NOTIFY message points at."""
+
+    _fields_ = [
+        ("hwndFrom", wintypes.HWND),
+        ("idFrom", ctypes.c_void_p),
+        ("code", ctypes.c_int),
+    ]
+
+
 class LOGFONTW(ctypes.Structure):
     """Python layout of a Windows font description."""
 
@@ -213,6 +361,17 @@ class LOGFONTW(ctypes.Structure):
         ("lfQuality", wintypes.BYTE),  # Anti-aliasing preference.
         ("lfPitchAndFamily", wintypes.BYTE),  # Pitch plus stylistic family.
         ("lfFaceName", wintypes.WCHAR * 32),  # Typeface name such as "Segoe UI".
+    ]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    """How Windows is to combine the label's bitmap with what is behind it."""
+
+    _fields_ = [
+        ("BlendOp", ctypes.c_ubyte),  # Always AC_SRC_OVER.
+        ("BlendFlags", ctypes.c_ubyte),  # Reserved; Windows requires zero.
+        ("SourceConstantAlpha", ctypes.c_ubyte),  # Whole-window opacity.
+        ("AlphaFormat", ctypes.c_ubyte),  # AC_SRC_ALPHA to read per-pixel alpha.
     ]
 
 
@@ -325,6 +484,55 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
         wintypes.BOOL,
     ),
     "ShowWindow": ((wintypes.HWND, ctypes.c_int), wintypes.BOOL),
+    "SetForegroundWindow": ((wintypes.HWND,), wintypes.BOOL),
+    "IsIconic": ((wintypes.HWND,), wintypes.BOOL),
+    "EnableWindow": ((wintypes.HWND, wintypes.BOOL), wintypes.BOOL),
+    "GetSystemMetrics": ((ctypes.c_int,), ctypes.c_int),
+    "AdjustWindowRectEx": (
+        (ctypes.POINTER(wintypes.RECT), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD),
+        wintypes.BOOL,
+    ),
+    "AdjustWindowRectExForDpi": (
+        (
+            ctypes.POINTER(wintypes.RECT),
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            wintypes.UINT,
+        ),
+        wintypes.BOOL,
+    ),
+    "GetDpiForSystem": ((), wintypes.UINT),
+    "FillRect": (
+        (wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH),
+        ctypes.c_int,
+    ),
+    # A one-pixel outline, which is the whole of the tab strip's line work.
+    "FrameRect": (
+        (wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH),
+        ctypes.c_int,
+    ),
+    # Subclassing the tab control: its own procedure is kept and called for
+    # every message but the one that paints it.
+    "CallWindowProcW": (
+        (
+            ctypes.c_void_p,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ),
+        ctypes.c_ssize_t,
+    ),
+    "GetMessageW": (
+        (ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT),
+        wintypes.BOOL,
+    ),
+    "PostMessageW": (
+        (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM),
+        wintypes.BOOL,
+    ),
+    "PostQuitMessage": ((ctypes.c_int,), None),
     "SetParent": ((wintypes.HWND, wintypes.HWND), wintypes.HWND),
     "GetWindow": ((wintypes.HWND, wintypes.UINT), wintypes.HWND),
     "IsWindowVisible": ((wintypes.HWND,), wintypes.BOOL),
@@ -336,12 +544,55 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
         ctypes.c_ssize_t,
     ),
     "GetWindowLongPtrW": ((wintypes.HWND, ctypes.c_int), ctypes.c_ssize_t),
-    "SetLayeredWindowAttributes": (
-        (wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD),
+    "UpdateLayeredWindow": (
+        (
+            wintypes.HWND,
+            wintypes.HDC,  # The screen the window is composited onto.
+            ctypes.POINTER(wintypes.POINT),  # New screen position, or NULL.
+            ctypes.POINTER(SIZE),  # New size, or NULL to keep the current one.
+            wintypes.HDC,  # The memory DC holding the finished bitmap.
+            ctypes.POINTER(wintypes.POINT),  # Where in that bitmap to start.
+            wintypes.COLORREF,  # Unused without ULW_COLORKEY.
+            ctypes.POINTER(BLENDFUNCTION),
+            wintypes.DWORD,
+        ),
         wintypes.BOOL,
     ),
+    # Borrowing the screen's device context: CreateDIBSection and
+    # UpdateLayeredWindow both want one describing the real display.
+    "GetDC": ((wintypes.HWND,), wintypes.HDC),
+    "ReleaseDC": ((wintypes.HWND, wintypes.HDC), ctypes.c_int),
     # Change text and dispatch Windows' message queue.
     "SetWindowTextW": ((wintypes.HWND, wintypes.LPCWSTR), wintypes.BOOL),
+    "GetWindowTextW": (
+        (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int),
+        ctypes.c_int,
+    ),
+    "GetWindowTextLengthW": ((wintypes.HWND,), ctypes.c_int),
+    # Tab and Escape only reach the controls if every message is offered to
+    # the dialog manager first; this window is not a real dialog resource.
+    "IsDialogMessageW": (
+        (wintypes.HWND, ctypes.POINTER(wintypes.MSG)),
+        wintypes.BOOL,
+    ),
+    "SetFocus": ((wintypes.HWND,), wintypes.HWND),
+    "MapWindowPoints": (
+        (wintypes.HWND, wintypes.HWND, ctypes.c_void_p, wintypes.UINT),
+        ctypes.c_int,
+    ),
+    # A per-pixel alpha window is not drawn through its own device context, so
+    # a paint request is answered by marking the window clean rather than by
+    # painting into it. Left invalid, Windows would ask again immediately.
+    "ValidateRect": ((wintypes.HWND, ctypes.c_void_p), wintypes.BOOL),
+    "RedrawWindow": (
+        (
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.RECT),
+            wintypes.HANDLE,  # A region, or NULL to use the rectangle.
+            wintypes.UINT,
+        ),
+        wintypes.BOOL,
+    ),
     "InvalidateRect": (
         (wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.BOOL),
         wintypes.BOOL,
@@ -407,6 +658,7 @@ GDI32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     "CreateSolidBrush": ((wintypes.COLORREF,), wintypes.HBRUSH),
     "CreateFontIndirectW": ((ctypes.POINTER(LOGFONTW),), wintypes.HGDIOBJ),
     "SetBkMode": ((wintypes.HDC, ctypes.c_int), ctypes.c_int),
+    "SetBkColor": ((wintypes.HDC, wintypes.COLORREF), wintypes.COLORREF),
     "SetTextColor": ((wintypes.HDC, wintypes.COLORREF), wintypes.COLORREF),
     "GetStockObject": ((ctypes.c_int,), wintypes.HGDIOBJ),
     "SelectObject": ((wintypes.HDC, wintypes.HGDIOBJ), wintypes.HGDIOBJ),
@@ -417,44 +669,24 @@ GDI32_SIGNATURES: dict[str, tuple[tuple, object]] = {
         (wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(SIZE)),
         wintypes.BOOL,
     ),
-    "SetDIBitsToDevice": (
+    # GDI batches drawing calls. Anything meaning to read back what it drew
+    # has to flush that batch first, or it reads a surface the drawing has not
+    # reached yet.
+    "GdiFlush": ((), wintypes.BOOL),
+    # The surface the whole label is composed on. CreateDIBSection hands back
+    # both a bitmap handle for GDI and a pointer to the pixels themselves, so
+    # the text GDI draws can be read back and the finished picture written in.
+    "CreateDIBSection": (
         (
             wintypes.HDC,
-            ctypes.c_int,  # xDest
-            ctypes.c_int,  # yDest
-            wintypes.DWORD,  # dwWidth
-            wintypes.DWORD,  # dwHeight
-            ctypes.c_int,  # xSrc
-            ctypes.c_int,  # ySrc
-            wintypes.UINT,  # uStartScan
-            wintypes.UINT,  # cScanLines
-            ctypes.c_void_p,  # lpvBits
-            ctypes.POINTER(BITMAPINFO),  # lpbmi
-            wintypes.UINT,  # fuColorUse
-        ),
-        ctypes.c_int,
-    ),
-    # Drawing the glyph at a scaled size needs the stretching variant, because
-    # SetDIBitsToDevice copies pixels one for one and cannot resize.
-    "StretchDIBits": (
-        (
-            wintypes.HDC,
-            ctypes.c_int,  # xDest
-            ctypes.c_int,  # yDest
-            ctypes.c_int,  # DestWidth
-            ctypes.c_int,  # DestHeight
-            ctypes.c_int,  # xSrc
-            ctypes.c_int,  # ySrc
-            ctypes.c_int,  # SrcWidth
-            ctypes.c_int,  # SrcHeight
-            ctypes.c_void_p,  # lpBits
-            ctypes.POINTER(BITMAPINFO),  # lpbmi
+            ctypes.POINTER(BITMAPINFO),
             wintypes.UINT,  # iUsage
-            wintypes.DWORD,  # rop
+            ctypes.POINTER(ctypes.c_void_p),  # Receives the address of the pixels.
+            wintypes.HANDLE,  # File mapping; NULL to let Windows allocate.
+            wintypes.DWORD,  # Offset into that mapping.
         ),
-        ctypes.c_int,
+        wintypes.HBITMAP,
     ),
-    "SetStretchBltMode": ((wintypes.HDC, ctypes.c_int), ctypes.c_int),
     # Releasing a font that a display-scaling change has replaced.
     "DeleteObject": ((wintypes.HGDIOBJ,), wintypes.BOOL),
 }
@@ -475,6 +707,13 @@ UXTHEME_SIGNATURES: dict[str, tuple[tuple, object]] = {
 
 KERNEL32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     "GetModuleHandleW": ((wintypes.LPCWSTR,), wintypes.HMODULE),
+}
+
+DWMAPI_SIGNATURES: dict[str, tuple[tuple, object]] = {
+    "DwmSetWindowAttribute": (
+        (wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD),
+        ctypes.c_long,  # HRESULT
+    ),
 }
 
 
@@ -503,6 +742,38 @@ def apply_signatures(
 def foreground_color_for_theme(*, uses_light_theme: bool) -> int:
     """Pick taskbar text color that stays readable against the active theme."""
     return LIGHT_THEME_FOREGROUND if uses_light_theme else DARK_THEME_FOREGROUND
+
+
+def background_color_for_theme(*, uses_light_theme: bool) -> int:
+    """Pick the window background the same theme calls for."""
+    return LIGHT_THEME_BACKGROUND if uses_light_theme else DARK_THEME_BACKGROUND
+
+
+def page_background_color_for_theme(*, uses_light_theme: bool) -> int:
+    """Pick the colour of a tab page, which sits above the dialog background."""
+    return (
+        LIGHT_THEME_PAGE_BACKGROUND
+        if uses_light_theme
+        else DARK_THEME_PAGE_BACKGROUND
+    )
+
+
+def field_background_color_for_theme(*, uses_light_theme: bool) -> int:
+    """Pick the colour inside a number box, which is lighter again."""
+    return (
+        LIGHT_THEME_FIELD_BACKGROUND
+        if uses_light_theme
+        else DARK_THEME_FIELD_BACKGROUND
+    )
+
+
+def rgb_from_colorref(color: int) -> tuple[int, int, int]:
+    """Split a Windows COLORREF into the red, green, blue Pillow expects.
+
+    A COLORREF stores blue in the high byte, which is the opposite of the order
+    every image library uses.
+    """
+    return (color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF)
 
 
 def system_uses_light_theme() -> bool:

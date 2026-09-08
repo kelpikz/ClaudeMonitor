@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from claudemonitor import config
-from claudemonitor.config import PollingConfig, SessionRefreshConfig, TaskbarConfig
+from claudemonitor.config import (
+    CodexConfig,
+    PollingConfig,
+    SessionRefreshConfig,
+    TaskbarConfig,
+)
 
 
 @pytest.fixture
@@ -165,3 +170,105 @@ def test_saving_never_leaves_a_truncated_config_behind(config_path):
         config.os.replace = original_replace
 
     assert config_path.read_text(encoding="utf-8") == "[polling]\ninterval_seconds = 30\n"
+
+
+# ===========================================================================
+# Codex tracking — on by default, switchable from the tray or the file.
+# ===========================================================================
+
+
+def test_codex_tracking_is_enabled_by_default():
+    assert CodexConfig().enabled is True
+
+
+def test_codex_tracking_can_be_turned_off_in_the_config_file(config_path):
+    _write_config(config_path, "[codex]\nenabled = false\n")
+
+    assert config.load_config().codex.enabled is False
+
+
+def test_codex_toggle_is_persisted_without_touching_other_settings(config_path):
+    _write_config(
+        config_path,
+        "[polling]\ninterval_seconds = 45\n\n[codex]\nenabled = true\n",
+    )
+
+    config.save_codex_enabled(False)
+
+    reloaded = config.load_config()
+    assert reloaded.codex.enabled is False
+    assert reloaded.polling.interval_seconds == 45
+
+
+def test_codex_toggle_seeds_the_section_when_it_is_absent(config_path):
+    _write_config(config_path, "[polling]\ninterval_seconds = 30\n")
+
+    config.save_codex_enabled(False)
+
+    assert config.load_config().codex.enabled is False
+
+
+def test_seeded_config_documents_the_codex_section(config_path):
+    config.load_config()
+
+    assert "[codex]" in config_path.read_text(encoding="utf-8")
+
+
+def test_a_wrongly_typed_codex_section_falls_back_to_the_default(config_path):
+    _write_config(config_path, '[codex]\nenabled = "yes please"\n')
+
+    assert config.load_config().codex.enabled is True
+
+
+class TestSavingTheNumericSettings:
+    """The settings window now writes what used to be file-only, so each of
+    these values needs a writer that leaves every other setting alone."""
+
+    def test_the_poll_interval_is_persisted(self, config_path):
+        _write_config(config_path, "[polling]\ninterval_seconds = 60\n")
+
+        config.save_poll_interval_seconds(120)
+
+        assert config.load_config().polling.interval_seconds == 120
+
+    def test_the_amber_threshold_is_persisted(self, config_path):
+        _write_config(config_path, "[thresholds]\namber_below = 50\nred_below = 20\n")
+
+        config.save_amber_threshold(40)
+
+        loaded = config.load_config()
+        assert loaded.thresholds.amber_below == 40
+        assert loaded.thresholds.red_below == 20
+
+    def test_the_red_threshold_is_persisted(self, config_path):
+        _write_config(config_path, "[thresholds]\namber_below = 50\nred_below = 20\n")
+
+        config.save_red_threshold(10)
+
+        loaded = config.load_config()
+        assert loaded.thresholds.red_below == 10
+        assert loaded.thresholds.amber_below == 50
+
+    def test_the_refresh_cooldown_is_persisted(self, config_path):
+        _write_config(
+            config_path, "[session_refresh]\nenabled = true\ncooldown_seconds = 900\n"
+        )
+
+        config.save_session_refresh_cooldown(300)
+
+        loaded = config.load_config()
+        assert loaded.session_refresh.cooldown_seconds == 300
+        assert loaded.session_refresh.enabled is True
+
+    def test_a_numeric_write_seeds_a_missing_section(self, config_path):
+        _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
+
+        config.save_amber_threshold(35)
+
+        assert config.load_config().thresholds.amber_below == 35
+        assert "Keep this user note" in config_path.read_text(encoding="utf-8")
+
+    def test_a_numeric_write_seeds_a_missing_config_file(self, config_path):
+        config.save_poll_interval_seconds(90)
+
+        assert config.load_config().polling.interval_seconds == 90

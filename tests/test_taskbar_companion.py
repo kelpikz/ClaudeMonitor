@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from claudemonitor.models import Rect
+from claudemonitor.models import LabelSegment, Rect
 from claudemonitor.taskbar_companion import (
     DisabledTaskbarCompanion,
     TaskbarCompanion,
@@ -158,8 +158,8 @@ class _FakeNativeWindow:
         self._record("get_rect", handle)
         return self.taskbar_rect if handle == 10 else self.notification_rect
 
-    def content_width_for(self, text):
-        self._record("content_width_for", text)
+    def content_width_for(self, segments):
+        self._record("content_width_for", _text_of(segments))
         return self.content_width
 
     def create_window(self, *, text):
@@ -176,8 +176,8 @@ class _FakeNativeWindow:
         self._record("list_sibling_rects", taskbar, exclude_handle)
         return list(self.sibling_rects)
 
-    def set_colorkey_transparency(self, handle):
-        self._record("set_colorkey_transparency", handle)
+    def enable_per_pixel_alpha(self, handle):
+        self._record("enable_per_pixel_alpha", handle)
 
     def refresh_theme(self, handle):
         self._record("refresh_theme", handle)
@@ -185,8 +185,8 @@ class _FakeNativeWindow:
     def move_window(self, handle, rect, *, topmost):
         self._record("move_window", handle, rect, topmost)
 
-    def set_text(self, handle, text):
-        self._record("set_text", handle, text)
+    def set_segments(self, handle, segments):
+        self._record("set_text", handle, _text_of(segments))
 
     def set_tooltip(self, handle, tooltip):
         self._record("set_tooltip", handle, tooltip)
@@ -204,6 +204,16 @@ class _FakeNativeWindow:
 
     def close_window(self, handle):
         self._record("close_window", handle)
+
+
+def _segments(*texts: str) -> list[LabelSegment]:
+    """Build a Claude-only label from plain strings, as most tests want."""
+    return [LabelSegment(provider_key="claude", text=text) for text in texts]
+
+
+def _text_of(segments) -> str:
+    """Flatten a label back to the plain text the older assertions expect."""
+    return "  ".join(segment.text for segment in segments)
 
 
 class _RecordingStopEvent:
@@ -286,7 +296,7 @@ class TestStartupSequence:
     def test_usage_text_supplied_before_start_is_rendered_initially(self):
         native = _FakeNativeWindow()
         companion = TaskbarCompanion(native=native)
-        companion.update("80% (3h 0m)", "Claude usage\n5h: 80% left")
+        companion.update(_segments("80% (3h 0m)"), "Claude usage\n5h: 80% left")
 
         companion._run()
 
@@ -311,7 +321,7 @@ class TestStartupSequence:
 
         TaskbarCompanion(native=native)._run()
 
-        assert ("set_colorkey_transparency", _handle(native)) in native.calls
+        assert ("enable_per_pixel_alpha", _handle(native)) in native.calls
 
 
 class TestVisibility:
@@ -348,7 +358,7 @@ class TestVisibility:
         original_pump = native.pump_messages
 
         def update_during_first_pump(stop_requested, duration_seconds):
-            companion.update("80% (3h 0m)", "Claude usage\n5h: 80% left")
+            companion.update(_segments("80% (3h 0m)"), "Claude usage\n5h: 80% left")
             original_pump(stop_requested, duration_seconds)
 
         native.pump_messages = update_during_first_pump
@@ -432,12 +442,12 @@ class TestPlacement:
         native = _FakeNativeWindow(pump_rounds=2)
         native.content_width = 100
         companion = TaskbarCompanion(native=native)
-        companion.update("40%")
+        companion.update(_segments("40%"))
         original_pump = native.pump_messages
 
         def pump_and_widen_text(stop_requested, duration_seconds):
             native.content_width = 160
-            companion.update("100% (not started)")
+            companion.update(_segments("100% (not started)"))
             original_pump(stop_requested, duration_seconds)
 
         native.pump_messages = pump_and_widen_text
@@ -561,7 +571,7 @@ class TestNativeFailureRecovery:
 
     @pytest.mark.parametrize(
         "failing_call",
-        ["attach_to_taskbar", "set_colorkey_transparency"],
+        ["attach_to_taskbar", "enable_per_pixel_alpha"],
     )
     def test_setup_failing_after_creation_still_destroys_the_window(self, failing_call):
         # Without this, every retry orphans one HWND — roughly 3,600 an hour,
@@ -714,7 +724,7 @@ class TestCompanionFactory:
         companion = DisabledTaskbarCompanion()
 
         companion.start()
-        companion.update("80% (3h 0m)", "Claude usage\n5h: 80% left")
+        companion.update(_segments("80% (3h 0m)"), "Claude usage\n5h: 80% left")
         companion.set_visible(True)
         companion.stop()
 

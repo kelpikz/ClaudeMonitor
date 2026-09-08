@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="the taskbar label is a Windows-only feature"
 )
 
-from claudemonitor.models import Rect
+from claudemonitor.models import LabelSegment, Rect
 from claudemonitor.taskbar_companion import companion_slot
 from claudemonitor.win32_bindings import (
     IDC_ARROW,
@@ -78,12 +78,86 @@ class TestRealWindowLifecycle:
         handle = native.create_window(text="Claude: 80% (3 hours)")
         try:
             assert handle
-            native.set_colorkey_transparency(handle)
-            native.set_text(handle, "Claude: 79% (2 hours)")
+            native.enable_per_pixel_alpha(handle)
+            native.set_segments(
+                handle, [LabelSegment("claude", "79% (2 hours)")]
+            )
             native.move_window(
                 handle, Rect(left=0, top=0, right=180, bottom=40), topmost=True
             )
             assert native.get_rect(handle).width == 180
+        finally:
+            native.close_window(handle)
+
+    def test_a_two_provider_label_survives_the_real_api(self, native):
+        # Two marks and two strings are measured by the real GDI, which is where
+        # a mistyped signature actually shows up.
+        handle = native.create_window(text="loading...")
+        try:
+            native.set_segments(
+                handle,
+                [
+                    LabelSegment("claude", "80% (3h 0m)"),
+                    LabelSegment("codex", "64% (2h 0m)"),
+                ],
+            )
+            width = native.content_width_for(
+                [
+                    LabelSegment("claude", "80% (3h 0m)"),
+                    LabelSegment("codex", "64% (2h 14m)"),
+                ]
+            )
+            # Stacked rows share one width, so the longer string sets it and
+            # the shorter one adds nothing.
+            assert width == native.content_width_for(
+                [LabelSegment("codex", "64% (2h 14m)")]
+            )
+            assert width > native.content_width_for(
+                [LabelSegment("claude", "80% (3h 0m)")]
+            )
+        finally:
+            native.close_window(handle)
+
+    def test_a_real_paint_is_accepted_by_windows(self, native):
+        """The whole render, against the real GDI, on a window nobody can see.
+
+        CreateDIBSection hands back a pointer through an argument, and
+        UpdateLayeredWindow takes nine of them including two structures. A fake
+        DLL accepts any of that happily; only Windows objects to a wrong one,
+        and the label would then be silently blank on the user's taskbar.
+        """
+        handle = native.create_window(text="loading...")
+        try:
+            native.enable_per_pixel_alpha(handle)
+            native.move_window(
+                handle, Rect(left=-3000, top=-3000, right=-2860, bottom=-2940),
+                topmost=True,
+            )
+            native.set_segments(
+                handle,
+                [
+                    LabelSegment("claude", "80% (3h 0m)"),
+                    LabelSegment("codex", "64% (2h 14m)"),
+                ],
+            )
+
+            native._render_label(handle)
+        finally:
+            native.close_window(handle)
+
+    def test_a_paint_before_the_label_is_sized_is_skipped(self, native):
+        # A window is born 1x1 and only sized once the taskbar is measured.
+        # Windows refuses a bitmap for an empty rectangle, so the paint has to
+        # notice rather than log a failure every second until the first move.
+        handle = native.create_window(text="loading...")
+        try:
+            native.enable_per_pixel_alpha(handle)
+            native.move_window(
+                handle, Rect(left=-3000, top=-3000, right=-3000, bottom=-3000),
+                topmost=True,
+            )
+
+            native._render_label(handle)
         finally:
             native.close_window(handle)
 

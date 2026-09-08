@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from claudemonitor import fetcher
-from claudemonitor.models import AnthropicUsageData
+from claudemonitor.models import ProviderUsageData
 
 
 class _FakeResponse:
@@ -49,7 +49,7 @@ def test_429_maps_to_rate_limited(fake_token, monkeypatch):
     # processor can fall back to the last good data instead of going grey.
     monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(429))
     data = fetcher.fetch()
-    assert isinstance(data, AnthropicUsageData)
+    assert isinstance(data, ProviderUsageData)
     assert data.fetch_error == "rate_limited"
     assert data.status_code == 429
     assert data.five_hour is None

@@ -1,16 +1,35 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime
 
 from .config import Config
-from .models import AnthropicUsageData, DisplayState, UsageWindow
+from .models import (
+    CLAUDE,
+    PROVIDERS,
+    DisplayState,
+    LabelSegment,
+    Provider,
+    ProviderUsageData,
+    TaskbarLabel,
+    TrayState,
+    UsageWindow,
+)
 
 # Every taskbar string lives here so the label, the tooltip, and the menu can
 # never drift apart. The companion shows this until the first fetch completes.
 # The native label draws the Claude glyph itself, so these strings no longer
 # spell out "Claude" — see win32_taskbar_window._draw_icon.
 LOADING_TASKBAR_TEXT = "loading..."
+LOADING_TOOLTIP = "Claude Monitor — loading…"
+LOADING_MENU_STATUS = "Loading…"
+
+# Ascending order of how much the user needs to look at the tray icon. One icon
+# now serves every provider, so the most severe colour is the one it takes:
+# grey outranks green because "we do not know" must not read as "all is well",
+# and both amber and red outrank grey because a real number beats a blank.
+_ICON_COLOR_SEVERITY = ("green", "grey", "amber", "red")
 
 _TASKBAR_ERROR_TEXTS = {
     "token_expired": "token expired",
@@ -24,6 +43,41 @@ _TASKBAR_UNKNOWN_ERROR_TEXT = "unavailable"
 _TASKBAR_SIGN_IN_TEXT = "sign in"
 _TASKBAR_NO_DATA_TEXT = "no data"
 _TASKBAR_INTERNAL_ERROR_TEXT = "error"
+
+
+@dataclass(frozen=True)
+class _Wording:
+    """The provider-specific sentences the tooltip needs.
+
+    Every other string in this module is provider-neutral, so this is the whole
+    of what changes between Claude and Codex.
+    """
+
+    heading: str
+    token_expired: str
+    missing_credentials: str
+    sign_in_needed: str
+
+
+_WORDING: dict[str, _Wording] = {
+    "claude": _Wording(
+        heading="Claude usage",
+        token_expired="Claude token expired — start Claude Code to refresh",
+        missing_credentials="Claude credentials not found — log in via Claude Code",
+        sign_in_needed="Claude sign-in needed — run: claude /login",
+    ),
+    "codex": _Wording(
+        heading="Codex usage",
+        token_expired="Codex token expired — start Codex to refresh",
+        missing_credentials="Codex credentials not found — log in via Codex",
+        sign_in_needed="Codex sign-in needed — run: codex login",
+    ),
+}
+
+
+def _wording(provider: Provider) -> _Wording:
+    """Return the sentences for a provider, defaulting to Claude's."""
+    return _WORDING.get(provider.key, _WORDING["claude"])
 
 
 def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
@@ -69,6 +123,18 @@ def _taskbar_text(window: UsageWindow, now: datetime) -> str:
     return f"{remaining_usage}% ({_taskbar_reset_text(window.resets_at, now)})"
 
 
+def _tray_text(five_hour_text: str, seven_day: UsageWindow | None) -> str:
+    """Condense one provider onto the single line the tray tooltip stacks.
+
+    The five-hour reading is what the taskbar already shows; the weekly number
+    is appended because the tray icon is the only place left that reports it.
+    """
+    if seven_day is None or _window_not_started(seven_day):
+        return five_hour_text
+    week_remaining = 100.0 - seven_day.utilization
+    return f"{five_hour_text} · week {week_remaining:.0f}%"
+
+
 def _taskbar_error_text(error: str | None, session_refresh_exhausted: bool = False) -> str:
     """Map a fetch error to a short label that still says what went wrong."""
     if _needs_sign_in(error, session_refresh_exhausted):
@@ -103,7 +169,7 @@ def _format_elapsed(seconds: int) -> str:
 
 
 def _menu_label(
-    data: AnthropicUsageData,
+    data: ProviderUsageData,
     now: datetime,
     session_refresh_exhausted: bool = False,
 ) -> str:
@@ -140,13 +206,18 @@ def _window_not_started(window: UsageWindow) -> bool:
     return window.utilization == 0.0 and window.resets_at is None
 
 
-def _usage_lines(data: AnthropicUsageData, now: datetime) -> list[str]:
-    """Build the 'Claude usage' header plus the 5h (and optional weekly) "% left
-    · resets in ..." lines. The caller appends a trailing status line."""
+def _usage_lines(
+    data: ProviderUsageData,
+    now: datetime,
+    provider: Provider = CLAUDE,
+) -> list[str]:
+    """Build the "<provider> usage" header plus the 5h (and optional weekly)
+    "% left · resets in ..." lines. The caller appends a trailing status line."""
+    heading = _wording(provider).heading
     if data.seven_day is not None and _window_not_started(data.seven_day):
         # A weekly session cannot be unstarted while the 5h session is active,
         # so showing both prompts would be redundant.
-        return ["Claude usage", "Week: send a message to start the session"]
+        return [heading, "Week: send a message to start the session"]
 
     if _window_not_started(data.five_hour):
         # No countdown to show yet — explain that it begins on the first message
@@ -157,7 +228,7 @@ def _usage_lines(data: AnthropicUsageData, now: datetime) -> list[str]:
         five_reset = _format_time_left(data.five_hour.resets_at, now)
         five_hour_line = f"5h:   {five_remaining:.0f}% left · resets in {five_reset}"
     lines = [
-        "Claude usage",
+        heading,
         five_hour_line,
     ]
     if data.seven_day is not None:
@@ -170,28 +241,37 @@ def _usage_lines(data: AnthropicUsageData, now: datetime) -> list[str]:
     return lines
 
 
-def _stale_state(last_good: AnthropicUsageData, now: datetime, config: Config) -> DisplayState:
+def _stale_state(
+    last_good: ProviderUsageData,
+    now: datetime,
+    config: Config,
+    provider: Provider = CLAUDE,
+) -> DisplayState:
     """Render the last successful usage data, flagged as stale because the most
     recent fetch was rate-limited (HTTP 429). Reset times stay accurate (they are
     absolute timestamps); only the freshness note reflects the older fetch."""
     color = _icon_color(last_good.five_hour.utilization, config)
-    lines = _usage_lines(last_good, now)
+    lines = _usage_lines(last_good, now, provider)
     elapsed = _format_elapsed(max(0, int((now - last_good.fetched_at).total_seconds())))
     lines.append(f"Unable to fetch recent data ({elapsed} ago)")
+    taskbar_text = _taskbar_text(last_good.five_hour, now)
     return DisplayState(
+        provider_key=provider.key,
         icon_color=color,
         tooltip="\n".join(lines),
         menu_status_label=f"Rate limited — last update {elapsed} ago",
-        taskbar_text=_taskbar_text(last_good.five_hour, now),
+        taskbar_text=taskbar_text,
+        tray_text=_tray_text(taskbar_text, last_good.seven_day),
     )
 
 
 def process(
-    data: AnthropicUsageData,
+    data: ProviderUsageData,
     now: datetime,
     config: Config,
-    last_good: AnthropicUsageData | None = None,
+    last_good: ProviderUsageData | None = None,
     session_refresh_exhausted: bool = False,
+    provider: Provider = CLAUDE,
 ) -> DisplayState:
     # A rate-limit doesn't mean our data is wrong, just unrefreshed. If we have a
     # previous successful result, show it (flagged stale) instead of going grey.
@@ -200,56 +280,69 @@ def process(
         and last_good is not None
         and last_good.five_hour is not None
     ):
-        return _stale_state(last_good, now, config)
+        return _stale_state(last_good, now, config, provider)
 
     label = _menu_label(data, now, session_refresh_exhausted)
 
     if data.fetch_error:
-        tooltip = _error_tooltip(data.fetch_error, data, now, session_refresh_exhausted)
+        tooltip = _error_tooltip(
+            data.fetch_error, data, now, session_refresh_exhausted, provider
+        )
         tooltip += f"\n{_updated_at_line(data.fetched_at, now)}"
+        error_text = _taskbar_error_text(data.fetch_error, session_refresh_exhausted)
         return DisplayState(
+            provider_key=provider.key,
             icon_color="grey",
             tooltip=tooltip,
             menu_status_label=label,
-            taskbar_text=_taskbar_error_text(data.fetch_error, session_refresh_exhausted),
+            taskbar_text=error_text,
+            tray_text=error_text,
         )
 
     if data.five_hour is None:
+        heading = _wording(provider).heading
         return DisplayState(
+            provider_key=provider.key,
             icon_color="grey",
-            tooltip=f"Claude usage\nNo usage data available\n{_updated_at_line(data.fetched_at, now)}",
+            tooltip=f"{heading}\nNo usage data available\n{_updated_at_line(data.fetched_at, now)}",
             menu_status_label=label,
             taskbar_text=_TASKBAR_NO_DATA_TEXT,
+            tray_text=_TASKBAR_NO_DATA_TEXT,
         )
 
-    lines = _usage_lines(data, now)
+    lines = _usage_lines(data, now, provider)
     lines.append(_updated_at_line(data.fetched_at, now))
 
+    taskbar_text = _taskbar_text(data.five_hour, now)
     return DisplayState(
+        provider_key=provider.key,
         icon_color=_icon_color(data.five_hour.utilization, config),
         tooltip="\n".join(lines),
         menu_status_label=label,
-        taskbar_text=_taskbar_text(data.five_hour, now),
+        taskbar_text=taskbar_text,
+        tray_text=_tray_text(taskbar_text, data.seven_day),
     )
 
 
 def _error_tooltip(
     error: str,
-    data: AnthropicUsageData,
+    data: ProviderUsageData,
     now: datetime,
     session_refresh_exhausted: bool = False,
+    provider: Provider = CLAUDE,
 ) -> str:
+    wording = _wording(provider)
     if _needs_sign_in(error, session_refresh_exhausted):
         # "Start Claude Code to refresh" is advice that cannot work once the
         # automatic refresh has already tried and failed.
-        return "Claude sign-in needed — run: claude /login"
+        return wording.sign_in_needed
     if error == "token_expired":
-        return "Claude token expired — start Claude Code to refresh"
+        return wording.token_expired
     if error in ("timeout", "offline"):
         elapsed = int((now - data.fetched_at).total_seconds())
         return f"Offline — last update {_format_elapsed(max(0, elapsed))} ago"
     if error == "no_credentials":
-        return "Claude credentials not found — log in via Claude Code"
+        return wording.missing_credentials
     if error == "bad_response":
         return "Unexpected API response — see log for details"
     if error == "rate_limited":
@@ -257,10 +350,82 @@ def _error_tooltip(
     return "Internal error — see log"
 
 
-def internal_error_state(now: datetime) -> DisplayState:
+def internal_error_state(now: datetime, provider: Provider = CLAUDE) -> DisplayState:
     return DisplayState(
+        provider_key=provider.key,
         icon_color="grey",
         tooltip="Internal error — see log",
         menu_status_label=f"Error — {now.strftime('%H:%M')}",
         taskbar_text=_TASKBAR_INTERNAL_ERROR_TEXT,
+        tray_text=_TASKBAR_INTERNAL_ERROR_TEXT,
+    )
+
+
+def taskbar_label(states: list[DisplayState]) -> TaskbarLabel:
+    """Combine each provider's display state into the one taskbar label.
+
+    The label is a list of glyph-and-text segments rather than a single string,
+    so the native window can draw each provider's own icon before its numbers.
+    The tooltip stacks the full per-provider detail, separated by a blank line.
+    """
+    if not states:
+        # An empty label has no width, which would collapse the native window.
+        return TaskbarLabel(
+            segments=[LabelSegment(provider_key=CLAUDE.key, text=LOADING_TASKBAR_TEXT)],
+            tooltip=LOADING_TOOLTIP,
+        )
+    return TaskbarLabel(
+        segments=[
+            LabelSegment(provider_key=state.provider_key, text=state.taskbar_text)
+            for state in states
+        ],
+        tooltip="\n\n".join(state.tooltip for state in states),
+    )
+
+
+def _provider_label(provider_key: str) -> str:
+    """Name a provider for the tray, falling back to a readable form of its key."""
+    provider = PROVIDERS.get(provider_key)
+    return provider.label if provider is not None else provider_key.title()
+
+
+def tray_status(states: list[DisplayState]) -> TrayState:
+    """Condense every tracked provider into what the one tray icon shows.
+
+    The icon has one colour for two providers, so it takes the more serious of
+    the two; the tooltip and the menu name each provider, because a number with
+    no name beside it belongs to nobody.
+    """
+    if not states:
+        return TrayState(
+            icon_color="grey",
+            tooltip=LOADING_TOOLTIP,
+            status_lines=[LOADING_MENU_STATUS],
+        )
+    return TrayState(
+        icon_color=max(states, key=_color_severity).icon_color,
+        tooltip="\n".join(
+            f"{_provider_label(state.provider_key)}  {state.tray_text}"
+            for state in states
+        ),
+        status_lines=[
+            f"{_provider_label(state.provider_key)} — {state.menu_status_label}"
+            for state in states
+        ],
+    )
+
+
+def _color_severity(state: DisplayState) -> int:
+    """Rank one provider's colour so the worst of them can be picked."""
+    return _ICON_COLOR_SEVERITY.index(state.icon_color)
+
+
+def loading_label(providers: list[Provider]) -> TaskbarLabel:
+    """Build the placeholder label shown before the first fetch returns."""
+    return TaskbarLabel(
+        segments=[
+            LabelSegment(provider_key=provider.key, text=LOADING_TASKBAR_TEXT)
+            for provider in providers
+        ],
+        tooltip=LOADING_TOOLTIP,
     )

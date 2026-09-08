@@ -7,10 +7,12 @@ from claudemonitor import cli_refresher
 from claudemonitor.cli_refresher import (
     SessionNudger,
     _claude_command,
+    _codex_command,
     needs_session_nudge,
     run_claude_cli,
+    run_codex_cli,
 )
-from claudemonitor.models import AnthropicUsageData, UsageWindow
+from claudemonitor.models import ProviderUsageData, UsageWindow
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -20,14 +22,14 @@ def usage(
     utilization: float | None = None,
     resets_at: datetime | None = None,
     fetch_error: str | None = None,
-) -> AnthropicUsageData:
+) -> ProviderUsageData:
     """Build one fetch result, with a 5h window only when a utilization is given."""
     five_hour = (
         UsageWindow(utilization=utilization, resets_at=resets_at)
         if utilization is not None
         else None
     )
-    return AnthropicUsageData(five_hour=five_hour, fetch_error=fetch_error, fetched_at=NOW)
+    return ProviderUsageData(five_hour=five_hour, fetch_error=fetch_error, fetched_at=NOW)
 
 
 class _CompletedProcess:
@@ -56,6 +58,10 @@ class _RecordingRunner:
 
 def _which_finds_claude(_name: str) -> str:
     return r"C:\Users\someone\.local\bin\claude.EXE"
+
+
+def _which_finds_codex(_name: str) -> str:
+    return r"C:\Users\someone\AppData\Roaming\npm\codex.CMD"
 
 
 def _which_finds_nothing(_name: str) -> None:
@@ -434,12 +440,44 @@ class TestRuntimeToggle:
 
         assert nudger.maybe_nudge(usage(utilization=0.0)) is False
 
+    def test_the_cooldown_can_be_changed_while_running(self):
+        # The settings window writes a new cooldown on Apply; a nudger that
+        # kept the value it started with would ignore it until the next launch.
+        elapsed = [0.0]
+        nudger = SessionNudger(
+            invoke=lambda: True,
+            start_background=_run_immediately,
+            clock=lambda: elapsed[0],
+            cooldown_seconds=900,
+        )
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+        nudger.set_cooldown_seconds(60)
+        elapsed[0] = 100.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+    def test_a_longer_cooldown_takes_effect_at_once(self):
+        elapsed = [0.0]
+        nudger = SessionNudger(
+            invoke=lambda: True,
+            start_background=_run_immediately,
+            clock=lambda: elapsed[0],
+            cooldown_seconds=60,
+        )
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+        nudger.set_cooldown_seconds(900)
+        elapsed[0] = 100.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+
 
 class TestConcurrentNudges:
     """A nudge outlives one poll, so a second poll must not stack another CLI call."""
 
     def test_a_nudge_still_running_blocks_a_second_one(self):
-        started: list[AnthropicUsageData] = []
+        started: list[ProviderUsageData] = []
         pending: list = []
         nudger = SessionNudger(
             invoke=lambda: started.append("invoked") or True,
@@ -468,3 +506,179 @@ class TestConcurrentNudges:
         elapsed[0] = 61.0
 
         assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+
+# ===========================================================================
+# Codex — the same nudge, decided by the same rule.
+# ===========================================================================
+
+
+class TestCodexSharesTheNudgeRule:
+    """One rule decides for both providers, because one message fixes both.
+
+    Codex used to own a predicate that fired on an expired token and nothing
+    else, on the theory that Codex reports a reset time whether or not the
+    window has been used. The effect was that an idle Codex window — the one
+    state a single message actually repairs — was never woken, and the user
+    had to run ``codex exec`` by hand.
+    """
+
+    def test_expired_token_is_worth_nudging(self):
+        assert needs_session_nudge(usage(fetch_error="token_expired")) is True
+
+    def test_untouched_window_is_worth_nudging(self):
+        assert needs_session_nudge(usage(utilization=0.0)) is True
+
+    def test_healthy_usage_is_left_alone(self):
+        assert needs_session_nudge(usage(utilization=42.0)) is False
+
+    def test_other_errors_are_not_nudgeable(self):
+        for error in ("offline", "timeout", "no_credentials", "rate_limited"):
+            assert needs_session_nudge(usage(fetch_error=error)) is False
+
+    def test_no_provider_specific_predicate_survives(self):
+        # Two predicates meant two behaviours to keep in step, and they drifted.
+        assert not hasattr(cli_refresher, "needs_codex_nudge")
+
+
+class TestCodexCommand:
+    """The argv for the cheapest turn that still forces a token refresh."""
+
+    def test_runs_a_non_interactive_turn(self):
+        command = _codex_command("codex.CMD")
+
+        assert command[0] == "codex.CMD"
+        assert command[1] == "exec"
+        assert command[-1] == "hi"
+
+    def test_refuses_to_touch_the_users_files(self):
+        # The nudge only exists to make one authenticated request. A sandbox
+        # that could write would let an off-hand model reply edit real files.
+        command = _codex_command("codex.CMD")
+
+        assert "--sandbox" in command
+        assert command[command.index("--sandbox") + 1] == "read-only"
+
+    def test_does_not_require_a_git_repository(self):
+        # The tray app runs from wherever Windows launched it, which is usually
+        # not a repository; without this the CLI refuses to start at all.
+        assert "--skip-git-repo-check" in _codex_command("codex.CMD")
+
+
+class TestRunCodexCli:
+    """run_codex_cli reports success or failure and never raises."""
+
+    def test_missing_executable_reports_failure(self):
+        runner = _RecordingRunner()
+
+        assert run_codex_cli(which=_which_finds_nothing, run=runner) is False
+        assert runner.calls == []
+
+    def test_successful_reply_reports_success(self):
+        runner = _RecordingRunner(_CompletedProcess(returncode=0, stdout="hi there"))
+
+        assert run_codex_cli(which=_which_finds_codex, run=runner) is True
+
+    def test_looks_up_the_codex_executable(self):
+        looked_up: list[str] = []
+
+        def _which(name):
+            looked_up.append(name)
+            return "codex.CMD"
+
+        run_codex_cli(which=_which, run=_RecordingRunner())
+
+        assert looked_up == ["codex"]
+
+    def test_non_zero_exit_reports_failure(self):
+        runner = _RecordingRunner(_CompletedProcess(returncode=1, stdout="", stderr="nope"))
+
+        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
+
+    def test_silent_success_reports_failure(self):
+        runner = _RecordingRunner(_CompletedProcess(returncode=0, stdout="   "))
+
+        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
+
+    def test_timeout_reports_failure(self):
+        runner = _RecordingRunner(
+            raises=subprocess.TimeoutExpired(cmd="codex", timeout=1)
+        )
+
+        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
+
+    def test_launch_error_reports_failure(self):
+        runner = _RecordingRunner(raises=OSError("not executable"))
+
+        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
+
+    def test_unexpected_error_reports_failure(self):
+        runner = _RecordingRunner(raises=RuntimeError("something else"))
+
+        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
+
+    def test_stdin_is_closed_so_a_prompt_cannot_block(self):
+        runner = _RecordingRunner()
+
+        run_codex_cli(which=_which_finds_codex, run=runner)
+
+        _command, kwargs = runner.calls[0]
+        assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+def _only_on_expiry(data: ProviderUsageData) -> bool:
+    """A stub predicate that ignores everything except an expired token."""
+    return data.fetch_error == "token_expired"
+
+
+class TestNudgerHonorsItsPredicate:
+    """SessionNudger asks the injected predicate, not the shared rule."""
+
+    def test_an_injected_predicate_can_suppress_the_idle_window_nudge(self):
+        calls: list[int] = []
+        nudger = SessionNudger(
+            invoke=lambda: (calls.append(1), True)[1],
+            needs_nudge=_only_on_expiry,
+            start_background=_run_immediately,
+        )
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+        assert calls == []
+
+    def test_an_injected_predicate_fires_on_what_it_accepts(self):
+        calls: list[int] = []
+        nudger = SessionNudger(
+            invoke=lambda: (calls.append(1), True)[1],
+            needs_nudge=_only_on_expiry,
+            start_background=_run_immediately,
+        )
+
+        assert nudger.maybe_nudge(usage(fetch_error="token_expired")) is True
+        assert calls == [1]
+
+    def test_breaker_rearms_using_the_injected_predicate(self):
+        # An idle window is "nothing left to fix" under this stub rule, so a
+        # run of failures must be forgiven once fetches recover.
+        nudger = SessionNudger(
+            invoke=lambda: False,
+            needs_nudge=_only_on_expiry,
+            cooldown_seconds=0,
+            start_background=_run_immediately,
+        )
+        for _ in range(3):
+            nudger.maybe_nudge(usage(fetch_error="token_expired"))
+        assert nudger.exhausted is True
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+
+        assert nudger.exhausted is False
+
+    def test_the_shared_rule_is_the_default_predicate(self):
+        calls: list[int] = []
+        nudger = SessionNudger(
+            invoke=lambda: (calls.append(1), True)[1],
+            start_background=_run_immediately,
+        )
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert calls == [1]

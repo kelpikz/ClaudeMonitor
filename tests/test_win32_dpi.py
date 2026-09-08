@@ -14,6 +14,7 @@ import pytest
 
 from claudemonitor import win32_taskbar_window
 from claudemonitor.win32_bindings import USER_DEFAULT_SCREEN_DPI
+from claudemonitor.models import LabelSegment
 from claudemonitor.win32_taskbar_window import (
     _ICON_CONTENT_RIGHT_PADDING,
     _ICON_LEFT_INSET,
@@ -250,7 +251,7 @@ class TestContentWidthFollowsDisplayScaling:
     def test_the_icon_and_padding_are_scaled_to_the_display(self):
         native, _user32, _gdi32 = _label_at_dpi(_DPI_125_PERCENT)
 
-        width = native.content_width_for("Claude: 80% (3 hours)")
+        width = native.content_width_for([LabelSegment('claude', "Claude: 80% (3 hours)")])
 
         expected_insets = sum(
             scale_for_dpi(constant, _DPI_125_PERCENT)
@@ -268,14 +269,14 @@ class TestContentWidthFollowsDisplayScaling:
         unscaled, _u2, _g2 = _label_at_dpi(_DPI_100_PERCENT)
 
         text = "Claude: 80% (3 hours)"
-        assert scaled.content_width_for(text) > unscaled.content_width_for(text)
+        assert scaled.content_width_for([LabelSegment('claude', text)]) > unscaled.content_width_for([LabelSegment('claude', text)])
 
     def test_a_label_that_does_not_exist_yet_measures_at_the_unscaled_default(self):
         user32 = _FakeUser32AtDpi(_DPI_125_PERCENT)
         native = _window(user32=user32, gdi32=_FakeGdi32Measuring())
 
         # No window has been created, so there is no monitor to ask about.
-        assert native.content_width_for("Claude") == (
+        assert native.content_width_for([LabelSegment('claude', "Claude")]) == (
             _ICON_LEFT_INSET
             + _ICON_SIZE
             + _ICON_TEXT_GAP
@@ -296,7 +297,7 @@ class TestScalingEndToEndThroughTheAdapter:
     ):
         native, user32, gdi32 = _label_at_dpi(dpi)
 
-        width = native.content_width_for("Claude: 80% (3 hours)")
+        width = native.content_width_for([LabelSegment('claude', "Claude: 80% (3 hours)")])
 
         # The font Windows was asked for and the width the slot reserves must
         # agree on one scale factor, or the text overflows its own slot.
@@ -317,11 +318,11 @@ class TestScalingEndToEndThroughTheAdapter:
         native, user32, _gdi32 = _label_at_dpi(_DPI_125_PERCENT)
         text = "Claude: 80% (3 hours)"
 
-        on_laptop = native.content_width_for(text)
+        on_laptop = native.content_width_for([LabelSegment('claude', text)])
 
         # The taskbar moves to the external display; only the DPI changes.
         user32.dpi = _DPI_100_PERCENT
-        on_external = native.content_width_for(text)
+        on_external = native.content_width_for([LabelSegment('claude', text)])
 
         assert on_laptop > on_external
         assert user32.metrics_requests == [_DPI_125_PERCENT, _DPI_100_PERCENT]

@@ -6,8 +6,21 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from claudemonitor.config import Config, ThresholdsConfig
-from claudemonitor.models import AnthropicUsageData, UsageWindow
+from claudemonitor.models import (
+    CLAUDE,
+    CODEX,
+    DisplayState,
+    LabelSegment,
+    ProviderUsageData,
+    UsageWindow,
+)
 from claudemonitor.processor import (
+    LOADING_MENU_STATUS,
+    LOADING_TASKBAR_TEXT,
+    LOADING_TOOLTIP,
+    loading_label,
+    taskbar_label,
+    tray_status,
     _error_tooltip,
     _window_not_started,
     _format_elapsed,
@@ -38,10 +51,10 @@ def make_data(
     seven_day: UsageWindow | None = None,
     fetch_error: str | None = None,
     fetched_at: datetime = NOW,
-) -> AnthropicUsageData:
-    """Build an AnthropicUsageData with sensible defaults so each test only
+) -> ProviderUsageData:
+    """Build an ProviderUsageData with sensible defaults so each test only
     has to spell out the fields it actually cares about."""
-    return AnthropicUsageData(
+    return ProviderUsageData(
         five_hour=five_hour,
         seven_day=seven_day,
         fetch_error=fetch_error,
@@ -779,3 +792,333 @@ class TestSignInNeededWording:
         state = process(data, NOW, Config(), session_refresh_exhausted=True)
         assert state.taskbar_text == "80% (1h 0m)"
         assert state.icon_color == "green"
+
+
+# ===========================================================================
+# Two providers — Codex wording, and combining both into one taskbar label.
+# ===========================================================================
+
+
+class TestCodexProvider:
+    """process() must speak about Codex in Codex's own words."""
+
+    def _usage(self) -> ProviderUsageData:
+        return make_data(
+            five_hour=UsageWindow(
+                utilization=20.0, resets_at=NOW + timedelta(hours=2)
+            ),
+            seven_day=UsageWindow(utilization=40.0, resets_at=NOW + timedelta(days=3)),
+        )
+
+    def test_state_is_tagged_with_its_provider(self):
+        state = process(self._usage(), NOW, Config(), provider=CODEX)
+
+        assert state.provider_key == "codex"
+
+    def test_claude_remains_the_default_provider(self):
+        assert process(self._usage(), NOW, Config()).provider_key == "claude"
+
+    def test_tooltip_heading_names_codex(self):
+        tooltip = process(self._usage(), NOW, Config(), provider=CODEX).tooltip
+
+        assert tooltip.split("\n")[0] == "Codex usage"
+
+    def test_percentages_are_formatted_the_same_as_claude(self):
+        codex = process(self._usage(), NOW, Config(), provider=CODEX)
+        claude = process(self._usage(), NOW, Config(), provider=CLAUDE)
+
+        assert codex.taskbar_text == claude.taskbar_text
+        assert codex.icon_color == claude.icon_color
+
+    @pytest.mark.parametrize(
+        "error, expected",
+        [
+            ("token_expired", "Codex token expired — start Codex to refresh"),
+            ("no_credentials", "Codex credentials not found — log in via Codex"),
+        ],
+    )
+    def test_error_tooltips_name_codex(self, error, expected):
+        state = process(make_data(fetch_error=error), NOW, Config(), provider=CODEX)
+
+        assert state.tooltip.split("\n")[0] == expected
+
+    def test_exhausted_refresh_asks_for_the_codex_login_command(self):
+        state = process(
+            make_data(fetch_error="token_expired"),
+            NOW,
+            Config(),
+            provider=CODEX,
+            session_refresh_exhausted=True,
+        )
+
+        assert "codex login" in state.tooltip
+
+    def test_claude_wording_is_unchanged_by_the_second_provider(self):
+        state = process(make_data(fetch_error="token_expired"), NOW, Config())
+
+        assert state.tooltip.split("\n")[0] == (
+            "Claude token expired — start Claude Code to refresh"
+        )
+
+
+class TestTaskbarLabelCombining:
+    """The single taskbar label carries one segment per visible provider."""
+
+    def _state(self, provider, taskbar_text: str, tooltip: str) -> DisplayState:
+        return DisplayState(
+            provider_key=provider.key,
+            icon_color="green",
+            tooltip=tooltip,
+            menu_status_label="Updated 0s ago",
+            taskbar_text=taskbar_text,
+            tray_text=taskbar_text,
+        )
+
+    def test_one_segment_per_provider_in_order(self):
+        label = taskbar_label(
+            [
+                self._state(CLAUDE, "87% (2h 10m)", "Claude usage"),
+                self._state(CODEX, "64% (3h 5m)", "Codex usage"),
+            ]
+        )
+
+        assert label.segments == [
+            LabelSegment(provider_key="claude", text="87% (2h 10m)"),
+            LabelSegment(provider_key="codex", text="64% (3h 5m)"),
+        ]
+
+    def test_tooltip_stacks_both_providers_with_a_blank_line_between(self):
+        label = taskbar_label(
+            [
+                self._state(CLAUDE, "87%", "Claude usage\n5h: 87% left"),
+                self._state(CODEX, "64%", "Codex usage\n5h: 64% left"),
+            ]
+        )
+
+        assert label.tooltip == (
+            "Claude usage\n5h: 87% left\n\nCodex usage\n5h: 64% left"
+        )
+
+    def test_a_single_provider_needs_no_separator(self):
+        label = taskbar_label([self._state(CLAUDE, "87%", "Claude usage")])
+
+        assert label.segments == [LabelSegment(provider_key="claude", text="87%")]
+        assert label.tooltip == "Claude usage"
+
+    def test_no_providers_falls_back_to_the_loading_label(self):
+        # An empty label would collapse the native window to nothing; showing
+        # the loading text keeps it measurable until a provider reports in.
+        label = taskbar_label([])
+
+        assert label.segments == [
+            LabelSegment(provider_key="claude", text=LOADING_TASKBAR_TEXT)
+        ]
+
+
+class TestLoadingLabel:
+    """The label shown before the first fetch completes."""
+
+    def test_loading_label_has_one_segment_per_provider(self):
+        label = loading_label([CLAUDE, CODEX])
+
+        assert label.segments == [
+            LabelSegment(provider_key="claude", text=LOADING_TASKBAR_TEXT),
+            LabelSegment(provider_key="codex", text=LOADING_TASKBAR_TEXT),
+        ]
+        assert "loading" in label.tooltip
+
+
+# ===========================================================================
+# tray_status — every tracked provider, condensed onto the single tray icon.
+# ===========================================================================
+
+
+def _state(
+    provider_key: str = "claude",
+    icon_color: str = "green",
+    tray_text: str = "80% (3h 0m)",
+    menu_status_label: str = "Updated 1s ago",
+) -> DisplayState:
+    """Build one provider's display state with only the tray fields spelled out."""
+    return DisplayState(
+        provider_key=provider_key,
+        icon_color=icon_color,
+        tooltip=f"{provider_key} usage",
+        menu_status_label=menu_status_label,
+        taskbar_text=tray_text,
+        tray_text=tray_text,
+    )
+
+
+class TestTrayStatusColor:
+    """One icon serves both providers, so it has to show the worse of the two."""
+
+    def test_two_healthy_providers_stay_green(self):
+        status = tray_status([_state("claude", "green"), _state("codex", "green")])
+
+        assert status.icon_color == "green"
+
+    def test_either_provider_running_low_colours_the_icon(self):
+        for states in (
+            [_state("claude", "green"), _state("codex", "red")],
+            [_state("claude", "red"), _state("codex", "green")],
+        ):
+            assert tray_status(states).icon_color == "red"
+
+    def test_red_outranks_amber(self):
+        status = tray_status([_state("claude", "amber"), _state("codex", "red")])
+
+        assert status.icon_color == "red"
+
+    def test_a_broken_provider_greys_an_otherwise_healthy_icon(self):
+        # Grey means "we do not know", which a green icon would hide.
+        status = tray_status([_state("claude", "green"), _state("codex", "grey")])
+
+        assert status.icon_color == "grey"
+
+    def test_running_out_still_outranks_not_knowing(self):
+        status = tray_status([_state("claude", "red"), _state("codex", "grey")])
+
+        assert status.icon_color == "red"
+
+
+class TestTrayStatusTooltip:
+    """Hovering one icon has to say which provider each number belongs to."""
+
+    def test_every_provider_is_named_on_its_own_line(self):
+        status = tray_status(
+            [
+                _state("claude", tray_text="80% (3h 0m)"),
+                _state("codex", tray_text="43% (2h 0m)"),
+            ]
+        )
+
+        assert status.tooltip.splitlines() == [
+            "Claude  80% (3h 0m)",
+            "Codex  43% (2h 0m)",
+        ]
+
+    def test_one_provider_still_names_itself(self):
+        status = tray_status([_state("claude", tray_text="80% (3h 0m)")])
+
+        assert status.tooltip == "Claude  80% (3h 0m)"
+
+    def test_the_tooltip_fits_the_windows_tray_limit(self):
+        # NOTIFYICONDATAW.szTip holds 128 characters; pystray raises above it.
+        status = tray_status(
+            [
+                _state("claude", tray_text="100% (not started) · week 100%"),
+                _state("codex", tray_text="100% (not started) · week 100%"),
+            ]
+        )
+
+        assert len(status.tooltip) <= 127
+
+
+class TestTrayStatusMenu:
+    """The menu carries the freshness line each provider used to have alone."""
+
+    def test_one_status_line_per_provider(self):
+        status = tray_status(
+            [
+                _state("claude", menu_status_label="Updated 5s ago"),
+                _state("codex", menu_status_label="Rate limited — last update 2m ago"),
+            ]
+        )
+
+        assert status.status_lines == [
+            "Claude — Updated 5s ago",
+            "Codex — Rate limited — last update 2m ago",
+        ]
+
+    def test_an_unknown_provider_is_still_named(self):
+        status = tray_status([_state("something-else")])
+
+        assert status.status_lines == ["Something-Else — Updated 1s ago"]
+
+
+class TestTrayStatusBeforeTheFirstFetch:
+    """Nothing to show yet must still produce a usable icon and menu."""
+
+    def test_no_providers_shows_the_loading_placeholder(self):
+        status = tray_status([])
+
+        assert status.icon_color == "grey"
+        assert status.tooltip == LOADING_TOOLTIP
+        assert status.status_lines == [LOADING_MENU_STATUS]
+
+
+class TestTrayText:
+    """The one-line summary the shared tooltip stacks, built with the rest."""
+
+    def test_it_carries_the_five_hour_reading_and_the_week(self):
+        state = process(
+            make_data(
+                five_hour=UsageWindow(
+                    utilization=20.0, resets_at=NOW + timedelta(hours=3)
+                ),
+                seven_day=UsageWindow(
+                    utilization=36.0, resets_at=NOW + timedelta(days=3)
+                ),
+            ),
+            now=NOW,
+            config=Config(),
+        )
+
+        assert state.tray_text == "80% (3h 0m) · week 64%"
+
+    def test_a_provider_without_a_weekly_window_shows_only_the_five_hour(self):
+        state = process(
+            make_data(
+                five_hour=UsageWindow(
+                    utilization=20.0, resets_at=NOW + timedelta(hours=3)
+                )
+            ),
+            now=NOW,
+            config=Config(),
+        )
+
+        assert state.tray_text == "80% (3h 0m)"
+
+    def test_an_unstarted_week_is_not_reported_as_a_number(self):
+        state = process(
+            make_data(
+                five_hour=UsageWindow(
+                    utilization=20.0, resets_at=NOW + timedelta(hours=3)
+                ),
+                seven_day=UsageWindow(utilization=0.0, resets_at=None),
+            ),
+            now=NOW,
+            config=Config(),
+        )
+
+        assert state.tray_text == "80% (3h 0m)"
+
+    def test_an_error_says_what_went_wrong(self):
+        state = process(make_data(fetch_error="offline"), now=NOW, config=Config())
+
+        assert state.tray_text == "offline"
+
+    def test_missing_usage_says_so(self):
+        state = process(make_data(), now=NOW, config=Config())
+
+        assert state.tray_text == "no data"
+
+    def test_an_internal_error_says_so(self):
+        assert internal_error_state(now=NOW).tray_text == "error"
+
+    def test_stale_data_keeps_the_last_good_reading(self):
+        last_good = make_data(
+            five_hour=UsageWindow(utilization=20.0, resets_at=NOW + timedelta(hours=3)),
+            seven_day=UsageWindow(utilization=36.0, resets_at=NOW + timedelta(days=3)),
+            fetched_at=NOW - timedelta(minutes=2),
+        )
+
+        state = process(
+            make_data(fetch_error="rate_limited"),
+            now=NOW,
+            config=Config(),
+            last_good=last_good,
+        )
+
+        assert state.tray_text == "80% (3h 0m) · week 64%"
