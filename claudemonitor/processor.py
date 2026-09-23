@@ -3,12 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
 
 from .config import Config
 from .models import (
     CLAUDE,
-    PROVIDERS,
     DisplayState,
+    FetchError,
     LabelSegment,
     Provider,
     ProviderUsageData,
@@ -31,17 +32,6 @@ LOADING_MENU_STATUS = "Loading…"
 # and both amber and red outrank grey because a real number beats a blank.
 _ICON_COLOR_SEVERITY = ("green", "grey", "amber", "red")
 
-_TASKBAR_ERROR_TEXTS = {
-    "token_expired": "token expired",
-    "timeout": "offline",
-    "offline": "offline",
-    "no_credentials": "not logged in",
-    "bad_response": "bad response",
-    "rate_limited": "rate limited",
-}
-_TASKBAR_UNKNOWN_ERROR_TEXT = "unavailable"
-_TASKBAR_SIGN_IN_TEXT = "sign in"
-_TASKBAR_NO_DATA_TEXT = "no data"
 _TASKBAR_INTERNAL_ERROR_TEXT = "error"
 
 
@@ -76,8 +66,89 @@ _WORDING: dict[str, _Wording] = {
 
 
 def _wording(provider: Provider) -> _Wording:
-    """Return the sentences for a provider, defaulting to Claude's."""
-    return _WORDING.get(provider.key, _WORDING["claude"])
+    """Return the sentences written about one provider."""
+    return _WORDING[provider.key]
+
+
+@dataclass(frozen=True)
+class _ErrorDisplay:
+    """The three things one fetch error is shown as, in one row.
+
+    These used to be three tables written in the same order — a short label, a
+    menu prefix, and a tooltip if-chain — and a value present in two of them
+    but missing from the third fell through to wording that fitted a different
+    failure. One row per error makes that impossible: a new ``FetchError``
+    has nowhere to hide until it has all three.
+
+    ``tooltip`` is a callable because two of the sentences are not fixed: one
+    names the provider, another counts how long the data has been stale.
+    """
+
+    taskbar_text: str
+    menu_prefix: str
+    tooltip: Callable[[_Wording, str], str]
+
+
+_OFFLINE_DISPLAY = _ErrorDisplay(
+    taskbar_text="offline",
+    menu_prefix="Offline",
+    tooltip=lambda wording, elapsed: f"Offline — last update {elapsed} ago",
+)
+
+_ERROR_DISPLAY: dict[FetchError, _ErrorDisplay] = {
+    "no_credentials": _ErrorDisplay(
+        taskbar_text="not logged in",
+        menu_prefix="Not logged in",
+        tooltip=lambda wording, elapsed: wording.missing_credentials,
+    ),
+    "token_expired": _ErrorDisplay(
+        taskbar_text="token expired",
+        menu_prefix="Token expired",
+        tooltip=lambda wording, elapsed: wording.token_expired,
+    ),
+    "rate_limited": _ErrorDisplay(
+        taskbar_text="rate limited",
+        menu_prefix="Rate limited",
+        tooltip=lambda wording, elapsed: "Rate limited — too many requests, will retry",
+    ),
+    # A timeout is a network failure the user can do nothing about, so it is
+    # told as the same story as an unreachable host rather than as its own.
+    "timeout": _OFFLINE_DISPLAY,
+    "offline": _OFFLINE_DISPLAY,
+    "bad_response": _ErrorDisplay(
+        taskbar_text="bad response",
+        menu_prefix="Error",
+        tooltip=lambda wording, elapsed: "Unexpected API response — see log for details",
+    ),
+    "no_data": _ErrorDisplay(
+        taskbar_text="no data",
+        menu_prefix="Error",
+        tooltip=lambda wording, elapsed: "No usage data yet",
+    ),
+    "unknown": _ErrorDisplay(
+        taskbar_text="unavailable",
+        menu_prefix="Error",
+        tooltip=lambda wording, elapsed: "Internal error — see log",
+    ),
+}
+
+# What an expired token becomes once every automatic refresh has been spent:
+# "start Claude Code to refresh" is advice that cannot work any more.
+_SIGN_IN_DISPLAY = _ErrorDisplay(
+    taskbar_text="sign in",
+    menu_prefix="Sign-in needed",
+    tooltip=lambda wording, elapsed: wording.sign_in_needed,
+)
+
+
+def _display_for(
+    error: FetchError,
+    session_refresh_exhausted: bool = False,
+) -> _ErrorDisplay:
+    """Return how one fetch error is shown, on every surface at once."""
+    if _needs_sign_in(error, session_refresh_exhausted):
+        return _SIGN_IN_DISPLAY
+    return _ERROR_DISPLAY[error]
 
 
 def _format_time_left(resets_at: datetime | None, now: datetime) -> str:
@@ -135,14 +206,7 @@ def _tray_text(five_hour_text: str, seven_day: UsageWindow | None) -> str:
     return f"{five_hour_text} · week {week_remaining:.0f}%"
 
 
-def _taskbar_error_text(error: str | None, session_refresh_exhausted: bool = False) -> str:
-    """Map a fetch error to a short label that still says what went wrong."""
-    if _needs_sign_in(error, session_refresh_exhausted):
-        return _TASKBAR_SIGN_IN_TEXT
-    return _TASKBAR_ERROR_TEXTS.get(error or "", _TASKBAR_UNKNOWN_ERROR_TEXT)
-
-
-def _needs_sign_in(error: str | None, session_refresh_exhausted: bool) -> bool:
+def _needs_sign_in(error: FetchError | None, session_refresh_exhausted: bool) -> bool:
     """Return whether an expired token has outlived every automatic refresh.
 
     Only ``token_expired`` changes wording here. The nudge can also exhaust itself
@@ -175,19 +239,10 @@ def _menu_label(
 ) -> str:
     elapsed = int((now - data.fetched_at).total_seconds())
     elapsed_str = _format_elapsed(max(0, elapsed))
-    if data.fetch_error in ("timeout", "offline"):
-        return f"Offline — last update {elapsed_str} ago"
-    if _needs_sign_in(data.fetch_error, session_refresh_exhausted):
-        return f"Sign-in needed — last update {elapsed_str} ago"
-    if data.fetch_error == "token_expired":
-        return f"Token expired — last update {elapsed_str} ago"
-    if data.fetch_error == "no_credentials":
-        return f"Not logged in — last update {elapsed_str} ago"
-    if data.fetch_error == "rate_limited":
-        return f"Rate limited — last update {elapsed_str} ago"
-    if data.fetch_error:
-        return f"Error — last update {elapsed_str} ago"
-    return f"Updated {elapsed_str} ago"
+    if data.fetch_error is None:
+        return f"Updated {elapsed_str} ago"
+    prefix = _display_for(data.fetch_error, session_refresh_exhausted).menu_prefix
+    return f"{prefix} — last update {elapsed_str} ago"
 
 
 def _icon_color(utilization: float, config: Config) -> str:
@@ -209,7 +264,7 @@ def _window_not_started(window: UsageWindow) -> bool:
 def _usage_lines(
     data: ProviderUsageData,
     now: datetime,
-    provider: Provider = CLAUDE,
+    provider: Provider,
 ) -> list[str]:
     """Build the "<provider> usage" header plus the 5h (and optional weekly)
     "% left · resets in ..." lines. The caller appends a trailing status line."""
@@ -245,7 +300,7 @@ def _stale_state(
     last_good: ProviderUsageData,
     now: datetime,
     config: Config,
-    provider: Provider = CLAUDE,
+    provider: Provider,
 ) -> DisplayState:
     """Render the last successful usage data, flagged as stale because the most
     recent fetch was rate-limited (HTTP 429). Reset times stay accurate (they are
@@ -256,7 +311,7 @@ def _stale_state(
     lines.append(f"Unable to fetch recent data ({elapsed} ago)")
     taskbar_text = _taskbar_text(last_good.five_hour, now)
     return DisplayState(
-        provider_key=provider.key,
+        provider=provider,
         icon_color=color,
         tooltip="\n".join(lines),
         menu_status_label=f"Rate limited — last update {elapsed} ago",
@@ -269,9 +324,10 @@ def process(
     data: ProviderUsageData,
     now: datetime,
     config: Config,
+    provider: Provider,
+    *,
     last_good: ProviderUsageData | None = None,
     session_refresh_exhausted: bool = False,
-    provider: Provider = CLAUDE,
 ) -> DisplayState:
     # A rate-limit doesn't mean our data is wrong, just unrefreshed. If we have a
     # previous successful result, show it (flagged stale) instead of going grey.
@@ -286,12 +342,18 @@ def process(
 
     if data.fetch_error:
         tooltip = _error_tooltip(
-            data.fetch_error, data, now, session_refresh_exhausted, provider
+            data.fetch_error,
+            data,
+            now,
+            provider,
+            session_refresh_exhausted=session_refresh_exhausted,
         )
         tooltip += f"\n{_updated_at_line(data.fetched_at, now)}"
-        error_text = _taskbar_error_text(data.fetch_error, session_refresh_exhausted)
+        error_text = _display_for(
+            data.fetch_error, session_refresh_exhausted
+        ).taskbar_text
         return DisplayState(
-            provider_key=provider.key,
+            provider=provider,
             icon_color="grey",
             tooltip=tooltip,
             menu_status_label=label,
@@ -302,12 +364,12 @@ def process(
     if data.five_hour is None:
         heading = _wording(provider).heading
         return DisplayState(
-            provider_key=provider.key,
+            provider=provider,
             icon_color="grey",
             tooltip=f"{heading}\nNo usage data available\n{_updated_at_line(data.fetched_at, now)}",
             menu_status_label=label,
-            taskbar_text=_TASKBAR_NO_DATA_TEXT,
-            tray_text=_TASKBAR_NO_DATA_TEXT,
+            taskbar_text=_ERROR_DISPLAY["no_data"].taskbar_text,
+            tray_text=_ERROR_DISPLAY["no_data"].taskbar_text,
         )
 
     lines = _usage_lines(data, now, provider)
@@ -315,7 +377,7 @@ def process(
 
     taskbar_text = _taskbar_text(data.five_hour, now)
     return DisplayState(
-        provider_key=provider.key,
+        provider=provider,
         icon_color=_icon_color(data.five_hour.utilization, config),
         tooltip="\n".join(lines),
         menu_status_label=label,
@@ -325,34 +387,23 @@ def process(
 
 
 def _error_tooltip(
-    error: str,
+    error: FetchError,
     data: ProviderUsageData,
     now: datetime,
+    provider: Provider,
+    *,
     session_refresh_exhausted: bool = False,
-    provider: Provider = CLAUDE,
 ) -> str:
-    wording = _wording(provider)
-    if _needs_sign_in(error, session_refresh_exhausted):
-        # "Start Claude Code to refresh" is advice that cannot work once the
-        # automatic refresh has already tried and failed.
-        return wording.sign_in_needed
-    if error == "token_expired":
-        return wording.token_expired
-    if error in ("timeout", "offline"):
-        elapsed = int((now - data.fetched_at).total_seconds())
-        return f"Offline — last update {_format_elapsed(max(0, elapsed))} ago"
-    if error == "no_credentials":
-        return wording.missing_credentials
-    if error == "bad_response":
-        return "Unexpected API response — see log for details"
-    if error == "rate_limited":
-        return "Rate limited — too many requests, will retry"
-    return "Internal error — see log"
+    """Return the first line of the tooltip for one failed fetch."""
+    elapsed = _format_elapsed(max(0, int((now - data.fetched_at).total_seconds())))
+    return _display_for(error, session_refresh_exhausted).tooltip(
+        _wording(provider), elapsed
+    )
 
 
-def internal_error_state(now: datetime, provider: Provider = CLAUDE) -> DisplayState:
+def internal_error_state(now: datetime, provider: Provider) -> DisplayState:
     return DisplayState(
-        provider_key=provider.key,
+        provider=provider,
         icon_color="grey",
         tooltip="Internal error — see log",
         menu_status_label=f"Error — {now.strftime('%H:%M')}",
@@ -371,22 +422,16 @@ def taskbar_label(states: list[DisplayState]) -> TaskbarLabel:
     if not states:
         # An empty label has no width, which would collapse the native window.
         return TaskbarLabel(
-            segments=[LabelSegment(provider_key=CLAUDE.key, text=LOADING_TASKBAR_TEXT)],
+            segments=[LabelSegment(provider=CLAUDE, text=LOADING_TASKBAR_TEXT)],
             tooltip=LOADING_TOOLTIP,
         )
     return TaskbarLabel(
         segments=[
-            LabelSegment(provider_key=state.provider_key, text=state.taskbar_text)
+            LabelSegment(provider=state.provider, text=state.taskbar_text)
             for state in states
         ],
         tooltip="\n\n".join(state.tooltip for state in states),
     )
-
-
-def _provider_label(provider_key: str) -> str:
-    """Name a provider for the tray, falling back to a readable form of its key."""
-    provider = PROVIDERS.get(provider_key)
-    return provider.label if provider is not None else provider_key.title()
 
 
 def tray_status(states: list[DisplayState]) -> TrayState:
@@ -405,11 +450,11 @@ def tray_status(states: list[DisplayState]) -> TrayState:
     return TrayState(
         icon_color=max(states, key=_color_severity).icon_color,
         tooltip="\n".join(
-            f"{_provider_label(state.provider_key)}  {state.tray_text}"
+            f"{state.provider.label}  {state.tray_text}"
             for state in states
         ),
         status_lines=[
-            f"{_provider_label(state.provider_key)} — {state.menu_status_label}"
+            f"{state.provider.label} — {state.menu_status_label}"
             for state in states
         ],
     )
@@ -424,7 +469,7 @@ def loading_label(providers: list[Provider]) -> TaskbarLabel:
     """Build the placeholder label shown before the first fetch returns."""
     return TaskbarLabel(
         segments=[
-            LabelSegment(provider_key=provider.key, text=LOADING_TASKBAR_TEXT)
+            LabelSegment(provider=provider, text=LOADING_TASKBAR_TEXT)
             for provider in providers
         ],
         tooltip=LOADING_TOOLTIP,

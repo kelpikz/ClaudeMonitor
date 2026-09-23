@@ -11,13 +11,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from claudemonitor.models import CLAUDE, CODEX
 from claudemonitor.settings import (
-    Number,
+    ProviderFields,
     PendingSettings,
     SettingNumber,
     SettingToggle,
     SettingsWindowController,
-    Switch,
     build_settings,
     parse_number,
 )
@@ -26,7 +26,7 @@ from claudemonitor.settings import (
 def _switch(on: bool = True, available: bool = True):
     """Build a switch over a mutable flag, plus the flag itself to assert on."""
     state = {"on": on}
-    switch = Switch(
+    switch = SettingToggle(
         is_on=lambda: state["on"],
         write=lambda value: state.update(on=value),
         available=lambda: available,
@@ -37,7 +37,7 @@ def _switch(on: bool = True, available: bool = True):
 def _number(value: int = 60, minimum: int = 1, maximum: int = 999):
     """Build a numeric setting over a mutable value, plus the value to assert on."""
     state = {"value": value}
-    number = Number(
+    number = SettingNumber(
         value=lambda: state["value"],
         write=lambda new: state.update(value=new),
         minimum=minimum,
@@ -46,11 +46,20 @@ def _number(value: int = 60, minimum: int = 1, maximum: int = 999):
     return number, state
 
 
+def _providers(codex=None):
+    """Build the Providers tab's boxes: Claude has a link, Codex a switch too."""
+    return [
+        ProviderFields(provider=CLAUDE),
+        ProviderFields(provider=CODEX, tracking=codex if codex is not None else _switch()[0]),
+    ]
+
+
 def _settings(**overrides):
     """Build the production settings model with harmless defaults."""
+    codex = overrides.pop("codex", None)
     fields = {
         "taskbar": _switch()[0],
-        "codex": _switch()[0],
+        "providers": _providers(codex),
         "session_refresh": _switch()[0],
         "startup": _switch()[0],
         "poll_interval": _number()[0],
@@ -125,7 +134,7 @@ class TestWhichSettingsTheWindowOffers:
 
     def test_every_switch_is_offered(self):
         assert self._keys_of(SettingToggle) == sorted(
-            ["startup", "session_refresh", "codex", "taskbar"]
+            ["startup", "session_refresh", "codex_tracking", "taskbar"]
         )
 
     def test_every_number_is_offered(self):
@@ -137,7 +146,7 @@ class TestWhichSettingsTheWindowOffers:
         model = _settings(taskbar=_switch(on=False)[0], codex=_switch(on=True)[0])
 
         assert _field(model, "taskbar").is_on() is False
-        assert _field(model, "codex").is_on() is True
+        assert _field(model, "codex_tracking").is_on() is True
 
     def test_each_number_reports_its_own_value(self):
         model = _settings(poll_interval=_number(30)[0])
@@ -159,7 +168,7 @@ class TestWhichSettingsTheWindowOffers:
     def test_writing_a_switch_runs_that_setting_s_action(self):
         codex, state = _switch(on=True)
 
-        _field(_settings(codex=codex), "codex").write(False)
+        _field(_settings(codex=codex), "codex_tracking").write(False)
 
         assert state["on"] is False
 
@@ -302,7 +311,7 @@ class TestPendingSettings:
 
     def test_applying_leaves_untouched_fields_alone(self):
         written: list[str] = []
-        codex = Switch(is_on=lambda: True, write=lambda value: written.append("codex"))
+        codex = SettingToggle(is_on=lambda: True, write=lambda value: written.append("codex"))
 
         PendingSettings(_settings(codex=codex)).apply()
 
@@ -310,7 +319,7 @@ class TestPendingSettings:
 
     def test_a_value_edited_back_to_what_it_already_was_is_not_written(self):
         written: list[bool] = []
-        taskbar = Switch(is_on=lambda: True, write=written.append)
+        taskbar = SettingToggle(is_on=lambda: True, write=written.append)
         pending = PendingSettings(_settings(taskbar=taskbar))
 
         pending.edit("taskbar", False)
@@ -321,7 +330,7 @@ class TestPendingSettings:
 
     def test_applying_twice_writes_once(self):
         written: list[int] = []
-        interval = Number(value=lambda: 60, write=written.append, minimum=1, maximum=999)
+        interval = SettingNumber(value=lambda: 60, write=written.append, minimum=1, maximum=999)
         pending = PendingSettings(_settings(poll_interval=interval))
         pending.edit("poll_interval", 120)
 
@@ -387,7 +396,7 @@ class TestApplyingSurvivesAFailure:
         def refuse(value):
             raise OSError("the registry is locked")
 
-        startup = Switch(is_on=lambda: False, write=refuse)
+        startup = SettingToggle(is_on=lambda: False, write=refuse)
         interval, interval_state = _number(60)
         pending = PendingSettings(_settings(startup=startup, poll_interval=interval))
         pending.edit("startup", True)
@@ -403,7 +412,7 @@ class TestApplyingSurvivesAFailure:
         def unreadable():
             raise OSError("the registry is locked")
 
-        startup = Switch(is_on=unreadable, write=lambda value: None)
+        startup = SettingToggle(is_on=unreadable, write=lambda value: None)
         pending = PendingSettings(_settings(startup=startup))
 
         with caplog.at_level(logging.ERROR):

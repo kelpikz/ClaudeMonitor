@@ -7,10 +7,13 @@ room around a stacked row, and the byte order Windows reads the result in.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from PIL import Image
 
 from claudemonitor import label_art
+from claudemonitor.models import CLAUDE, CODEX
 from claudemonitor.label_art import (
     glyph_extent,
     premultiplied_bgra,
@@ -28,56 +31,57 @@ class TestTaskbarGlyph:
     """One provider's mark, drawn at whatever size the row leaves for it."""
 
     def test_the_glyph_is_drawn_at_the_size_asked_for(self):
-        assert taskbar_glyph("claude", 22, uses_light_theme=False).size == (22, 22)
+        assert taskbar_glyph(CLAUDE, 22, uses_light_theme=False).size == (22, 22)
 
     def test_each_size_is_drawn_rather_than_rescaled_from_one_bitmap(self):
         # Upscaling a 16px bitmap to 22px was what made the mark look ragged on
         # a 125% display, so every size has to come from the artwork itself.
-        small = taskbar_glyph("claude", 16, uses_light_theme=False)
-        large = taskbar_glyph("claude", 32, uses_light_theme=False)
+        small = taskbar_glyph(CLAUDE, 16, uses_light_theme=False)
+        large = taskbar_glyph(CLAUDE, 32, uses_light_theme=False)
 
         assert small.resize((32, 32)).tobytes() != large.tobytes()
 
     def test_the_result_is_reused_rather_than_redrawn_every_paint(self):
-        first = taskbar_glyph("codex", 20, uses_light_theme=False)
-        second = taskbar_glyph("codex", 20, uses_light_theme=False)
+        first = taskbar_glyph(CODEX, 20, uses_light_theme=False)
+        second = taskbar_glyph(CODEX, 20, uses_light_theme=False)
 
         assert first is second
 
     def test_the_codex_mark_follows_the_theme(self):
-        dark = taskbar_glyph("codex", 20, uses_light_theme=False)
-        light = taskbar_glyph("codex", 20, uses_light_theme=True)
+        dark = taskbar_glyph(CODEX, 20, uses_light_theme=False)
+        light = taskbar_glyph(CODEX, 20, uses_light_theme=True)
 
         assert dark.tobytes() != light.tobytes()
 
     def test_the_claude_mark_reads_against_either_theme(self):
         # Anthropic's asterisk carries its own colour, so it does not follow the
         # taskbar the way the monochrome OpenAI mark has to.
-        dark = taskbar_glyph("claude", 20, uses_light_theme=False)
-        light = taskbar_glyph("claude", 20, uses_light_theme=True)
+        dark = taskbar_glyph(CLAUDE, 20, uses_light_theme=False)
+        light = taskbar_glyph(CLAUDE, 20, uses_light_theme=True)
 
         assert dark.tobytes() == light.tobytes()
 
-    def test_an_unknown_provider_gets_the_claude_mark(self):
-        # A provider key nobody drew must never raise inside a paint.
-        fallback = taskbar_glyph("something-else", 20, uses_light_theme=False)
-
-        assert fallback.tobytes() == taskbar_glyph(
-            "claude", 20, uses_light_theme=False
-        ).tobytes()
+    def test_a_provider_with_no_tone_of_its_own_is_refused(self):
+        # Borrowing another provider's mark would put the wrong name beside a
+        # real number, which is worse than a mark that never appears. The
+        # provider carries its own key now, so this cannot reach a paint.
+        with pytest.raises(KeyError):
+            taskbar_glyph(
+                replace(CLAUDE, key="something-else"), 20, uses_light_theme=False
+            )
 
     def test_a_partly_covered_pixel_keeps_its_own_alpha(self):
         # This is the whole point of the per-pixel alpha label. The mark is
         # mostly anti-aliased edge, and flattening that edge onto black is what
         # drew the dark outline the user saw around both glyphs.
-        glyph = taskbar_glyph("claude", 20, uses_light_theme=False)
+        glyph = taskbar_glyph(CLAUDE, 20, uses_light_theme=False)
 
         alphas = {pixel[3] for pixel in glyph.get_flattened_data()}
         assert alphas - {0, 255}
 
     def test_a_size_of_zero_is_refused_rather_than_drawn(self):
         with pytest.raises(ValueError):
-            taskbar_glyph("claude", 0, uses_light_theme=False)
+            taskbar_glyph(CLAUDE, 0, uses_light_theme=False)
 
 
 class TestStackedBands:

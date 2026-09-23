@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -30,9 +31,9 @@ red_below   = 20
 enabled = true
 
 [codex]
-# Track OpenAI Codex usage alongside Claude: a second tray icon, and a
-# second reading in the taskbar label. Reads ~/.codex/auth.json, which the
-# Codex CLI writes when you log in.
+# Track OpenAI Codex usage alongside Claude: a second line in the tray
+# tooltip, and a second row in the taskbar label. One tray icon serves both.
+# Reads ~/.codex/auth.json, which the Codex CLI writes when you log in.
 enabled = true
 
 [session_refresh]
@@ -160,36 +161,56 @@ def _save_setting(section_name: str, key: str, value: object) -> None:
     _write_atomically(path, tomlkit.dumps(document))
 
 
-def save_taskbar_enabled(enabled: bool) -> None:
-    """Persist whether the taskbar usage label is shown."""
-    _save_setting("taskbar", "enabled", enabled)
+@dataclass(frozen=True)
+class ConfigSetting:
+    """One value in config.toml, and the same value in a loaded ``Config``.
+
+    The TOML section names and the ``Config`` attribute names are deliberately
+    the same word, so naming the pair once is enough to read it, to change it
+    in the running application, and to write it back. Spelling it twice — a
+    ``save_*`` wrapper here and an attribute string in the caller — is what
+    made a setting something four layers had to agree about.
+
+    ``save`` logs rather than raises. Every caller runs on a UI thread and has
+    already changed the running application by the time it writes, so a file
+    that cannot be written must not undo that or take the thread down with it.
+    """
+
+    section: str
+    key: str
+
+    def read(self, config: Config) -> object:
+        """Return what a loaded config currently holds for this setting."""
+        return getattr(getattr(config, self.section), self.key)
+
+    def write(self, config: Config, value: object) -> None:
+        """Change a loaded config, so the running application sees it at once."""
+        setattr(getattr(config, self.section), self.key, value)
+
+    def save(self, value: object) -> None:
+        """Write this setting to the file, leaving every other one untouched."""
+        try:
+            _save_setting(self.section, self.key, value)
+        except Exception:
+            log.exception("unable to persist [%s] %s", self.section, self.key)
 
 
-def save_session_refresh_enabled(enabled: bool) -> None:
-    """Persist whether an idle session may be woken with a Claude CLI prompt."""
-    _save_setting("session_refresh", "enabled", enabled)
+POLL_INTERVAL = ConfigSetting("polling", "interval_seconds")
+AMBER_THRESHOLD = ConfigSetting("thresholds", "amber_below")
+RED_THRESHOLD = ConfigSetting("thresholds", "red_below")
+TASKBAR_ENABLED = ConfigSetting("taskbar", "enabled")
+CODEX_ENABLED = ConfigSetting("codex", "enabled")
+SESSION_REFRESH_ENABLED = ConfigSetting("session_refresh", "enabled")
+REFRESH_COOLDOWN = ConfigSetting("session_refresh", "cooldown_seconds")
 
-
-def save_codex_enabled(enabled: bool) -> None:
-    """Persist whether Codex usage is tracked alongside Claude."""
-    _save_setting("codex", "enabled", enabled)
-
-
-def save_poll_interval_seconds(seconds: int) -> None:
-    """Persist how often usage is fetched."""
-    _save_setting("polling", "interval_seconds", seconds)
-
-
-def save_amber_threshold(percent: float) -> None:
-    """Persist the remaining percentage below which the icon turns amber."""
-    _save_setting("thresholds", "amber_below", percent)
-
-
-def save_red_threshold(percent: float) -> None:
-    """Persist the remaining percentage below which the icon turns red."""
-    _save_setting("thresholds", "red_below", percent)
-
-
-def save_session_refresh_cooldown(seconds: float) -> None:
-    """Persist the shortest gap allowed between two CLI session nudges."""
-    _save_setting("session_refresh", "cooldown_seconds", seconds)
+# Every setting the application can write, for the tests that check each one
+# still names a section and a key the model has.
+EVERY_SETTING = (
+    POLL_INTERVAL,
+    AMBER_THRESHOLD,
+    RED_THRESHOLD,
+    TASKBAR_ENABLED,
+    CODEX_ENABLED,
+    SESSION_REFRESH_ENABLED,
+    REFRESH_COOLDOWN,
+)

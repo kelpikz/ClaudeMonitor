@@ -17,6 +17,7 @@ import functools
 
 from PIL import Image, ImageChops
 
+from .models import Provider
 from .icon_art import (
     CLAUDE_GLYPH_COLOR,
     CODEX_DARK_THEME_COLOR,
@@ -35,12 +36,10 @@ _GLYPH_COLORS: dict[str, tuple[Color, Color]] = {
     "codex": (CODEX_DARK_THEME_COLOR, CODEX_LIGHT_THEME_COLOR),
 }
 
-_FALLBACK_PROVIDER_KEY = "claude"
-
 
 @functools.lru_cache(maxsize=32)
 def taskbar_glyph(
-    provider_key: str,
+    provider: Provider,
     size: int,
     *,
     uses_light_theme: bool,
@@ -51,12 +50,16 @@ def taskbar_glyph(
     stretched up to whatever a scaled display asked for, and the marks are thin
     enough that the stretch was plainly visible. Each size is cached, so this
     costs one render per size the taskbar ever asks for.
+
+    A provider with no tone of its own raises rather than borrowing another
+    provider's mark, which would put the wrong name beside a real number.
     """
     if size <= 0:
         raise ValueError(f"a glyph needs a positive size, not {size}")
-    glyph = provider_key if provider_key in _GLYPH_COLORS else _FALLBACK_PROVIDER_KEY
-    dark_color, light_color = _GLYPH_COLORS[glyph]
-    return glyph_image(glyph, light_color if uses_light_theme else dark_color, size)
+    dark_color, light_color = _GLYPH_COLORS[provider.key]
+    return glyph_image(
+        provider.key, light_color if uses_light_theme else dark_color, size
+    )
 
 
 def stacked_bands(height: int, rows: int, padding: int) -> list[tuple[int, int]]:

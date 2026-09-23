@@ -5,8 +5,9 @@ the provider's own CLI can. Asking it for one cheap reply makes it do both as a
 side effect: it refreshes an expired token before sending, and the reply itself
 starts the usage window so a real reset countdown appears.
 
-Both providers use the same ``SessionNudger``; they differ only in the command
-run and in which fetch results are worth running it for.
+Both providers use the same ``SessionNudger`` and the same rule for when to
+run it. The only difference between them is the command, which each
+``Provider`` carries, so nothing in this module names a provider.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import threading
 import time
 from typing import Callable
 
-from .models import ProviderUsageData
+from .models import Provider, ProviderUsageData
 
 log = logging.getLogger(__name__)
 
@@ -26,19 +27,6 @@ COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_COOLDOWN_SECONDS = 900 # 15 mins
 MAX_CONSECUTIVE_FAILURES = 3
 
-_CLAUDE_EXECUTABLE_NAME = "claude"
-_CLAUDE_PROMPT_ARGUMENTS = ("-p", "--model", "haiku", "hi")
-
-_CODEX_EXECUTABLE_NAME = "codex"
-# read-only keeps a stray model reply from editing real files, and the repo
-# check would otherwise refuse to start from the tray app's working directory.
-_CODEX_PROMPT_ARGUMENTS = (
-    "exec",
-    "--sandbox",
-    "read-only",
-    "--skip-git-repo-check",
-    "hi",
-)
 # A windowed build has no console, so an inherited one would flash on screen.
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -65,20 +53,10 @@ def needs_session_nudge(data: ProviderUsageData) -> bool:
     return data.five_hour.utilization <= 0.0
 
 
-def _claude_command(executable: str) -> list[str]:
-    """Build the argv for the cheapest prompt that still forces a real request."""
-    return [executable, *_CLAUDE_PROMPT_ARGUMENTS]
-
-
-def _codex_command(executable: str) -> list[str]:
-    """Build the argv for one throwaway Codex turn that renews the token."""
-    return [executable, *_CODEX_PROMPT_ARGUMENTS]
-
-
 def _run_cli(
     *,
     executable_name: str,
-    build_command,
+    arguments: tuple[str, ...],
     which,
     run,
 ) -> bool:
@@ -96,7 +74,7 @@ def _run_cli(
 
     try:
         completed = run(
-            build_command(executable),
+            [executable, *arguments],
             capture_output=True,
             text=True,
             # capture_output only redirects stdout and stderr, so stdin would
@@ -140,27 +118,19 @@ def _run_cli(
     return True
 
 
-def run_claude_cli(
+def run_provider_cli(
+    provider: Provider,
     which: Callable[[str], str | None] = shutil.which,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> bool:
-    """Ask the Claude CLI for one Haiku reply and report whether it answered."""
-    return _run_cli(
-        executable_name=_CLAUDE_EXECUTABLE_NAME,
-        build_command=_claude_command,
-        which=which,
-        run=run,
-    )
+    """Ask one provider's CLI for a throwaway reply, and say whether it answered.
 
-
-def run_codex_cli(
-    which: Callable[[str], str | None] = shutil.which,
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> bool:
-    """Ask the Codex CLI for one throwaway reply and report whether it answered."""
+    Which executable and which arguments are the provider's own, so there is
+    no per-provider wrapper here: a third provider adds nothing to this file.
+    """
     return _run_cli(
-        executable_name=_CODEX_EXECUTABLE_NAME,
-        build_command=_codex_command,
+        executable_name=provider.cli_executable,
+        arguments=provider.cli_arguments,
         which=which,
         run=run,
     )
@@ -184,19 +154,21 @@ class SessionNudger:
 
     def __init__(
         self,
+        provider: Provider,
         *,
         enabled: bool = True,
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
-        invoke: Callable[[], bool] = run_claude_cli,
+        invoke: Callable[[], bool] | None = None,
         needs_nudge: Callable[[ProviderUsageData], bool] = needs_session_nudge,
         on_refreshed: Callable[[], None] = lambda: None,
         clock: Callable[[], float] = time.monotonic,
         start_background: Callable[[Callable[[], None]], None] = _start_daemon_thread,
         max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
     ) -> None:
+        self.provider = provider
         self._enabled = enabled
         self._cooldown_seconds = cooldown_seconds
-        self._invoke = invoke
+        self._invoke = invoke or (lambda: run_provider_cli(provider))
         self._needs_nudge = needs_nudge
         self._on_refreshed = on_refreshed
         self._clock = clock

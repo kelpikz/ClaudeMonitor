@@ -18,16 +18,15 @@ import logging
 import os
 import threading
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Protocol, Union
+
+from .models import Provider
 
 log = logging.getLogger(__name__)
 
 WINDOW_TITLE = "Claude Monitor settings"
-
-_CLAUDE_USAGE_URL = "https://console.anthropic.com/settings/usage"
-_CODEX_USAGE_URL = "https://chatgpt.com/codex/settings/usage"
 
 
 def _open_in_browser(url: str) -> None:
@@ -45,15 +44,19 @@ def _always_available() -> bool:
     return True
 
 
-# ------------------------------------------------------------------ the wiring
-# What the caller hands in: a way to read one setting and a way to write it.
+# --------------------------------------------------------------------- a field
+# One field is both the wiring and what is drawn around it. The caller builds
+# it with the wiring alone — a way to read the setting and a way to write it —
+# and ``build_settings`` names it, because every user-facing string about
+# settings belongs in this file rather than in whoever owns the setting.
+#
 # The window never toggles anything, because a buffered edit has to be able to
 # say "set this to False" twice without the second click undoing the first.
 
 
 @dataclass(frozen=True)
-class Switch:
-    """One boolean setting the window can read and write.
+class SettingToggle:
+    """One boolean setting: a labelled checkbox over a value it reads and writes.
 
     ``available`` exists for the taskbar label, which can fail to appear at
     all: a checkbox that claims otherwise is a lie the user cannot act on.
@@ -62,45 +65,34 @@ class Switch:
     is_on: Callable[[], bool]
     write: Callable[[bool], None]
     available: Callable[[], bool] = _always_available
-
-
-@dataclass(frozen=True)
-class Number:
-    """One numeric setting the window can read and write, and the range it accepts."""
-
-    value: Callable[[], int]
-    write: Callable[[int], None]
-    minimum: int
-    maximum: int
-
-
-# ------------------------------------------------------------------ the content
-# What the window draws: the same switches, given a key to route clicks by, a
-# label to print, and a place in the tab/group tree.
-
-
-@dataclass(frozen=True)
-class SettingToggle:
-    """A labelled checkbox."""
-
-    key: str
-    label: str
-    is_on: Callable[[], bool]
-    write: Callable[[bool], None]
-    available: Callable[[], bool] = _always_available
+    key: str = ""
+    label: str = ""
 
 
 @dataclass(frozen=True)
 class SettingNumber:
-    """A labelled number box, with the unit printed after it."""
+    """One numeric setting: a labelled box, its range, and the unit after it."""
 
-    key: str
-    label: str
-    suffix: str
     value: Callable[[], int]
     write: Callable[[int], None]
     minimum: int
     maximum: int
+    key: str = ""
+    label: str = ""
+    suffix: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderFields:
+    """One provider's own box on the Providers tab.
+
+    ``tracking`` is the switch that turns the provider off, and is ``None``
+    for a provider the application always shows. The box is built from the
+    ``Provider`` itself, so a third provider adds no code to this module.
+    """
+
+    provider: Provider
+    tracking: SettingToggle | None = None
 
 
 @dataclass(frozen=True)
@@ -176,14 +168,14 @@ def parse_number(field: SettingNumber, text: str) -> int | None:
 
 def build_settings(
     *,
-    taskbar: Switch,
-    codex: Switch,
-    session_refresh: Switch,
-    startup: Switch,
-    poll_interval: Number,
-    amber_threshold: Number,
-    red_threshold: Number,
-    refresh_cooldown: Number,
+    taskbar: SettingToggle,
+    providers: list[ProviderFields],
+    session_refresh: SettingToggle,
+    startup: SettingToggle,
+    poll_interval: SettingNumber,
+    amber_threshold: SettingNumber,
+    red_threshold: SettingNumber,
+    refresh_cooldown: SettingNumber,
     log_dir: Path,
     open_url: Callable[[str], None] | None = None,
     open_folder: Callable[[str], None] | None = None,
@@ -264,27 +256,7 @@ def build_settings(
                             ),
                         ],
                     ),
-                    SettingsGroup(
-                        title="Claude",
-                        fields=[
-                            SettingLink(
-                                key="claude_usage",
-                                label="Claude usage online",
-                                open=lambda: open_page(_CLAUDE_USAGE_URL),
-                            ),
-                        ],
-                    ),
-                    SettingsGroup(
-                        title="Codex",
-                        fields=[
-                            _toggle("codex", "Track Codex usage", codex),
-                            SettingLink(
-                                key="codex_usage",
-                                label="Codex usage online",
-                                open=lambda: open_page(_CODEX_USAGE_URL),
-                            ),
-                        ],
-                    ),
+                    *[_provider_group(entry, open_page) for entry in providers],
                 ],
             ),
             SettingsTab(
@@ -302,28 +274,44 @@ def build_settings(
     )
 
 
-def _toggle(key: str, label: str, switch: Switch) -> SettingToggle:
+def _provider_group(
+    entry: ProviderFields,
+    open_page: Callable[[str], None],
+) -> SettingsGroup:
+    """Build one provider's box: its tracking switch, if it has one, and its link.
+
+    The keys are derived from the provider's own key, so two providers can
+    never be given the same one and a third needs no new name here.
+    """
+    provider = entry.provider
+    fields: list[SettingField] = []
+    if entry.tracking is not None:
+        fields.append(
+            _toggle(
+                f"{provider.key}_tracking",
+                f"Track {provider.label} usage",
+                entry.tracking,
+            )
+        )
+    fields.append(
+        SettingLink(
+            key=f"{provider.key}_usage",
+            label=f"{provider.label} usage online",
+            # Bound now rather than read from the loop variable when clicked.
+            open=lambda url=provider.usage_url: open_page(url),
+        )
+    )
+    return SettingsGroup(title=provider.label, fields=fields)
+
+
+def _toggle(key: str, label: str, toggle: SettingToggle) -> SettingToggle:
     """Give one switch the key and label the window draws it under."""
-    return SettingToggle(
-        key=key,
-        label=label,
-        is_on=switch.is_on,
-        write=switch.write,
-        available=switch.available,
-    )
+    return replace(toggle, key=key, label=label)
 
 
-def _number(key: str, label: str, suffix: str, number: Number) -> SettingNumber:
+def _number(key: str, label: str, suffix: str, number: SettingNumber) -> SettingNumber:
     """Give one numeric setting the key, label, and unit the window draws it under."""
-    return SettingNumber(
-        key=key,
-        label=label,
-        suffix=suffix,
-        value=number.value,
-        write=number.write,
-        minimum=number.minimum,
-        maximum=number.maximum,
-    )
+    return replace(number, key=key, label=label, suffix=suffix)
 
 
 class PendingSettings:

@@ -6,7 +6,6 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -14,31 +13,32 @@ from typing import Callable
 
 import pystray
 
-from . import autostart, cli_refresher, codex_fetcher, fetcher, processor, tray
+from . import autostart, cli_refresher, processor, tray
 from .config import (
+    AMBER_THRESHOLD,
+    POLL_INTERVAL,
+    RED_THRESHOLD,
+    REFRESH_COOLDOWN,
+    SESSION_REFRESH_ENABLED,
+    TASKBAR_ENABLED,
     Config,
+    ConfigSetting,
     load_config,
-    save_amber_threshold,
-    save_codex_enabled,
-    save_poll_interval_seconds,
-    save_red_threshold,
-    save_session_refresh_cooldown,
-    save_session_refresh_enabled,
-    save_taskbar_enabled,
 )
-from .models import CLAUDE, CODEX, DisplayState, Provider, ProviderUsageData
+from .models import PROVIDERS, DisplayState, Provider, ProviderUsageData
 from .notifications import ThresholdNotifier, UsageNotification
 from .settings import (
-    Number,
+    ProviderFields,
+    SettingNumber,
+    SettingToggle,
     SettingsModel,
     SettingsView,
     SettingsWindowController,
-    Switch,
     build_settings,
 )
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 from .win32_settings_window import create_settings_window
-from .win32_taskbar_window import enable_per_monitor_dpi_awareness
+from .win32_dpi import enable_per_monitor_dpi_awareness
 
 _ERROR_ALREADY_EXISTS = 183
 log = logging.getLogger(__name__)
@@ -70,43 +70,19 @@ def _apply_display(
     companion.update(label.segments, label.tooltip)
 
 
-def _toggle_taskbar_visibility(
-    companion: TaskbarDisplay,
-    persist: Callable[[bool], None],
-) -> None:
+def _toggle_taskbar_visibility(companion: TaskbarDisplay) -> None:
     """Flip the taskbar label, for the tray menu entry that still offers it."""
-    _set_taskbar_visibility(companion, persist, not companion.visible)
+    _set_taskbar_visibility(companion, not companion.visible)
 
 
-def _set_taskbar_visibility(
-    companion: TaskbarDisplay,
-    persist: Callable[[bool], None],
-    visible: bool,
-) -> None:
-    """Show or hide the taskbar label and remember the choice for next launch.
-
-    This runs on a UI thread, where an escaping exception would surface only as
-    a stderr traceback nobody sees in a windowed build, so a failed config write
-    is logged and the change still takes effect.
-    """
+def _set_taskbar_visibility(companion: TaskbarDisplay, visible: bool) -> None:
+    """Show or hide the taskbar label and remember the choice for next launch."""
     companion.set_visible(visible)
-    try:
-        persist(visible)
-    except Exception:
-        log.exception("unable to persist taskbar visibility")
-
-
-def _toggle_session_refresh(
-    nudgers: list[cli_refresher.SessionNudger],
-    persist: Callable[[bool], None],
-) -> None:
-    """Flip the CLI nudge, for whichever surface offers it as a toggle."""
-    _set_session_refresh(nudgers, persist, not _session_refresh_is_enabled(nudgers))
+    TASKBAR_ENABLED.save(visible)
 
 
 def _set_session_refresh(
     nudgers: list[cli_refresher.SessionNudger],
-    persist: Callable[[bool], None],
     enabled: bool,
 ) -> None:
     """Switch every provider's CLI nudge on or off together.
@@ -116,16 +92,12 @@ def _set_session_refresh(
     """
     for nudger in nudgers:
         nudger.set_enabled(enabled)
-    try:
-        persist(enabled)
-    except Exception:
-        log.exception("unable to persist session refresh setting")
+    SESSION_REFRESH_ENABLED.save(enabled)
 
 
 def _set_session_refresh_cooldown(
     nudgers: list[cli_refresher.SessionNudger],
     config: Config,
-    persist: Callable[[float], None],
     seconds: int,
 ) -> None:
     """Change how long a nudge waits before it may run again.
@@ -133,10 +105,10 @@ def _set_session_refresh_cooldown(
     The running nudgers are told as well as the file, or the new gap would
     only take effect at the next launch.
     """
-    config.session_refresh.cooldown_seconds = seconds
+    REFRESH_COOLDOWN.write(config, seconds)
     for nudger in nudgers:
         nudger.set_cooldown_seconds(seconds)
-    _persist(persist, seconds, "session refresh cooldown")
+    REFRESH_COOLDOWN.save(seconds)
 
 
 def _session_refresh_is_enabled(
@@ -146,63 +118,34 @@ def _session_refresh_is_enabled(
     return any(nudger.enabled for nudger in nudgers)
 
 
-@dataclass
-class CodexTracking:
-    """Whether Codex is being tracked at all."""
+def _is_tracked(provider: Provider, config: Config) -> bool:
+    """Return whether the user is tracking this provider at all.
 
-    enabled: bool
+    A provider with no tracking setting is always shown — Claude has none,
+    because an application showing nothing is not a state worth offering.
+    """
+    return provider.tracking is None or bool(provider.tracking.read(config))
 
 
-def _toggle_codex_tracking(
-    tracking: CodexTracking,
-    persist: Callable[[bool], None],
-    wake_poll_loop: Callable[[], None] = lambda: None,
+def _set_tracking(
+    provider: Provider,
+    config: Config,
+    wake_poll_loop: Callable[[], None],
+    enabled: bool,
 ) -> None:
-    """Start or stop tracking Codex, and ask the loop to redraw at once.
+    """Start or stop tracking one provider, and ask the loop to redraw at once.
 
     Only a poll decides which providers are shown, so without the wake-up the
     switch would appear to do nothing for up to a polling interval.
-
-    Like the other toggles this runs on a UI thread, where an escaping
-    exception would surface only as a stderr traceback nobody sees in a
-    windowed build, so a failed config write is logged and the switch still
-    takes effect.
     """
-    _set_codex_tracking(tracking, persist, not tracking.enabled, wake_poll_loop)
-
-
-def _set_codex_tracking(
-    tracking: CodexTracking,
-    persist: Callable[[bool], None],
-    enabled: bool,
-    wake_poll_loop: Callable[[], None] = lambda: None,
-) -> None:
-    """Start or stop tracking Codex, and ask the loop to redraw at once."""
-    tracking.enabled = enabled
-    try:
-        persist(tracking.enabled)
-    except Exception:
-        log.exception("unable to persist codex tracking setting")
+    provider.tracking.write(config, enabled)
+    provider.tracking.save(enabled)
     wake_poll_loop()
-
-
-def _persist(save: Callable[[object], None], value: object, described_as: str) -> None:
-    """Write one setting to the config file, logging rather than raising.
-
-    Every caller runs on a UI thread and has already changed the running app,
-    so a file that cannot be written must not undo that or take the thread down
-    with it.
-    """
-    try:
-        save(value)
-    except Exception:
-        log.exception("unable to persist the %s setting", described_as)
 
 
 def _set_poll_interval(
     config: Config,
     pollers: list["ProviderPoller"],
-    persist: Callable[[int], None],
     wake_poll_loop: Callable[[], None],
     seconds: int,
 ) -> None:
@@ -212,24 +155,22 @@ def _set_poll_interval(
     so each one is reset too: otherwise the new setting would be ignored for as
     long as the backoff lasted.
     """
-    config.polling.interval_seconds = seconds
+    POLL_INTERVAL.write(config, seconds)
     for poller in pollers:
         poller.interval_seconds = seconds
-    _persist(persist, seconds, "poll interval")
+    POLL_INTERVAL.save(seconds)
     wake_poll_loop()
 
 
 def _set_threshold(
     config: Config,
-    attribute: str,
-    persist: Callable[[float], None],
+    setting: ConfigSetting,
     wake_poll_loop: Callable[[], None],
-    described_as: str,
     percent: int,
 ) -> None:
     """Change one icon colour threshold and redraw with it at once."""
-    setattr(config.thresholds, attribute, percent)
-    _persist(persist, percent, described_as)
+    setting.write(config, percent)
+    setting.save(percent)
     wake_poll_loop()
 
 
@@ -244,14 +185,33 @@ _MIN_REFRESH_COOLDOWN_SECONDS = 60
 _MAX_REFRESH_COOLDOWN_SECONDS = 86_400
 
 
+def _provider_fields(
+    provider: Provider,
+    config: Config,
+    wake_poll_loop: Callable[[], None],
+) -> ProviderFields:
+    """Wire one provider's box in the settings window to the setting it holds."""
+    if provider.tracking is None:
+        return ProviderFields(provider=provider)
+    return ProviderFields(
+        provider=provider,
+        tracking=SettingToggle(
+            is_on=lambda: _is_tracked(provider, config),
+            write=lambda enabled: _set_tracking(
+                provider, config, wake_poll_loop, enabled
+            ),
+        ),
+    )
+
+
 def build_settings_model(
     *,
     companion: TaskbarDisplay,
-    codex_tracking: CodexTracking,
     nudgers: list[cli_refresher.SessionNudger],
     pollers: list["ProviderPoller"],
     config: Config,
     log_dir: Path,
+    providers: tuple[Provider, ...] = PROVIDERS,
     wake_poll_loop: Callable[[], None] = lambda: None,
 ) -> SettingsModel:
     """Point every field in the settings window at the thing it controls.
@@ -260,74 +220,53 @@ def build_settings_model(
     Apply means what it says: nothing here waits for the next launch.
     """
     return build_settings(
-        taskbar=Switch(
+        taskbar=SettingToggle(
             is_on=lambda: companion.visible,
-            write=lambda visible: _set_taskbar_visibility(
-                companion, save_taskbar_enabled, visible
-            ),
+            write=lambda visible: _set_taskbar_visibility(companion, visible),
             available=lambda: companion.healthy,
         ),
-        codex=Switch(
-            is_on=lambda: codex_tracking.enabled,
-            write=lambda enabled: _set_codex_tracking(
-                codex_tracking,
-                save_codex_enabled,
-                enabled,
-                wake_poll_loop,
-            ),
-        ),
-        session_refresh=Switch(
+        providers=[
+            _provider_fields(provider, config, wake_poll_loop)
+            for provider in providers
+        ],
+        session_refresh=SettingToggle(
             is_on=lambda: _session_refresh_is_enabled(nudgers),
-            write=lambda enabled: _set_session_refresh(
-                nudgers,
-                save_session_refresh_enabled,
-                enabled,
-            ),
+            write=lambda enabled: _set_session_refresh(nudgers, enabled),
         ),
-        startup=Switch(
+        startup=SettingToggle(
             is_on=lambda: _startup_registration_enabled(autostart.is_enabled),
             write=lambda enabled: _set_startup_registration(
                 autostart.set_enabled, enabled
             ),
         ),
-        poll_interval=Number(
-            value=lambda: int(config.polling.interval_seconds),
+        poll_interval=SettingNumber(
+            value=lambda: int(POLL_INTERVAL.read(config)),
             write=lambda seconds: _set_poll_interval(
-                config, pollers, save_poll_interval_seconds, wake_poll_loop, seconds
+                config, pollers, wake_poll_loop, seconds
             ),
             minimum=_MIN_POLL_INTERVAL_SECONDS,
             maximum=_MAX_POLL_INTERVAL_SECONDS,
         ),
-        amber_threshold=Number(
-            value=lambda: int(config.thresholds.amber_below),
+        amber_threshold=SettingNumber(
+            value=lambda: int(AMBER_THRESHOLD.read(config)),
             write=lambda percent: _set_threshold(
-                config,
-                "amber_below",
-                save_amber_threshold,
-                wake_poll_loop,
-                "amber threshold",
-                percent,
+                config, AMBER_THRESHOLD, wake_poll_loop, percent
             ),
             minimum=_MIN_THRESHOLD_PERCENT,
             maximum=_MAX_THRESHOLD_PERCENT,
         ),
-        red_threshold=Number(
-            value=lambda: int(config.thresholds.red_below),
+        red_threshold=SettingNumber(
+            value=lambda: int(RED_THRESHOLD.read(config)),
             write=lambda percent: _set_threshold(
-                config,
-                "red_below",
-                save_red_threshold,
-                wake_poll_loop,
-                "red threshold",
-                percent,
+                config, RED_THRESHOLD, wake_poll_loop, percent
             ),
             minimum=_MIN_THRESHOLD_PERCENT,
             maximum=_MAX_THRESHOLD_PERCENT,
         ),
-        refresh_cooldown=Number(
-            value=lambda: int(config.session_refresh.cooldown_seconds),
+        refresh_cooldown=SettingNumber(
+            value=lambda: int(REFRESH_COOLDOWN.read(config)),
             write=lambda seconds: _set_session_refresh_cooldown(
-                nudgers, config, save_session_refresh_cooldown, seconds
+                nudgers, config, seconds
             ),
             minimum=_MIN_REFRESH_COOLDOWN_SECONDS,
             maximum=_MAX_REFRESH_COOLDOWN_SECONDS,
@@ -355,17 +294,6 @@ def _startup_registration_enabled(check: Callable[[], bool]) -> bool:
     except OSError:
         log.exception("unable to read Windows startup registration")
         return False
-
-
-def _toggle_startup_registration(
-    check: Callable[[], bool],
-    persist: Callable[[bool], None],
-) -> None:
-    """Flip per-user startup registration, for the tray menu entry."""
-    try:
-        _set_startup_registration(persist, not check())
-    except OSError:
-        log.exception("unable to read Windows startup registration")
 
 
 def _set_startup_registration(
@@ -459,16 +387,20 @@ def _remove_console_shutdown_handler(handler: ctypes._CFuncPtr) -> None:
 
 
 def create_session_nudger(
+    provider: Provider,
     cfg: Config,
     manual_refresh: threading.Event,
     **overrides,
 ) -> cli_refresher.SessionNudger:
-    """Build the CLI session nudger, re-polling as soon as a refresh succeeds.
+    """Build one provider's CLI nudger, re-polling as soon as a refresh succeeds.
 
     Waking the loop matters because the whole point of the nudge is that the
-    numbers it produces are newer than the ones that triggered it.
+    numbers it produces are newer than the ones that triggered it. Which CLI to
+    run is the provider's own business, so there is one of these, not one per
+    provider.
     """
     return cli_refresher.SessionNudger(
+        provider,
         enabled=cfg.session_refresh.enabled,
         cooldown_seconds=cfg.session_refresh.cooldown_seconds,
         on_refreshed=manual_refresh.set,
@@ -476,23 +408,9 @@ def create_session_nudger(
     )
 
 
-def create_codex_nudger(
-    cfg: Config,
-    manual_refresh: threading.Event,
-    **overrides,
-) -> cli_refresher.SessionNudger:
-    """Build Codex's nudger: the same rule as Claude, a different CLI to run."""
-    return create_session_nudger(
-        cfg,
-        manual_refresh,
-        invoke=cli_refresher.run_codex_cli,
-        **overrides,
-    )
-
-
 def _next_poll_interval_seconds(
     current_interval_seconds: int,
-    data: fetcher.ProviderUsageData,
+    data: ProviderUsageData,
     *,
     baseline_seconds: int,
 ) -> int:
@@ -512,19 +430,14 @@ def _next_poll_interval_seconds(
     return current_interval_seconds
 
 
-def _is_successful_fetch(data: fetcher.ProviderUsageData) -> bool:
+def _is_successful_fetch(data: ProviderUsageData) -> bool:
     """Return whether a fetch completed successfully enough to update freshness."""
     return data.fetch_error is None and data.status_code == 200
 
 
-def _active_pollers(
-    claude: object,
-    codex: object,
-    *,
-    codex_enabled: bool,
-) -> list:
+def _active_pollers(pollers: list["ProviderPoller"], config: Config) -> list:
     """Return the pollers to run this tick, in the order they are displayed."""
-    return [claude, codex] if codex_enabled else [claude]
+    return [poller for poller in pollers if _is_tracked(poller.provider, config)]
 
 
 def _shared_poll_interval(intervals: list[int]) -> int:
@@ -547,12 +460,10 @@ class ProviderPoller:
     def __init__(
         self,
         provider: Provider,
-        fetch: Callable[[], ProviderUsageData],
         config: Config,
         nudger: cli_refresher.SessionNudger,
     ) -> None:
         self.provider = provider
-        self._fetch = fetch
         self._config = config
         self._nudger = nudger
         self._notifier = ThresholdNotifier(provider_label=provider.label)
@@ -567,7 +478,7 @@ class ProviderPoller:
 
     def poll(self) -> list[UsageNotification]:
         """Fetch once, updating freshness, backoff, and the CLI nudge."""
-        data = self._fetch()
+        data = self.provider.fetch()
         self._latest = data
         notifications = self._notifier.check(data)
         self._nudger.maybe_nudge(data)
@@ -589,11 +500,11 @@ class ProviderPoller:
         """
         return processor.process(
             self._latest,
-            now=now,
-            config=self._config,
+            now,
+            self._config,
+            self.provider,
             last_good=self._last_good,
             session_refresh_exhausted=self._nudger.exhausted,
-            provider=self.provider,
         )
 
 
@@ -616,7 +527,7 @@ def _provider_display(poller: "ProviderPoller", now: datetime) -> DisplayState:
         return poller.display(now)
     except Exception:
         log.exception("display failed for %s", poller.provider.label)
-        return processor.internal_error_state(now=now, provider=poller.provider)
+        return processor.internal_error_state(now, poller.provider)
 
 
 def _acquire_single_instance(name: str = "ClaudeMonitor.SingleInstance") -> bool:
@@ -655,21 +566,21 @@ def main() -> None:
     manual_refresh = threading.Event()
     shutdown_requested = threading.Event()
     companion = create_taskbar_companion(initial_visible=cfg.taskbar.enabled)
-    codex_tracking = CodexTracking(enabled=cfg.codex.enabled)
     # Built before the tray so its menu toggles have something to flip; the
     # poll loop starts later and closes over the same instances.
-    session_nudger = create_session_nudger(cfg, manual_refresh)
-    codex_nudger = create_codex_nudger(cfg, manual_refresh)
-    nudgers = [session_nudger, codex_nudger]
-    claude_poller = ProviderPoller(CLAUDE, fetcher.fetch, cfg, session_nudger)
-    codex_poller = ProviderPoller(CODEX, codex_fetcher.fetch, cfg, codex_nudger)
+    nudgers = [
+        create_session_nudger(provider, cfg, manual_refresh) for provider in PROVIDERS
+    ]
+    pollers = [
+        ProviderPoller(provider, cfg, nudger)
+        for provider, nudger in zip(PROVIDERS, nudgers)
+    ]
 
     settings_window = create_settings_controller(
         build_settings_model(
             companion=companion,
-            codex_tracking=codex_tracking,
             nudgers=nudgers,
-            pollers=[claude_poller, codex_poller],
+            pollers=pollers,
             config=cfg,
             log_dir=log_dir,
             wake_poll_loop=manual_refresh.set,
@@ -680,7 +591,7 @@ def main() -> None:
         manual_refresh,
         shutdown_requested,
         taskbar_visible=lambda: companion.visible,
-        toggle_taskbar=lambda: _toggle_taskbar_visibility(companion, save_taskbar_enabled),
+        toggle_taskbar=lambda: _toggle_taskbar_visibility(companion),
         taskbar_healthy=lambda: companion.healthy,
         open_settings=settings_window.open,
     )
@@ -688,14 +599,7 @@ def main() -> None:
     # Seed a placeholder for every tracked provider before the label appears,
     # so it does not visibly grow from one segment to two on the first fetch.
     initial_label = processor.loading_label(
-        [
-            poller.provider
-            for poller in _active_pollers(
-                claude_poller,
-                codex_poller,
-                codex_enabled=codex_tracking.enabled,
-            )
-        ]
+        [poller.provider for poller in _active_pollers(pollers, cfg)]
     )
     companion.update(initial_label.segments, initial_label.tooltip)
     companion.start()
@@ -705,11 +609,7 @@ def main() -> None:
         while not shutdown_requested.is_set():
             notifications: list[UsageNotification] = []
             try:
-                active = _active_pollers(
-                    claude_poller,
-                    codex_poller,
-                    codex_enabled=codex_tracking.enabled,
-                )
+                active = _active_pollers(pollers, cfg)
                 for poller in active:
                     notifications += _poll_provider(poller)
                 poll_interval_seconds = _shared_poll_interval(
@@ -725,7 +625,9 @@ def main() -> None:
 
                 def build_states() -> list[DisplayState]:
                     return [
-                        processor.internal_error_state(now=datetime.now(timezone.utc))
+                        processor.internal_error_state(
+                            datetime.now(timezone.utc), PROVIDERS[0]
+                        )
                     ]
 
             _apply_display(icon, build_states(), companion)
@@ -767,9 +669,9 @@ def poll() -> None:
     """Print one fetch per provider, for `uv run poll`."""
     import json
 
-    for provider, fetch in ((CLAUDE, fetcher.fetch), (CODEX, codex_fetcher.fetch)):
+    for provider in PROVIDERS:
         print(f"--- {provider.label} ---")
-        print(json.dumps(fetch().model_dump(mode="json"), indent=2))
+        print(json.dumps(provider.fetch().model_dump(mode="json"), indent=2))
 
 
 if __name__ == "__main__":

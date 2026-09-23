@@ -10,18 +10,18 @@ from __future__ import annotations
 
 import ctypes
 import logging
+from dataclasses import replace
 from pathlib import Path
 
-from claudemonitor.models import Insets
+from claudemonitor.models import CLAUDE, CODEX
 from claudemonitor.settings import (
-    Number,
+    ProviderFields,
     SettingLink,
     SettingNumber,
     SettingToggle,
     SettingsGroup,
     SettingsModel,
     SettingsTab,
-    Switch,
     build_settings,
 )
 from claudemonitor.win32_bindings import (
@@ -64,7 +64,6 @@ from claudemonitor.win32_settings_window import (
     _FIRST_EDITOR_ID,
     _FIRST_FIELD_ID,
     Win32SettingsWindow,
-    settings_layout,
 )
 
 
@@ -84,7 +83,7 @@ def _brushes_framed(window) -> list[int]:
 def _switch(on: bool = True, available: bool = True):
     """Build a switch over a mutable flag, plus the flag itself to assert on."""
     state = {"on": on}
-    switch = Switch(
+    switch = SettingToggle(
         is_on=lambda: state["on"],
         write=lambda value: state.update(on=value),
         available=lambda: available,
@@ -95,7 +94,7 @@ def _switch(on: bool = True, available: bool = True):
 def _number(value: int = 60, minimum: int = 10, maximum: int = 600):
     """Build a numeric setting over a mutable value, plus the value to assert on."""
     state = {"value": value}
-    number = Number(
+    number = SettingNumber(
         value=lambda: state["value"],
         write=lambda new: state.update(value=new),
         minimum=minimum,
@@ -108,7 +107,10 @@ def _production_model(**overrides) -> SettingsModel:
     """Build the real three-tab model, so the tests bind to what ships."""
     fields = {
         "taskbar": _switch()[0],
-        "codex": _switch()[0],
+        "providers": [
+            ProviderFields(provider=CLAUDE),
+            ProviderFields(provider=CODEX, tracking=_switch()[0]),
+        ],
         "session_refresh": _switch()[0],
         "startup": _switch()[0],
         "poll_interval": _number()[0],
@@ -126,29 +128,13 @@ def _production_model(**overrides) -> SettingsModel:
 def _toggle_field(key="taskbar", label="Show usage in the taskbar", **kwargs):
     """One checkbox field, over a flag the caller can inspect."""
     switch, state = _switch(**kwargs)
-    field = SettingToggle(
-        key=key,
-        label=label,
-        is_on=switch.is_on,
-        write=switch.write,
-        available=switch.available,
-    )
-    return field, state
+    return replace(switch, key=key, label=label), state
 
 
 def _number_field(key="poll_interval", label="Check usage every", **kwargs):
     """One number field, over a value the caller can inspect."""
     number, state = _number(**kwargs)
-    field = SettingNumber(
-        key=key,
-        label=label,
-        suffix="seconds",
-        value=number.value,
-        write=number.write,
-        minimum=number.minimum,
-        maximum=number.maximum,
-    )
-    return field, state
+    return replace(number, key=key, label=label, suffix="seconds"), state
 
 
 def _one_tab(*fields, title: str = "General", group: str = "Startup") -> SettingsModel:
@@ -326,174 +312,6 @@ def _switch_to_tab(window, index: int) -> None:
     window._window_proc(window._handle, WM_NOTIFY, 0, ctypes.addressof(header))
 
 
-# --------------------------------------------------------------------- layout
-
-
-class TestSettingsLayout:
-    """Where every control sits, worked out before a window exists."""
-
-    def _layout(self, model: SettingsModel | None = None, **kwargs):
-        return settings_layout(
-            model if model is not None else _production_model(),
-            measure=_measure,
-            tab_frame=kwargs.pop("tab_frame", Insets(4, 24, 4, 4)),
-            **kwargs,
-        )
-
-    def test_the_page_sits_inside_the_tab_control_by_its_frame(self):
-        layout = self._layout(tab_frame=Insets(4, 24, 4, 4))
-
-        assert layout.page.left == layout.tab.left + 4
-        assert layout.page.top == layout.tab.top + 24
-        assert layout.page.right == layout.tab.right - 4
-        assert layout.page.bottom == layout.tab.bottom - 4
-
-    def test_every_tab_is_laid_out(self):
-        layout = self._layout()
-
-        assert [tab.title for tab in layout.tabs] == ["General", "Providers", "Taskbar"]
-
-    def test_every_group_and_field_is_placed(self):
-        layout = self._layout()
-        placed = {field.key for tab in layout.tabs for group in tab.groups for field in group.fields}
-
-        assert placed == {field.key for field in _production_model().fields()}
-
-    def test_every_group_box_stays_inside_its_page(self):
-        # Each page is a window of its own, so its contents are placed from
-        # its own top left corner rather than from the frame's.
-        layout = self._layout()
-
-        for tab in layout.tabs:
-            for group in tab.groups:
-                assert group.rect.left >= 0
-                assert group.rect.top >= 0
-                assert group.rect.right <= layout.page.width
-                assert group.rect.bottom <= layout.page.height
-
-    def test_groups_on_a_page_do_not_overlap(self):
-        general = self._layout().tabs[0]
-
-        bottoms = [group.rect.bottom for group in general.groups]
-        tops = [group.rect.top for group in general.groups]
-        assert all(top >= bottom for bottom, top in zip(bottoms, tops[1:]))
-
-    def test_every_group_caption_sits_on_its_own_border(self):
-        layout = self._layout()
-
-        for tab in layout.tabs:
-            for group in tab.groups:
-                assert group.caption.left > group.rect.left
-                assert group.caption.top >= group.rect.top
-                assert group.caption.right <= group.rect.right
-                assert group.caption.bottom < group.rect.bottom
-
-    def test_every_field_stays_inside_its_group(self):
-        layout = self._layout()
-
-        for tab in layout.tabs:
-            for group in tab.groups:
-                for field in group.fields:
-                    assert field.rect.left >= group.rect.left
-                    assert field.rect.right <= group.rect.right
-                    assert field.rect.top >= group.rect.top
-                    assert field.rect.bottom <= group.rect.bottom
-
-    def test_a_number_field_gets_a_box_a_spinner_and_a_unit(self):
-        field, _state = _number_field()
-        layout = self._layout(_one_tab(field))
-        placed = layout.tabs[0].groups[0].fields[0]
-
-        assert placed.editor is not None
-        assert placed.spinner is not None
-        assert placed.suffix is not None
-
-    def test_the_spinner_sits_against_the_right_of_its_box(self):
-        field, _state = _number_field()
-        placed = self._layout(_one_tab(field)).tabs[0].groups[0].fields[0]
-
-        assert placed.spinner.right == placed.editor.right
-        assert placed.spinner.top == placed.editor.top
-
-    def test_the_unit_follows_the_box(self):
-        field, _state = _number_field()
-        placed = self._layout(_one_tab(field)).tabs[0].groups[0].fields[0]
-
-        assert placed.suffix.left >= placed.editor.right
-
-    def test_two_numbers_in_one_group_share_a_column(self):
-        # Two numbers under one caption read as a pair, so their boxes line up
-        # with each other rather than each following its own label.
-        short, _a = _number_field(key="red_threshold", label="Red")
-        long, _b = _number_field(key="amber_threshold", label="A much longer label")
-        placed = self._layout(_one_tab(short, long)).tabs[0].groups[0].fields
-
-        assert placed[0].editor.left == placed[1].editor.left
-
-    def test_a_long_unit_beside_a_short_label_is_not_clipped(self):
-        short, _a = _number_field(key="red_threshold", label="Red")
-        long, _b = _number_field(key="amber_threshold", label="A much longer label")
-        layout = self._layout(_one_tab(short, long))
-        placed = layout.tabs[0].groups[0].fields
-
-        assert all(field.suffix.right <= layout.page.width for field in placed)
-
-    def test_a_toggle_gets_no_box_of_its_own(self):
-        field, _state = _toggle_field()
-        placed = self._layout(_one_tab(field)).tabs[0].groups[0].fields[0]
-
-        assert placed.editor is None and placed.spinner is None
-
-    def test_every_page_is_the_same_size(self):
-        # The tab control shows one page at a time in one rectangle, so the
-        # window is sized for the busiest page and the others keep that size.
-        layout = self._layout()
-
-        assert layout.page.height > 0
-        assert all(
-            group.rect.bottom <= layout.page.height
-            for tab in layout.tabs
-            for group in tab.groups
-        )
-
-    def test_the_window_is_wide_enough_for_the_longest_label(self):
-        field, _state = _toggle_field(label="A" * 90)
-        layout = self._layout(_one_tab(field))
-
-        assert layout.width >= _measure("A" * 90)
-
-    def test_the_three_buttons_sit_in_a_row_below_the_tab_control(self):
-        layout = self._layout()
-
-        assert layout.ok.top > layout.tab.bottom
-        assert layout.ok.top == layout.cancel.top == layout.apply.top
-        assert layout.ok.right <= layout.cancel.left
-        assert layout.cancel.right <= layout.apply.left
-
-    def test_the_button_row_ends_at_the_right_margin(self):
-        layout = self._layout()
-
-        assert layout.apply.right < layout.width
-        assert layout.width - layout.apply.right == layout.tab.left
-
-    def test_the_window_is_tall_enough_for_the_button_row(self):
-        layout = self._layout()
-
-        assert layout.height > layout.apply.bottom
-
-    def test_a_higher_dpi_scales_every_measurement(self):
-        normal = self._layout(dpi=96)
-        scaled = self._layout(dpi=192)
-
-        assert scaled.height > normal.height
-        assert scaled.tab.left == 2 * normal.tab.left
-
-    def test_a_model_with_no_tabs_still_produces_a_usable_window(self):
-        layout = self._layout(SettingsModel(tabs=[]))
-
-        assert layout.width > 0 and layout.height > 0
-
-
 # --------------------------------------------------------------------- window
 
 
@@ -634,8 +452,22 @@ class TestWhatTheWindowCreates:
         window = _window(_one_tab(field))
         window._create()
 
-        handle = window._field_handles["taskbar"]
+        handle = window._controls["taskbar"].label
         assert window._user32.enabled[handle] is False
+
+    def test_two_fields_that_read_the_same_get_command_ids_of_their_own(self):
+        # A field is a frozen dataclass, so two of them that were wired the
+        # same way compare equal. Routing by position rather than by identity
+        # is what keeps the second one from answering to the first one's id.
+        switch, _state = _switch()
+        first = replace(switch, key="taskbar", label="Same label")
+        second = replace(switch, key="codex", label="Same label")
+        assert first != second  # only the key tells them apart
+        window = _window(_one_tab(first, second))
+
+        window._create()
+
+        assert window._controls["taskbar"].label != window._controls["codex"].label
 
     def test_common_controls_are_registered_before_the_tab_is_made(self):
         window = _window()
@@ -677,10 +509,11 @@ class TestWhichPageIsShown:
     def test_a_tab_index_the_dialog_does_not_have_is_ignored(self):
         window = _window()
         window._create()
+        shown_before = dict(window._user32.shown)
 
         _switch_to_tab(window, 9)
 
-        assert window._current_tab == 0
+        assert window._user32.shown == shown_before
 
 
 class TestNothingIsWrittenUntilApplied:
@@ -694,7 +527,7 @@ class TestNothingIsWrittenUntilApplied:
 
     def _click_checkbox(self, window, key: str, checked: bool) -> None:
         """Tick or untick a box the way Windows does, then tell the window."""
-        handle = window._field_handles[key]
+        handle = window._controls[key].label
         window._user32.checked[handle] = BST_CHECKED if checked else BST_UNCHECKED
         index = [field.key for field in window._model.fields()].index(key)
         _command(window, _FIRST_FIELD_ID + index)
@@ -792,7 +625,7 @@ class TestTypingANumber:
 
     def _type(self, window, key: str, text: str) -> None:
         """Put text in the box and send the change notification Windows would."""
-        window._user32.text[window._editor_handles[key]] = text
+        window._user32.text[window._controls[key].editor] = text
         index = [field.key for field in window._model.fields()].index(key)
         _command(window, _FIRST_EDITOR_ID + index, EN_CHANGE)
 
@@ -828,7 +661,7 @@ class TestTypingANumber:
 
         _command(window, _APPLY_ID)
 
-        assert window._user32.text[window._editor_handles["poll_interval"]] == "600"
+        assert window._user32.text[window._controls["poll_interval"].editor] == "600"
 
     def test_a_box_that_reports_before_it_exists_is_ignored(self):
         # Windows announces an edit control's first text while
@@ -836,7 +669,7 @@ class TestTypingANumber:
         field, state = _number_field(value=60)
         window = _window(_one_tab(field))
         window._create()
-        window._editor_handles.clear()
+        window._controls.clear()
 
         _command(window, _FIRST_EDITOR_ID, EN_CHANGE)
         _command(window, IDOK)
@@ -887,7 +720,7 @@ class TestColours:
         field, state = _toggle_field(on=True)
         window = _window(_one_tab(field))
         window._create()
-        window._user32.checked[window._field_handles["taskbar"]] = BST_UNCHECKED
+        window._user32.checked[window._controls["taskbar"].label] = BST_UNCHECKED
 
         window._window_proc(window._page_handles[0], WM_COMMAND, _FIRST_FIELD_ID, 0)
         _command(window, IDOK)

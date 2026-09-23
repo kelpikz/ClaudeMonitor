@@ -1,8 +1,11 @@
 """Tests for the Codex usage fetcher.
 
 The end-to-end path here runs from "bytes the ChatGPT backend returned" to
-"ProviderUsageData the processor can format", including every failure the
-network and the credential file can produce.
+"ProviderUsageData the processor can format". What is asserted is what is
+Codex's own: where its credentials live, how its JWT states an expiry, which
+URL is asked, and how its body maps onto the shared model. Every way the
+request itself can fail is one ladder shared with Claude, and is pinned in
+``test_usage_request`` rather than twice over here.
 """
 
 from __future__ import annotations
@@ -11,10 +14,9 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 
-import httpx
 import pytest
 
-from claudemonitor import codex_fetcher
+from claudemonitor import codex_fetcher, usage_request
 from claudemonitor.models import ProviderUsageData
 
 # One real reset moment, reused so assertions read as the same instant.
@@ -77,8 +79,7 @@ class _FakeResponse:
         return self._json
 
     def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError("error", request=None, response=None)
+        return None
 
 
 @pytest.fixture
@@ -95,6 +96,11 @@ def fake_credentials(monkeypatch):
     )
 
 
+def _answers(monkeypatch, response) -> None:
+    """Make the one shared request return a canned response."""
+    monkeypatch.setattr(usage_request.httpx, "get", lambda *a, **k: response)
+
+
 def _fail_if_called(*args, **kwargs):
     raise AssertionError("fetch() must not hit the network without a usable token")
 
@@ -105,9 +111,7 @@ def _fail_if_called(*args, **kwargs):
 
 
 def test_happy_path_maps_both_windows(fake_credentials, monkeypatch):
-    monkeypatch.setattr(
-        codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, _usage_body())
-    )
+    _answers(monkeypatch, _FakeResponse(200, _usage_body()))
 
     data = codex_fetcher.fetch()
 
@@ -136,7 +140,7 @@ def test_request_targets_the_usage_endpoint_with_auth_headers(
         captured["headers"] = kwargs.get("headers", {})
         return _FakeResponse(200, _usage_body())
 
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _capture)
+    monkeypatch.setattr(usage_request.httpx, "get", _capture)
 
     codex_fetcher.fetch()
 
@@ -156,7 +160,7 @@ def test_untouched_window_reports_zero_usage(fake_credentials, monkeypatch):
             "reset_at": None,
         }
     )
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, body))
+    _answers(monkeypatch, _FakeResponse(200, body))
 
     data = codex_fetcher.fetch()
 
@@ -167,10 +171,10 @@ def test_untouched_window_reports_zero_usage(fake_credentials, monkeypatch):
 
 
 def test_missing_windows_map_to_none(fake_credentials, monkeypatch):
-    body = _usage_body(primary=None, secondary=None)
+    body = _usage_body()
     body["rate_limit"]["primary_window"] = None
     body["rate_limit"]["secondary_window"] = None
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, body))
+    _answers(monkeypatch, _FakeResponse(200, body))
 
     data = codex_fetcher.fetch()
 
@@ -180,9 +184,7 @@ def test_missing_windows_map_to_none(fake_credentials, monkeypatch):
 
 
 def test_absent_rate_limit_section_maps_to_none_windows(fake_credentials, monkeypatch):
-    monkeypatch.setattr(
-        codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, {"plan_type": "plus"})
-    )
+    _answers(monkeypatch, _FakeResponse(200, {"plan_type": "plus"}))
 
     data = codex_fetcher.fetch()
 
@@ -190,24 +192,11 @@ def test_absent_rate_limit_section_maps_to_none_windows(fake_credentials, monkey
     assert data.five_hour is None
 
 
-# --------------------------------------------------------------------------
-# End-to-end: failures become values, never exceptions
-# --------------------------------------------------------------------------
-
-
-def test_401_maps_to_token_expired(fake_credentials, monkeypatch):
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(401))
-
-    data = codex_fetcher.fetch()
-
-    assert data.fetch_error == "token_expired"
-    assert data.status_code == 401
-
-
-def test_403_maps_to_token_expired(fake_credentials, monkeypatch):
-    # The ChatGPT backend answers a stale session with 403 as readily as 401,
-    # and both mean the same thing to the user: sign the Codex CLI back in.
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(403))
+def test_a_refused_session_reaches_the_caller_as_an_expired_token(
+    fake_credentials, monkeypatch
+):
+    # One rung of the shared ladder, end to end, so the wiring is proven too.
+    _answers(monkeypatch, _FakeResponse(403))
 
     data = codex_fetcher.fetch()
 
@@ -215,78 +204,14 @@ def test_403_maps_to_token_expired(fake_credentials, monkeypatch):
     assert data.status_code == 403
 
 
-def test_429_maps_to_rate_limited_with_retry_after(fake_credentials, monkeypatch):
-    response = _FakeResponse(429, headers={"retry-after": "224"})
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: response)
-
-    data = codex_fetcher.fetch()
-
-    assert data.fetch_error == "rate_limited"
-    assert data.status_code == 429
-    assert data.retry_after_seconds == 224
-
-
-def test_429_ignores_unusable_retry_after(fake_credentials, monkeypatch):
-    response = _FakeResponse(429, headers={"retry-after": "soon"})
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: response)
-
-    assert codex_fetcher.fetch().retry_after_seconds is None
-
-
-def test_timeout_maps_to_timeout(fake_credentials, monkeypatch):
-    def _timeout(*a, **k):
-        raise httpx.TimeoutException("too slow")
-
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _timeout)
-
-    assert codex_fetcher.fetch().fetch_error == "timeout"
-
-
-def test_network_failure_maps_to_offline(fake_credentials, monkeypatch):
-    def _boom(*a, **k):
-        raise httpx.ConnectError("no route")
-
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _boom)
-
-    assert codex_fetcher.fetch().fetch_error == "offline"
-
-
-def test_server_error_maps_to_offline(fake_credentials, monkeypatch):
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(500))
-
-    assert codex_fetcher.fetch().fetch_error == "offline"
-
-
-def test_unparseable_body_maps_to_bad_response(fake_credentials, monkeypatch):
-    class _Undecodable(_FakeResponse):
-        def json(self):
-            raise ValueError("not json")
-
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _Undecodable(200))
-
-    assert codex_fetcher.fetch().fetch_error == "bad_response"
-
-
 def test_wrongly_shaped_window_maps_to_bad_response(fake_credentials, monkeypatch):
     body = _usage_body(primary={"used_percent": "lots", "reset_at": "whenever"})
-    monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, body))
+    _answers(monkeypatch, _FakeResponse(200, body))
 
     data = codex_fetcher.fetch()
 
     assert data.fetch_error == "bad_response"
     assert data.status_code == 200
-
-
-def test_unexpected_error_is_still_returned_as_data(fake_credentials, monkeypatch):
-    def _weird(*a, **k):
-        raise RuntimeError("something else")
-
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _weird)
-
-    data = codex_fetcher.fetch()
-
-    assert data.fetch_error is not None
-    assert data.fetch_error.startswith("unknown")
 
 
 # --------------------------------------------------------------------------
@@ -296,7 +221,7 @@ def test_unexpected_error_is_still_returned_as_data(fake_credentials, monkeypatc
 
 def test_missing_auth_file_maps_to_no_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(codex_fetcher, "_auth_path", lambda: tmp_path / "auth.json")
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _fail_if_called)
+    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
 
     data = codex_fetcher.fetch()
 
@@ -308,7 +233,7 @@ def test_malformed_auth_file_maps_to_no_credentials(monkeypatch, tmp_path):
     path = tmp_path / "auth.json"
     path.write_text("{not json", encoding="utf-8")
     monkeypatch.setattr(codex_fetcher, "_auth_path", lambda: path)
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _fail_if_called)
+    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
 
     assert codex_fetcher.fetch().fetch_error == "no_credentials"
 
@@ -317,7 +242,7 @@ def test_auth_file_without_tokens_maps_to_no_credentials(monkeypatch, tmp_path):
     path = tmp_path / "auth.json"
     path.write_text(json.dumps({"OPENAI_API_KEY": None}), encoding="utf-8")
     monkeypatch.setattr(codex_fetcher, "_auth_path", lambda: path)
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _fail_if_called)
+    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
 
     assert codex_fetcher.fetch().fetch_error == "no_credentials"
 
@@ -329,7 +254,7 @@ def test_expired_token_skips_the_network(monkeypatch):
         "_read_credentials",
         lambda: codex_fetcher.CodexCredentials("tok", "acct", expired_at),
     )
-    monkeypatch.setattr(codex_fetcher.httpx, "get", _fail_if_called)
+    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
 
     data = codex_fetcher.fetch()
 
@@ -344,9 +269,7 @@ def test_unexpired_token_makes_the_request(monkeypatch):
         "_read_credentials",
         lambda: codex_fetcher.CodexCredentials("tok", "acct", expires_at),
     )
-    monkeypatch.setattr(
-        codex_fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, _usage_body())
-    )
+    _answers(monkeypatch, _FakeResponse(200, _usage_body()))
 
     assert codex_fetcher.fetch().status_code == 200
 
@@ -420,3 +343,31 @@ def test_usage_window_maps_percent_and_reset():
 
 def test_usage_window_of_nothing_is_none():
     assert codex_fetcher._usage_window(None) is None
+
+
+def test_usage_windows_reads_both_of_the_rate_limit_windows():
+    five_hour, seven_day = codex_fetcher._usage_windows(_usage_body())
+
+    assert five_hour.utilization == 12.5
+    assert seven_day.utilization == 64.0
+
+
+def test_usage_windows_raises_on_a_window_it_cannot_read():
+    # The shared request turns this into bad_response rather than a number.
+    with pytest.raises(Exception):
+        codex_fetcher._usage_windows(_usage_body(primary={"used_percent": "lots"}))
+
+
+def test_the_endpoint_is_built_from_the_credentials(monkeypatch):
+    monkeypatch.setattr(
+        codex_fetcher,
+        "_read_credentials",
+        lambda: codex_fetcher.CodexCredentials("tok", "acct", None),
+    )
+
+    endpoint = codex_fetcher._endpoint()
+
+    assert endpoint.url == "https://chatgpt.com/backend-api/wham/usage"
+    assert endpoint.headers["Authorization"] == "Bearer tok"
+    assert endpoint.headers["ChatGPT-Account-Id"] == "acct"
+    assert endpoint.expires_at is None

@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from claudemonitor.models import LabelSegment, Rect
+from claudemonitor.models import CLAUDE, LabelSegment, Rect
 from claudemonitor.taskbar_companion import (
     DisabledTaskbarCompanion,
     TaskbarCompanion,
@@ -208,7 +208,7 @@ class _FakeNativeWindow:
 
 def _segments(*texts: str) -> list[LabelSegment]:
     """Build a Claude-only label from plain strings, as most tests want."""
-    return [LabelSegment(provider_key="claude", text=text) for text in texts]
+    return [LabelSegment(provider=CLAUDE, text=text) for text in texts]
 
 
 def _text_of(segments) -> str:

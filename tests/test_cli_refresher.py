@@ -3,16 +3,15 @@ from __future__ import annotations
 import subprocess
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from claudemonitor import cli_refresher
 from claudemonitor.cli_refresher import (
     SessionNudger,
-    _claude_command,
-    _codex_command,
     needs_session_nudge,
-    run_claude_cli,
-    run_codex_cli,
+    run_provider_cli,
 )
-from claudemonitor.models import ProviderUsageData, UsageWindow
+from claudemonitor.models import CLAUDE, CODEX, PROVIDERS, ProviderUsageData, UsageWindow
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -79,7 +78,8 @@ class TestSessionNudgeEndToEnd:
     def _nudger(self, *, runner: _RecordingRunner, **kwargs) -> tuple[SessionNudger, list[str]]:
         refreshed: list[str] = []
         nudger = SessionNudger(
-            invoke=lambda: run_claude_cli(which=_which_finds_claude, run=runner),
+            CLAUDE,
+            invoke=lambda: run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner),
             on_refreshed=lambda: refreshed.append("refreshed"),
             start_background=_run_immediately,
             clock=lambda: 0.0,
@@ -148,7 +148,8 @@ class TestSessionNudgeEndToEnd:
         elapsed = [0.0]
         refreshed: list[str] = []
         nudger = SessionNudger(
-            invoke=lambda: run_claude_cli(which=_which_finds_claude, run=runner),
+            CLAUDE,
+            invoke=lambda: run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner),
             on_refreshed=lambda: refreshed.append("refreshed"),
             start_background=_run_immediately,
             clock=lambda: elapsed[0],
@@ -192,52 +193,95 @@ class TestNeedsSessionNudge:
         assert needs_session_nudge(usage()) is False
 
 
-class TestClaudeCommand:
-    """_claude_command: the exact argv handed to the resolved Claude executable."""
+class TestWhatEachProviderAsksItsCli:
+    """The argv is the provider's own data now, not a function per provider."""
 
-    def test_asks_haiku_for_the_cheapest_possible_reply(self):
-        assert _claude_command("claude.EXE") == [
-            "claude.EXE",
-            "-p",
-            "--model",
-            "haiku",
-            "hi",
-        ]
+    def test_claude_asks_haiku_for_the_cheapest_possible_reply(self):
+        assert CLAUDE.cli_arguments == ("-p", "--model", "haiku", "hi")
+
+    def test_codex_runs_a_non_interactive_turn(self):
+        assert CODEX.cli_arguments[0] == "exec"
+        assert CODEX.cli_arguments[-1] == "hi"
+
+    def test_codex_refuses_to_touch_the_users_files(self):
+        # The nudge only exists to make one authenticated request. A sandbox
+        # that could write would let an off-hand model reply edit real files.
+        arguments = CODEX.cli_arguments
+        assert arguments[arguments.index("--sandbox") + 1] == "read-only"
+
+    def test_codex_does_not_require_a_git_repository(self):
+        # The tray app runs from wherever Windows launched it, which is usually
+        # not a repository; without this the CLI refuses to start at all.
+        assert "--skip-git-repo-check" in CODEX.cli_arguments
+
+    def test_every_provider_names_an_executable_and_a_prompt(self):
+        for provider in PROVIDERS:
+            assert provider.cli_executable, provider
+            assert provider.cli_arguments, provider
 
 
-class TestRunClaudeCli:
-    """run_claude_cli: turns one CLI invocation into 'did it answer?'."""
+class TestRunProviderCli:
+    """One runner for every provider: "did the CLI answer?", and never a raise."""
+
+    @pytest.mark.parametrize("provider", PROVIDERS)
+    def test_the_providers_own_executable_is_looked_up(self, provider):
+        looked_up: list[str] = []
+
+        def which(name):
+            looked_up.append(name)
+            return name + ".EXE"
+
+        run_provider_cli(provider, which=which, run=_RecordingRunner())
+
+        assert looked_up == [provider.cli_executable]
+
+    @pytest.mark.parametrize("provider", PROVIDERS)
+    def test_the_resolved_executable_is_run_with_the_providers_arguments(
+        self, provider
+    ):
+        runner = _RecordingRunner()
+
+        run_provider_cli(provider, which=lambda name: name + ".EXE", run=runner)
+
+        command, _kwargs = runner.calls[0]
+        assert command == [provider.cli_executable + ".EXE", *provider.cli_arguments]
 
     def test_reports_success_when_the_cli_prints_a_reply(self):
         runner = _RecordingRunner(_CompletedProcess(stdout="Hello! How can I help?"))
-        assert run_claude_cli(which=_which_finds_claude, run=runner) is True
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is True
 
-    def test_reports_failure_when_claude_is_not_installed(self):
+    def test_reports_failure_when_the_cli_is_not_installed(self):
         runner = _RecordingRunner()
-        assert run_claude_cli(which=_which_finds_nothing, run=runner) is False
+        assert run_provider_cli(CLAUDE, which=_which_finds_nothing, run=runner) is False
         assert runner.calls == []
 
     def test_reports_failure_on_a_non_zero_exit_code(self):
-        runner = _RecordingRunner(_CompletedProcess(returncode=1, stdout="", stderr="boom"))
-        assert run_claude_cli(which=_which_finds_claude, run=runner) is False
+        runner = _RecordingRunner(
+            _CompletedProcess(returncode=1, stdout="", stderr="boom")
+        )
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
 
     def test_reports_failure_on_empty_output(self):
-        runner = _RecordingRunner(_CompletedProcess(stdout=""))
-        assert run_claude_cli(which=_which_finds_claude, run=runner) is False
+        runner = _RecordingRunner(_CompletedProcess(stdout="   "))
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
 
     def test_reports_failure_when_the_cli_hangs_past_the_timeout(self):
         runner = _RecordingRunner(
             raises=subprocess.TimeoutExpired(cmd="claude", timeout=120)
         )
-        assert run_claude_cli(which=_which_finds_claude, run=runner) is False
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
+
+    def test_reports_failure_when_the_cli_cannot_be_launched(self):
+        runner = _RecordingRunner(raises=OSError("not executable"))
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
 
     def test_never_lets_an_unexpected_error_escape(self):
         runner = _RecordingRunner(raises=RuntimeError("unexpected"))
-        assert run_claude_cli(which=_which_finds_claude, run=runner) is False
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
 
     def test_captures_output_under_a_timeout_and_hides_the_console_window(self):
         runner = _RecordingRunner()
-        run_claude_cli(which=_which_finds_claude, run=runner)
+        run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
 
         _command, kwargs = runner.calls[0]
         assert kwargs["capture_output"] is True
@@ -252,10 +296,15 @@ class TestRunClaudeCli:
         let whatever the user types during a nudge become part of the request.
         """
         runner = _RecordingRunner()
-        run_claude_cli(which=_which_finds_claude, run=runner)
+        run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
 
         _command, kwargs = runner.calls[0]
         assert kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_a_nudger_given_no_invoker_runs_its_own_providers_cli(self):
+        # This is what deleted create_codex_nudger: a nudger knows which CLI
+        # answers for it, so nothing has to pair the two up from outside.
+        assert SessionNudger(CODEX).provider is CODEX
 
 
 class TestCircuitBreaker:
@@ -266,6 +315,7 @@ class TestCircuitBreaker:
     def _nudger(self, *, succeeds: bool, cooldown_seconds: float = 0.0):
         attempts: list[str] = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: attempts.append("attempt") or succeeds,
             start_background=_run_immediately,
             clock=lambda: 0.0,
@@ -306,6 +356,7 @@ class TestCircuitBreaker:
         attempts: list[bool] = []
         outcomes = iter([False, False, True, False, False])
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: attempts.append(True) or next(outcomes),
             start_background=_run_immediately,
             clock=lambda: 0.0,
@@ -354,6 +405,7 @@ class TestCircuitBreaker:
             raise RuntimeError("subprocess layer blew up")
 
         nudger = SessionNudger(
+            CLAUDE,
             invoke=explode,
             start_background=_run_immediately,
             clock=lambda: 0.0,
@@ -369,6 +421,7 @@ class TestCircuitBreaker:
     def test_the_failure_limit_is_configurable(self):
         attempts: list[str] = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: attempts.append("attempt") or False,
             start_background=_run_immediately,
             clock=lambda: 0.0,
@@ -392,6 +445,7 @@ class TestRuntimeToggle:
     def _nudger(self, *, enabled: bool):
         started: list[str] = []
         nudger = SessionNudger(
+            CLAUDE,
             enabled=enabled,
             invoke=lambda: started.append("invoked") or True,
             start_background=_run_immediately,
@@ -427,6 +481,7 @@ class TestRuntimeToggle:
     def test_re_enabling_does_not_reset_the_cooldown(self):
         elapsed = [0.0]
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: True,
             start_background=_run_immediately,
             clock=lambda: elapsed[0],
@@ -445,6 +500,7 @@ class TestRuntimeToggle:
         # kept the value it started with would ignore it until the next launch.
         elapsed = [0.0]
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: True,
             start_background=_run_immediately,
             clock=lambda: elapsed[0],
@@ -460,6 +516,7 @@ class TestRuntimeToggle:
     def test_a_longer_cooldown_takes_effect_at_once(self):
         elapsed = [0.0]
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: True,
             start_background=_run_immediately,
             clock=lambda: elapsed[0],
@@ -480,6 +537,7 @@ class TestConcurrentNudges:
         started: list[ProviderUsageData] = []
         pending: list = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: started.append("invoked") or True,
             start_background=pending.append,
             clock=lambda: 0.0,
@@ -495,6 +553,7 @@ class TestConcurrentNudges:
         elapsed = [0.0]
         pending: list = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: True,
             start_background=pending.append,
             clock=lambda: elapsed[0],
@@ -541,91 +600,6 @@ class TestCodexSharesTheNudgeRule:
         assert not hasattr(cli_refresher, "needs_codex_nudge")
 
 
-class TestCodexCommand:
-    """The argv for the cheapest turn that still forces a token refresh."""
-
-    def test_runs_a_non_interactive_turn(self):
-        command = _codex_command("codex.CMD")
-
-        assert command[0] == "codex.CMD"
-        assert command[1] == "exec"
-        assert command[-1] == "hi"
-
-    def test_refuses_to_touch_the_users_files(self):
-        # The nudge only exists to make one authenticated request. A sandbox
-        # that could write would let an off-hand model reply edit real files.
-        command = _codex_command("codex.CMD")
-
-        assert "--sandbox" in command
-        assert command[command.index("--sandbox") + 1] == "read-only"
-
-    def test_does_not_require_a_git_repository(self):
-        # The tray app runs from wherever Windows launched it, which is usually
-        # not a repository; without this the CLI refuses to start at all.
-        assert "--skip-git-repo-check" in _codex_command("codex.CMD")
-
-
-class TestRunCodexCli:
-    """run_codex_cli reports success or failure and never raises."""
-
-    def test_missing_executable_reports_failure(self):
-        runner = _RecordingRunner()
-
-        assert run_codex_cli(which=_which_finds_nothing, run=runner) is False
-        assert runner.calls == []
-
-    def test_successful_reply_reports_success(self):
-        runner = _RecordingRunner(_CompletedProcess(returncode=0, stdout="hi there"))
-
-        assert run_codex_cli(which=_which_finds_codex, run=runner) is True
-
-    def test_looks_up_the_codex_executable(self):
-        looked_up: list[str] = []
-
-        def _which(name):
-            looked_up.append(name)
-            return "codex.CMD"
-
-        run_codex_cli(which=_which, run=_RecordingRunner())
-
-        assert looked_up == ["codex"]
-
-    def test_non_zero_exit_reports_failure(self):
-        runner = _RecordingRunner(_CompletedProcess(returncode=1, stdout="", stderr="nope"))
-
-        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
-
-    def test_silent_success_reports_failure(self):
-        runner = _RecordingRunner(_CompletedProcess(returncode=0, stdout="   "))
-
-        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
-
-    def test_timeout_reports_failure(self):
-        runner = _RecordingRunner(
-            raises=subprocess.TimeoutExpired(cmd="codex", timeout=1)
-        )
-
-        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
-
-    def test_launch_error_reports_failure(self):
-        runner = _RecordingRunner(raises=OSError("not executable"))
-
-        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
-
-    def test_unexpected_error_reports_failure(self):
-        runner = _RecordingRunner(raises=RuntimeError("something else"))
-
-        assert run_codex_cli(which=_which_finds_codex, run=runner) is False
-
-    def test_stdin_is_closed_so_a_prompt_cannot_block(self):
-        runner = _RecordingRunner()
-
-        run_codex_cli(which=_which_finds_codex, run=runner)
-
-        _command, kwargs = runner.calls[0]
-        assert kwargs["stdin"] is subprocess.DEVNULL
-
-
 def _only_on_expiry(data: ProviderUsageData) -> bool:
     """A stub predicate that ignores everything except an expired token."""
     return data.fetch_error == "token_expired"
@@ -637,6 +611,7 @@ class TestNudgerHonorsItsPredicate:
     def test_an_injected_predicate_can_suppress_the_idle_window_nudge(self):
         calls: list[int] = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: (calls.append(1), True)[1],
             needs_nudge=_only_on_expiry,
             start_background=_run_immediately,
@@ -648,6 +623,7 @@ class TestNudgerHonorsItsPredicate:
     def test_an_injected_predicate_fires_on_what_it_accepts(self):
         calls: list[int] = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: (calls.append(1), True)[1],
             needs_nudge=_only_on_expiry,
             start_background=_run_immediately,
@@ -660,6 +636,7 @@ class TestNudgerHonorsItsPredicate:
         # An idle window is "nothing left to fix" under this stub rule, so a
         # run of failures must be forgiven once fetches recover.
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: False,
             needs_nudge=_only_on_expiry,
             cooldown_seconds=0,
@@ -676,6 +653,7 @@ class TestNudgerHonorsItsPredicate:
     def test_the_shared_rule_is_the_default_predicate(self):
         calls: list[int] = []
         nudger = SessionNudger(
+            CLAUDE,
             invoke=lambda: (calls.append(1), True)[1],
             start_background=_run_immediately,
         )

@@ -7,25 +7,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```
 claudemonitor/
   main.py                 — entry point; logging setup, single-instance mutex, poll loop, wires everything together
-  fetcher.py              — calls Anthropic API; always returns ProviderUsageData (errors included, never raises)
-  codex_fetcher.py        — same contract for Codex: reads ~/.codex/auth.json, GETs the ChatGPT usage endpoint
+  usage_request.py        — the one HTTP usage request both providers make, and the single ladder of
+                            ways it fails; nothing raises across this boundary
+  fetcher.py              — what is Claude's own: its credentials file, its URL, its body shape
+  codex_fetcher.py        — the same for Codex: ~/.codex/auth.json, the ChatGPT usage endpoint
   processor.py            — pure functions: ProviderUsageData -> DisplayState, plus the combining of
-                            those states into one TrayState and one TaskbarLabel; owns all formatting
+                            those states into one TrayState and one TaskbarLabel; owns all formatting,
+                            including the one row per FetchError that every surface reads
   tray.py                 — drives the one pystray icon; init() must be called before apply()
   icon_art.py             — pure Pillow drawing of the tray status tiles (no pystray, no Windows state)
   label_art.py            — pure Pillow composition of the taskbar label's bitmap: which mark a
                             provider gets, the room around a stacked row, and the bytes Windows reads
-  models.py               — shared cross-layer types: Provider, UsageWindow, ProviderUsageData,
-                            DisplayState, TrayState, LabelSegment, TaskbarLabel, Rect
-  config.py               — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config
+  models.py               — shared cross-layer types: Provider (and the CLAUDE/CODEX constants),
+                            FetchError, UsageWindow, ProviderUsageData, DisplayState, TrayState,
+                            LabelSegment, TaskbarLabel, Rect
+  config.py               — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config and
+                            one ConfigSetting per writable value (read it, change it, save it)
   notifications.py        — decides when a threshold crossing warrants a desktop notification
-  cli_refresher.py        — runs the provider CLI to wake an idle session or an expired token
+  cli_refresher.py        — runs a provider's CLI to wake an idle session or an expired token
   settings.py             — the tabs, groups, and fields the settings window contains, the buffer that
                             holds an edit until Apply, and the one-window-at-a-time controller
+  settings_layout.py      — where every control in that window sits; pure geometry, no user32
   taskbar_companion.py    — controller for the taskbar usage label: owns its UI thread and placement maths
   win32_taskbar_window.py — user32/gdi32 for the taskbar label; implements the NativeWindow protocol.
                             Rasterises the text and hands Windows one finished bitmap (see below)
   win32_settings_window.py — user32/gdi32 for the settings dialog; implements the SettingsView protocol
+  win32_dpi.py            — this process's DPI awareness, and what a 96-DPI constant is worth on it
   win32_text.py           — the system UI font and text measurement, shared by both windows
   win32_bindings.py       — Windows constants, C structs, and function signature tables (no behavior)
 
@@ -74,7 +81,9 @@ docs/
 
 Logs are written to `%APPDATA%\claudemonitor\claudemonitor.log` (rotating, 1 MB × 3 files).
 
-Every successful fetch logs one INFO line: `fetched 5h=87% 7d=64%` for Claude and `fetched codex 5h=12% 7d=64%` for Codex. Errors log as WARNING. Unhandled poll-loop exceptions log as ERROR with a full traceback.
+Every successful fetch logs one INFO line naming its provider: `fetched claude 5h=87% 7d=64%`,
+`fetched codex 5h=12% 7d=64%`. Errors log as WARNING, and the provider is named there too. Unhandled
+poll-loop exceptions log as ERROR with a full traceback.
 
 To open the log folder from the tray: right-click icon → **Open log folder**.
 
@@ -89,13 +98,45 @@ All architecture docs are in `docs/`. Start with `docs/design-v1.md` for the ful
 
 ### Two providers
 
-Claude and Codex share every module. What differs is held in `models.Provider` (identity) and in the
-`_WORDING` table in `processor.py` (every user-facing sentence). Adding a third provider means a new
-fetcher, a `Provider` constant, a `_WORDING` entry, and a glyph — nothing else.
+Claude and Codex share every module. Everything that varies is a field on `models.Provider`: its key
+and label, its usage URL, the CLI that renews its token and the argv to run, the fetcher that answers
+for it, and the `ConfigSetting` that switches it off (`None` for Claude, which is always tracked).
+Nothing else in the application branches on which provider it is holding, and no function names one.
+
+Adding a third provider is therefore:
+
+1. a fetcher module — the credentials, the URL, and the body shape; the request itself is shared;
+2. a `Provider` constant in `models.py`, plus the small deferred-import shim that calls its fetcher
+   (deferred because the fetcher imports `models` for its return type);
+3. a `_WORDING` entry in `processor.py` — every sentence about a provider is written there;
+4. a glyph: a mask builder in `icon_art._GLYPH_MASKS` and a tone pair in `label_art._GLYPH_COLORS`;
+5. and, only if the user may switch it off, a `[section]` in the seeded config with a `ConfigSetting`.
+
+Each of those refuses to be forgotten: a missing wording, glyph, or tone raises rather than quietly
+borrowing another provider's.
 
 Both providers are judged by one nudge rule in `cli_refresher.py`: an expired token, or an untouched
 five-hour window. Codex briefly had a rule of its own, and the result was that an idle Codex window —
 the one state a single message repairs — was never woken.
+
+### One row per failure
+
+`models.FetchError` is a closed set, and `processor._ERROR_DISPLAY` gives each value one row holding
+all three things a failure is shown as: the short taskbar label, the menu status prefix, and the
+tooltip sentence. These were three tables written in the same order, and a value present in two of
+them but missing from the third fell through to wording that fitted a different failure. A fetcher
+that meets something it cannot name writes `unknown` and puts the detail in the log.
+
+### One name per setting
+
+A writable setting is one `config.ConfigSetting(section, key)`. The TOML section names and the
+`Config` attribute names are the same word, so that one pair reads the setting, changes it in the
+running application, and writes it back. `save` logs rather than raises: every caller runs on a UI
+thread and has already changed something the user can see, so a file that cannot be written must not
+undo that. The section and the key used to be spelled twice for every setting — once in a `save_*`
+wrapper, once as an attribute string in `main` — and the write passed through four layers.
+
+### One icon, one label
 
 One tray icon speaks for every provider. `processor.tray_status()` condenses the display states into a
 `TrayState`: the most severe colour, one tooltip line per provider, one menu status line per provider.
@@ -132,9 +173,11 @@ Consequences worth knowing:
 ### Where a setting lives
 
 The tray menu keeps only what a user reaches for mid-task: the status lines, Refresh now, the taskbar
-toggle, Settings…, Quit. Every other switch, number, and link is in the settings window
-(`settings.py` plus `win32_settings_window.py`), which runs on a thread of its own because pystray
-owns the thread a menu click arrives on.
+toggle, Settings…, Quit. Every other switch, number, and link is in the settings window, which runs on
+a thread of its own because pystray owns the thread a menu click arrives on. That window is three
+modules: `settings.py` says what it contains, `settings_layout.py` works out where each of those
+things sits, and `win32_settings_window.py` is the only one that calls user32. The first two are
+tested without a desktop.
 
 The window is a tabbed dialog — General, Providers, Taskbar — of captioned group boxes, with
 OK / Cancel / Apply along the bottom. **Nothing is written as it is clicked.** Every change goes into
@@ -158,6 +201,9 @@ Four arrangements are load-bearing, and each one was a visible bug first:
   fields it surrounds, and the tab control is pushed to the back once its pages exist.
 - **A group's caption is a static of ours, not the group box's title.** A group box paints its title
   in whichever colour the visual style picks, which on a dark page is black on near-black.
+- **A field is routed by its position, not by its identity.** Two fields wired the same way are equal
+  frozen dataclasses, so searching the field list for one of them would find the first for both. The
+  index a field is created under is carried through to the control it gets.
 - **The tab strip is painted by hand in dark mode.** `SysTabControl32` has no dark rendering and
   ignores `DarkMode_Explorer`, so left alone it draws a white strip and a white line round the page
   on an otherwise near-black dialog. The control is subclassed and answers `WM_PAINT` here; it still

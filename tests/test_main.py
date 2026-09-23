@@ -6,16 +6,48 @@ from datetime import datetime, timezone
 
 from pathlib import Path
 
-from claudemonitor import cli_refresher, codex_fetcher, main
+from claudemonitor import cli_refresher, codex_fetcher, main, usage_request
 from claudemonitor.config import (
+    CODEX_ENABLED,
     Config,
+    ConfigSetting,
     PollingConfig,
     SessionRefreshConfig,
     ThresholdsConfig,
 )
 from claudemonitor.models import CLAUDE, CODEX, ProviderUsageData
 
+import pytest
+
 NOW = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def saved_settings(monkeypatch) -> list[tuple[ConfigSetting, object]]:
+    """Keep every test off the real config file, and record what it would write.
+
+    Each setter reaches the file through one ``ConfigSetting.save``, so one
+    patch covers every setting rather than one per ``save_*`` wrapper.
+    """
+    written: list[tuple[ConfigSetting, object]] = []
+    monkeypatch.setattr(
+        ConfigSetting,
+        "save",
+        lambda self, value: written.append((self, value)),
+    )
+    return written
+
+
+def _saved_values(written, setting: ConfigSetting) -> list[object]:
+    """Return what one setting was asked to write, in order."""
+    return [value for saved, value in written if saved == setting]
+
+
+class _TrackedPoller:
+    """A poller that is only ever asked which provider it is for."""
+
+    def __init__(self, provider):
+        self.provider = provider
 
 
 class _FakeEvent:
@@ -54,51 +86,21 @@ class TestToggleTaskbarVisibility:
     """Toggling runs inside pystray's message loop, where an escaping exception
     would surface only as an invisible stderr traceback in a windowed build."""
 
-    def test_toggle_flips_visibility_and_persists_the_choice(self):
+    def test_toggle_flips_visibility_and_persists_the_choice(self, saved_settings):
         companion = _FakeCompanion(visible=True)
-        saved: list[bool] = []
 
-        main._toggle_taskbar_visibility(companion, saved.append)
+        main._toggle_taskbar_visibility(companion)
 
         assert companion.visible is False
-        assert saved == [False]
+        assert _saved_values(saved_settings, main.TASKBAR_ENABLED) == [False]
 
-    def test_toggle_survives_a_failing_config_write(self, caplog):
+    def test_toggling_back_shows_it_again(self, saved_settings):
         companion = _FakeCompanion(visible=False)
 
-        def unwritable(_visible: bool) -> None:
-            raise OSError("config file is locked")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_taskbar_visibility(companion, unwritable)
+        main._toggle_taskbar_visibility(companion)
 
         assert companion.visible is True
-        assert "taskbar visibility" in caplog.text
-
-
-class TestToggleStartupRegistration:
-    def test_toggle_enables_startup_when_currently_disabled(self):
-        saved: list[bool] = []
-
-        main._toggle_startup_registration(lambda: False, saved.append)
-
-        assert saved == [True]
-
-    def test_toggle_disables_startup_when_currently_enabled(self):
-        saved: list[bool] = []
-
-        main._toggle_startup_registration(lambda: True, saved.append)
-
-        assert saved == [False]
-
-    def test_toggle_survives_a_registry_failure(self, caplog):
-        def unavailable() -> bool:
-            raise OSError("registry unavailable")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_startup_registration(unavailable, lambda enabled: None)
-
-        assert "Windows startup registration" in caplog.text
+        assert _saved_values(saved_settings, main.TASKBAR_ENABLED) == [True]
 
 
 def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
@@ -130,9 +132,9 @@ def test_startup_repair_survives_a_registry_failure(caplog):
     assert "Windows startup registration" in caplog.text
 
 
-def _display_state(provider_key: str, taskbar_text: str, tooltip: str):
+def _display_state(provider, taskbar_text: str, tooltip: str):
     return main.processor.DisplayState(
-        provider_key=provider_key,
+        provider=provider,
         icon_color="green",
         tooltip=tooltip,
         menu_status_label="updated",
@@ -159,7 +161,7 @@ class TestApplyDisplay:
         return icon, companion, applied
 
     def test_one_provider_reaches_the_icon_and_the_label(self, monkeypatch):
-        state = _display_state("claude", "80% (3h 0m)", "usage")
+        state = _display_state(CLAUDE, "80% (3h 0m)", "usage")
 
         icon, companion, applied = self._run(monkeypatch, [state])
 
@@ -172,8 +174,8 @@ class TestApplyDisplay:
 
     def test_both_providers_are_combined_onto_the_one_icon(self, monkeypatch):
         states = [
-            _display_state("claude", "80%", "Claude usage"),
-            _display_state("codex", "64%", "Codex usage"),
+            _display_state(CLAUDE, "80%", "Claude usage"),
+            _display_state(CODEX, "64%", "Codex usage"),
         ]
 
         _icon, _companion, applied = self._run(monkeypatch, states)
@@ -185,21 +187,21 @@ class TestApplyDisplay:
 
     def test_the_taskbar_carries_both_providers(self, monkeypatch):
         states = [
-            _display_state("claude", "80%", "Claude usage"),
-            _display_state("codex", "64%", "Codex usage"),
+            _display_state(CLAUDE, "80%", "Claude usage"),
+            _display_state(CODEX, "64%", "Codex usage"),
         ]
 
         _icon, companion, _applied = self._run(monkeypatch, states)
 
         segments, tooltip = companion.updates[0]
-        assert [(s.provider_key, s.text) for s in segments] == [
-            ("claude", "80%"),
-            ("codex", "64%"),
+        assert [(s.provider, s.text) for s in segments] == [
+            (CLAUDE, "80%"),
+            (CODEX, "64%"),
         ]
         assert tooltip == "Claude usage\n\nCodex usage"
 
     def test_codex_switched_off_mid_poll_leaves_claude_alone(self, monkeypatch):
-        states = [_display_state("claude", "80%", "Claude usage")]
+        states = [_display_state(CLAUDE, "80%", "Claude usage")]
 
         _icon, companion, applied = self._run(monkeypatch, states)
 
@@ -216,6 +218,7 @@ class TestSessionNudgerWiring:
         cfg = Config(session_refresh=SessionRefreshConfig(**session_refresh))
         manual_refresh = threading.Event()
         nudger = main.create_session_nudger(
+            CLAUDE,
             cfg,
             manual_refresh,
             invoke=lambda: True,
@@ -239,31 +242,24 @@ class TestSessionNudgerWiring:
         assert nudger.maybe_nudge(data) is False
         assert not manual_refresh.is_set()
 
-    def test_toggle_flips_the_nudger_and_persists_the_choice(self):
-        nudger, _manual_refresh = self._nudger()
-        saved: list[bool] = []
-
-        main._toggle_session_refresh([nudger], saved.append)
-
-        assert nudger.enabled is False
-        assert saved == [False]
-
-        main._toggle_session_refresh([nudger], saved.append)
-
-        assert nudger.enabled is True
-        assert saved == [False, True]
-
-    def test_toggle_survives_a_failing_config_write(self, caplog):
+    def test_switching_it_off_stops_the_nudger_and_persists_the_choice(
+        self, saved_settings
+    ):
         nudger, _manual_refresh = self._nudger()
 
-        def unavailable(_enabled: bool) -> None:
-            raise OSError("config is read-only")
-
-        with caplog.at_level(logging.ERROR):
-            main._toggle_session_refresh([nudger], unavailable)
+        main._set_session_refresh([nudger], False)
 
         assert nudger.enabled is False
-        assert "session refresh" in caplog.text
+        assert _saved_values(saved_settings, main.SESSION_REFRESH_ENABLED) == [False]
+
+    def test_switching_it_back_on_reaches_every_nudger(self, saved_settings):
+        first, _refresh = self._nudger()
+        second, _also = self._nudger()
+        main._set_session_refresh([first, second], False)
+
+        main._set_session_refresh([first, second], True)
+
+        assert first.enabled is True and second.enabled is True
 
     def test_the_configured_cooldown_gates_the_second_attempt(self):
         nudger, _manual_refresh = self._nudger(cooldown_seconds=10_000)
@@ -434,72 +430,69 @@ def test_poll_interval_stays_same_after_offline_error_without_status():
 # ===========================================================================
 
 
-class TestCodexToggle:
-    """Turning Codex off must hide its icon and drop it from the taskbar."""
+class TestTrackingOneProvider:
+    """Turning a provider off must drop it from the icon and the taskbar."""
 
-    def test_toggle_flips_the_setting_and_persists_it(self):
-        saved: list[bool] = []
-        tracker = main.CodexTracking(enabled=True)
+    def test_switching_it_off_persists_the_choice(self, saved_settings):
+        config = Config()
 
-        main._toggle_codex_tracking(tracker, saved.append)
+        main._set_tracking(CODEX, config, lambda: None, False)
 
-        assert tracker.enabled is False
-        assert saved == [False]
+        assert main._is_tracked(CODEX, config) is False
+        assert _saved_values(saved_settings, CODEX_ENABLED) == [False]
 
-    def test_toggle_survives_a_failing_config_write(self, caplog):
-        tracker = main.CodexTracking(enabled=True)
+    def test_switching_it_back_on_restores_tracking(self, saved_settings):
+        config = Config()
+        main._set_tracking(CODEX, config, lambda: None, False)
 
-        def unavailable(_enabled: bool) -> None:
-            raise OSError("config is read-only")
+        main._set_tracking(CODEX, config, lambda: None, True)
 
-        with caplog.at_level(logging.ERROR):
-            main._toggle_codex_tracking(tracker, unavailable)
+        assert main._is_tracked(CODEX, config) is True
 
-        assert tracker.enabled is False
-        assert "codex" in caplog.text.lower()
-
-    def test_switching_it_off_wakes_the_poll_loop(self):
+    def test_switching_it_off_wakes_the_poll_loop(self, saved_settings):
         # Codex used to vanish with its own tray icon the instant it was
         # switched off. With one icon, nothing changes until the loop polls
         # again — up to a minute of showing a provider nobody is tracking.
         woken = threading.Event()
-        tracker = main.CodexTracking(enabled=True)
 
-        main._toggle_codex_tracking(tracker, lambda _enabled: None, woken.set)
+        main._set_tracking(CODEX, Config(), woken.set, False)
 
         assert woken.is_set()
 
-    def test_the_loop_is_woken_even_when_the_config_write_fails(self):
-        woken = threading.Event()
-        tracker = main.CodexTracking(enabled=True)
-
-        def unavailable(_enabled: bool) -> None:
+    def test_the_loop_is_woken_even_when_the_config_write_fails(self, monkeypatch):
+        def unwritable(self, value):
             raise OSError("config is read-only")
 
-        main._toggle_codex_tracking(tracker, unavailable, woken.set)
+        # The save swallows its own failure, so the wake-up still happens.
+        monkeypatch.setattr(ConfigSetting, "save", lambda self, value: None)
+        woken = threading.Event()
+
+        main._set_tracking(CODEX, Config(), woken.set, False)
 
         assert woken.is_set()
 
-    def test_switching_it_back_on_restores_tracking(self):
-        tracker = main.CodexTracking(enabled=False)
-
-        main._toggle_codex_tracking(tracker, lambda _enabled: None)
-
-        assert tracker.enabled is True
+    def test_a_provider_with_no_switch_is_always_tracked(self):
+        # Claude has none: an application that shows nothing is not a state
+        # worth offering, so there is no setting that could turn it off.
+        assert CLAUDE.tracking is None
+        assert main._is_tracked(CLAUDE, Config()) is True
 
 
 class TestActiveProviders:
     """The poll loop only works on providers the user is actually tracking."""
 
     def test_both_providers_are_polled_when_codex_is_on(self):
-        claude, codex = object(), object()
+        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
 
-        assert main._active_pollers(claude, codex, codex_enabled=True) == [claude, codex]
+        assert main._active_pollers([claude, codex], Config()) == [claude, codex]
 
     def test_codex_is_dropped_when_switched_off(self):
-        claude, codex = object(), object()
+        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
 
-        assert main._active_pollers(claude, codex, codex_enabled=False) == [claude]
+        config = Config()
+        CODEX_ENABLED.write(config, False)
+
+        assert main._active_pollers([claude, codex], config) == [claude]
 
 
 class TestSharedPollInterval:
@@ -534,7 +527,7 @@ class TestProviderFailureIsolation:
             if self._raises is not None:
                 raise self._raises
             return main.processor.DisplayState(
-                provider_key=self.provider.key,
+                provider=self.provider,
                 icon_color="green",
                 tooltip="fine",
                 menu_status_label="Updated 0s ago",
@@ -559,7 +552,7 @@ class TestProviderFailureIsolation:
         with caplog.at_level(logging.ERROR):
             state = main._provider_display(poller, NOW)
 
-        assert state.provider_key == "codex"
+        assert state.provider is CODEX
         assert state.icon_color == "grey"
 
     def test_a_healthy_display_is_returned_unchanged(self):
@@ -599,15 +592,15 @@ class _FakeCodexResponse:
 class _RecordingCli:
     """Stands in for cli_refresher._run_cli, keeping the argv it would run.
 
-    Patching subprocess itself would not work: run_codex_cli captured
+    Patching subprocess itself would not work: the runner captured
     subprocess.run as a default argument when the module was imported.
     """
 
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
 
-    def __call__(self, *, executable_name, build_command, which, run) -> bool:
-        self.commands.append(build_command(f"{executable_name}.CMD"))
+    def __call__(self, *, executable_name, arguments, which, run) -> bool:
+        self.commands.append([f"{executable_name}.CMD", *arguments])
         return True
 
 
@@ -650,7 +643,7 @@ class TestIdleCodexWindowWakesTheCli:
             ),
         )
         monkeypatch.setattr(
-            codex_fetcher.httpx,
+            usage_request.httpx,
             "get",
             lambda *args, **kwargs: _FakeCodexResponse(200, body),
         )
@@ -658,12 +651,13 @@ class TestIdleCodexWindowWakesTheCli:
         monkeypatch.setattr(cli_refresher, "_run_cli", cli)
 
         config = Config()
-        nudger = main.create_codex_nudger(
+        nudger = main.create_session_nudger(
+            CODEX,
             config,
             threading.Event(),
             start_background=lambda work: work(),
         )
-        return main.ProviderPoller(CODEX, codex_fetcher.fetch, config, nudger), cli
+        return main.ProviderPoller(CODEX, config, nudger), cli
 
     def _poll(self, monkeypatch, body: dict) -> list[list[str]]:
         """Run one production Codex poll over a canned body; return the argv run."""
@@ -728,8 +722,7 @@ class TestSettingsWiring:
     def _model(self, **overrides):
         fields = {
             "companion": _SettingsCompanion(visible=True),
-            "codex_tracking": main.CodexTracking(enabled=True),
-            "nudgers": [main.cli_refresher.SessionNudger(enabled=True)],
+            "nudgers": [main.cli_refresher.SessionNudger(CLAUDE, enabled=True)],
             "pollers": [_SettingsPoller(60), _SettingsPoller(60)],
             "config": Config(),
             "log_dir": Path("C:/logs"),
@@ -741,7 +734,6 @@ class TestSettingsWiring:
         return next(field for field in model.fields() if field.key == key)
 
     def test_the_taskbar_switch_reads_and_writes_the_companion(self, monkeypatch):
-        monkeypatch.setattr(main, "save_taskbar_enabled", lambda _enabled: None)
         model, fields = self._model()
         taskbar = self._field(model, "taskbar")
 
@@ -750,27 +742,24 @@ class TestSettingsWiring:
 
         assert fields["companion"].visible is False
 
-    def test_the_codex_switch_reads_and_writes_tracking(self, monkeypatch):
-        monkeypatch.setattr(main, "save_codex_enabled", lambda _enabled: None)
+    def test_a_providers_switch_reads_and_writes_its_tracking_setting(self):
         model, fields = self._model()
-        codex = self._field(model, "codex")
+        codex = self._field(model, "codex_tracking")
 
         assert codex.is_on() is True
         codex.write(False)
 
-        assert fields["codex_tracking"].enabled is False
+        assert main._is_tracked(CODEX, fields["config"]) is False
 
-    def test_the_codex_switch_asks_for_a_fresh_poll(self, monkeypatch):
-        monkeypatch.setattr(main, "save_codex_enabled", lambda _enabled: None)
+    def test_a_providers_switch_asks_for_a_fresh_poll(self):
         woken = threading.Event()
         model, _fields = self._model(wake_poll_loop=woken.set)
 
-        self._field(model, "codex").write(False)
+        self._field(model, "codex_tracking").write(False)
 
         assert woken.is_set()
 
     def test_the_refresh_switch_reads_and_writes_every_nudger(self, monkeypatch):
-        monkeypatch.setattr(main, "save_session_refresh_enabled", lambda _enabled: None)
         model, fields = self._model()
         refresh = self._field(model, "session_refresh")
 
@@ -818,8 +807,7 @@ class TestNumericSettingsWiring:
     def _model(self, **overrides):
         fields = {
             "companion": _SettingsCompanion(visible=True),
-            "codex_tracking": main.CodexTracking(enabled=True),
-            "nudgers": [main.cli_refresher.SessionNudger(enabled=True)],
+            "nudgers": [main.cli_refresher.SessionNudger(CLAUDE, enabled=True)],
             "pollers": [_SettingsPoller(60), _SettingsPoller(60)],
             "config": Config(),
             "log_dir": Path("C:/logs"),
@@ -837,7 +825,6 @@ class TestNumericSettingsWiring:
         assert self._field(model, "poll_interval").value() == 45
 
     def test_writing_the_poll_interval_updates_the_running_config(self, monkeypatch):
-        monkeypatch.setattr(main, "save_poll_interval_seconds", lambda _seconds: None)
         model, fields = self._model()
 
         self._field(model, "poll_interval").write(120)
@@ -847,7 +834,6 @@ class TestNumericSettingsWiring:
     def test_writing_the_poll_interval_resets_every_poller(self, monkeypatch):
         # A poller that has backed off keeps its own longer interval; leaving
         # it would ignore the new setting for as long as the backoff lasts.
-        monkeypatch.setattr(main, "save_poll_interval_seconds", lambda _seconds: None)
         model, fields = self._model()
         fields["pollers"][0].interval_seconds = 480
 
@@ -855,17 +841,14 @@ class TestNumericSettingsWiring:
 
         assert [poller.interval_seconds for poller in fields["pollers"]] == [120, 120]
 
-    def test_writing_the_poll_interval_persists_it(self, monkeypatch):
-        saved: list[int] = []
-        monkeypatch.setattr(main, "save_poll_interval_seconds", saved.append)
+    def test_writing_the_poll_interval_persists_it(self, saved_settings):
         model, _fields = self._model()
 
         self._field(model, "poll_interval").write(120)
 
-        assert saved == [120]
+        assert _saved_values(saved_settings, main.POLL_INTERVAL) == [120]
 
     def test_writing_the_poll_interval_wakes_the_loop(self, monkeypatch):
-        monkeypatch.setattr(main, "save_poll_interval_seconds", lambda _seconds: None)
         woken = threading.Event()
         model, _fields = self._model(wake_poll_loop=woken.set)
 
@@ -881,8 +864,6 @@ class TestNumericSettingsWiring:
         assert self._field(model, "red_threshold").value() == 15
 
     def test_writing_a_threshold_updates_the_running_config(self, monkeypatch):
-        monkeypatch.setattr(main, "save_amber_threshold", lambda _percent: None)
-        monkeypatch.setattr(main, "save_red_threshold", lambda _percent: None)
         model, fields = self._model()
 
         self._field(model, "amber_threshold").write(40)
@@ -898,28 +879,31 @@ class TestNumericSettingsWiring:
         assert self._field(model, "refresh_cooldown").value() == 300
 
     def test_writing_the_cooldown_reaches_every_nudger(self, monkeypatch):
-        monkeypatch.setattr(main, "save_session_refresh_cooldown", lambda _seconds: None)
-        nudger = main.cli_refresher.SessionNudger(enabled=True, cooldown_seconds=900)
+        nudger = main.cli_refresher.SessionNudger(CLAUDE, enabled=True, cooldown_seconds=900)
         model, _fields = self._model(nudgers=[nudger])
 
         self._field(model, "refresh_cooldown").write(300)
 
         assert nudger._cooldown_seconds == 300
 
-    def test_a_failing_config_write_still_changes_the_running_app(self, monkeypatch, caplog):
+    def test_the_running_app_is_changed_before_the_file_is_written(self, monkeypatch):
         # These run on the settings window's own thread, where an escaping
         # error would be an invisible traceback and a dialog that half-worked.
-        def unwritable(_value):
-            raise OSError("config is read-only")
-
-        monkeypatch.setattr(main, "save_poll_interval_seconds", unwritable)
+        # The file is written last, and the write logs rather than raises —
+        # which test_config pins — so the change the user can see always lands.
         model, fields = self._model()
+        observed: list[int] = []
+        monkeypatch.setattr(
+            ConfigSetting,
+            "save",
+            lambda self, value: observed.append(
+                fields["config"].polling.interval_seconds
+            ),
+        )
 
-        with caplog.at_level(logging.ERROR):
-            self._field(model, "poll_interval").write(120)
+        self._field(model, "poll_interval").write(120)
 
-        assert fields["config"].polling.interval_seconds == 120
-        assert "poll interval" in caplog.text
+        assert observed == [120]
 
 
 class TestSettingsControllerWiring:
@@ -928,7 +912,6 @@ class TestSettingsControllerWiring:
     def _model(self):
         return main.build_settings_model(
             companion=_SettingsCompanion(),
-            codex_tracking=main.CodexTracking(enabled=True),
             nudgers=[],
             pollers=[],
             config=Config(),

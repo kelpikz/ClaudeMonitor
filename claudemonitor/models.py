@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel
+
+from .config import CODEX_ENABLED, ConfigSetting
 
 
 @dataclass(frozen=True)
@@ -46,23 +48,77 @@ class Insets:
     bottom: int
 
 
+def _claude_usage() -> "ProviderUsageData":
+    """Fetch Claude usage.
+
+    The import is deferred because ``fetcher`` imports this module for the
+    types it returns. Reaching for it only when a fetch is actually asked for
+    is what lets a provider carry its own fetcher rather than leaving the
+    application to keep a table of which one answers for which.
+    """
+    from . import fetcher
+
+    return fetcher.fetch()
+
+
+def _codex_usage() -> "ProviderUsageData":
+    """Fetch Codex usage; deferred for the same reason as Claude's."""
+    from . import codex_fetcher
+
+    return codex_fetcher.fetch()
+
+
 @dataclass(frozen=True)
 class Provider:
-    """Identify one usage source the app tracks.
+    """One usage source the app tracks, and everything that varies with it.
 
-    Only identity lives here. Every user-facing sentence about a provider is
-    written by ``processor.py``, which owns all display strings.
+    Adding a provider is adding one of these, the fetcher it names, a wording
+    entry in ``processor``, and a glyph in ``icon_art``. Nothing else branches
+    on which provider it is holding — every wrapper function that used to say
+    "claude" or "codex" in its own name reads one of these fields instead.
+
+    ``tracking`` is the setting that switches the provider off. Claude has
+    none, because an application that shows nothing is not a state worth
+    offering; ``None`` therefore means "always tracked" rather than a missing
+    value. Every user-facing *sentence* about a provider is still written by
+    ``processor.py``, which owns all display strings.
     """
 
     key: Literal["claude", "codex"]
     label: str
+    # Where the settings window's "… usage online" button goes.
+    usage_url: str
+    # The CLI that can renew this provider's token, and the cheapest prompt
+    # that forces it to make a real request while doing so.
+    cli_executable: str
+    cli_arguments: tuple[str, ...]
+    fetch: Callable[[], "ProviderUsageData"]
+    tracking: ConfigSetting | None = None
 
 
-CLAUDE = Provider(key="claude", label="Claude")
-CODEX = Provider(key="codex", label="Codex")
+CLAUDE = Provider(
+    key="claude",
+    label="Claude",
+    usage_url="https://console.anthropic.com/settings/usage",
+    cli_executable="claude",
+    cli_arguments=("-p", "--model", "haiku", "hi"),
+    fetch=_claude_usage,
+)
 
-# Every provider the application knows, by the key its display state carries.
-PROVIDERS: dict[str, Provider] = {CLAUDE.key: CLAUDE, CODEX.key: CODEX}
+CODEX = Provider(
+    key="codex",
+    label="Codex",
+    usage_url="https://chatgpt.com/codex/settings/usage",
+    cli_executable="codex",
+    # read-only keeps a stray model reply from editing real files, and the repo
+    # check would otherwise refuse to start from the tray app's directory.
+    cli_arguments=("exec", "--sandbox", "read-only", "--skip-git-repo-check", "hi"),
+    fetch=_codex_usage,
+    tracking=CODEX_ENABLED,
+)
+
+# Every provider the application knows, in the order they are displayed.
+PROVIDERS: tuple[Provider, ...] = (CLAUDE, CODEX)
 
 
 @dataclass(frozen=True)
@@ -71,11 +127,29 @@ class LabelSegment:
 
     The taskbar shows every tracked provider on one line, so the label is a
     list of these rather than a single string: the native window draws the
-    glyph named by ``provider_key`` before each segment's text.
+    provider's own mark before each segment's text.
     """
 
-    provider_key: str
+    provider: Provider
     text: str
+
+
+# Every way a fetch can fail to produce usage, and the whole of the vocabulary
+# the display layer has to answer for. It is a closed set rather than free text
+# because three tables in ``processor`` are keyed by it: while any string was
+# allowed, a value one table had and another did not was written twice before
+# anybody noticed. ``unknown`` is what an unforeseen exception becomes — the
+# repr goes to the log, where it can be read, rather than into the tray.
+FetchError = Literal[
+    "no_credentials",
+    "token_expired",
+    "rate_limited",
+    "timeout",
+    "offline",
+    "bad_response",
+    "no_data",
+    "unknown",
+]
 
 
 class UsageWindow(BaseModel):
@@ -86,14 +160,21 @@ class UsageWindow(BaseModel):
 class ProviderUsageData(BaseModel):
     five_hour: UsageWindow | None = None
     seven_day: UsageWindow | None = None
-    fetch_error: str | None = None
+    fetch_error: FetchError | None = None
     status_code: int | None = None
     retry_after_seconds: int | None = None
     fetched_at: datetime
 
 
-class DisplayState(BaseModel):
-    provider_key: str
+@dataclass(frozen=True)
+class DisplayState:
+    """One provider's numbers, written for every surface that shows them.
+
+    It carries the provider itself rather than its key, so nothing downstream
+    has to look one up or guard against a key it cannot receive.
+    """
+
+    provider: Provider
     icon_color: Literal["green", "amber", "red", "grey"]
     tooltip: str
     menu_status_label: str

@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from claudemonitor import codex_fetcher, fetcher, main, processor
+from claudemonitor import codex_fetcher, fetcher, main, processor, usage_request
 from claudemonitor.config import Config
 from claudemonitor.models import CLAUDE, CODEX, Rect
 from claudemonitor.taskbar_companion import TaskbarCompanion
@@ -113,7 +113,7 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     companion = TaskbarCompanion(native=native)
     data = fetcher.fetch()
     # Freeze the clock so reset countdowns are deterministic.
-    state = processor.process(data, now=NOW, config=Config())
+    state = processor.process(data, NOW, Config(), CLAUDE)
 
     monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
     main._apply_display({"claude": _StubIcon()}, [state], companion)
@@ -239,12 +239,12 @@ class TestBothProvidersOnOneLabel:
         monkeypatch.setattr(httpx, "get", lambda *a, **k: claude_response)
         claude_data = fetcher.fetch()
 
-        monkeypatch.setattr(codex_fetcher.httpx, "get", lambda *a, **k: codex_response)
+        monkeypatch.setattr(usage_request.httpx, "get", lambda *a, **k: codex_response)
         codex_data = codex_fetcher.fetch()
 
         states = [
-            processor.process(claude_data, now=NOW, config=Config(), provider=CLAUDE),
-            processor.process(codex_data, now=NOW, config=Config(), provider=CODEX),
+            processor.process(claude_data, NOW, Config(), CLAUDE),
+            processor.process(codex_data, NOW, Config(), CODEX),
         ]
 
         native = _RecordingNativeWindow()
@@ -274,9 +274,9 @@ class TestBothProvidersOnOneLabel:
             ),
         )
 
-        assert [(s.provider_key, s.text) for s in segments] == [
-            ("claude", "80% (3h 0m)"),
-            ("codex", "64% (2h 0m)"),
+        assert [(s.provider, s.text) for s in segments] == [
+            (CLAUDE, "80% (3h 0m)"),
+            (CODEX, "64% (2h 0m)"),
         ]
         assert painted == "80% (3h 0m)  64% (2h 0m)"
 

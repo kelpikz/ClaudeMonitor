@@ -15,13 +15,16 @@ import pytest
 from claudemonitor import win32_taskbar_window
 from claudemonitor.win32_bindings import USER_DEFAULT_SCREEN_DPI
 from claudemonitor.models import LabelSegment
+from claudemonitor import win32_dpi
+from claudemonitor.win32_dpi import (
+    enable_per_monitor_dpi_awareness,
+    scale_for_dpi,
+)
 from claudemonitor.win32_taskbar_window import (
     _ICON_CONTENT_RIGHT_PADDING,
     _ICON_LEFT_INSET,
     _ICON_SIZE,
     _ICON_TEXT_GAP,
-    enable_per_monitor_dpi_awareness,
-    scale_for_dpi,
 )
 
 from tests.test_win32_taskbar_window import _FakeDll, _FakeUser32, _window
@@ -125,7 +128,7 @@ class TestProcessDpiAwareness:
         )()
 
         assert enable_per_monitor_dpi_awareness(user32=user32) is True
-        assert calls == [win32_taskbar_window.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2]
+        assert calls == [win32_dpi.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2]
 
     def test_an_older_windows_without_the_export_falls_back_to_system_awareness(self):
         # Windows 8.1 and earlier have only the process-wide SetProcessDPIAware.

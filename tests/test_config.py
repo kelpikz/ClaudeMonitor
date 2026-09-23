@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -54,14 +55,14 @@ def test_session_refresh_toggle_is_persisted_without_touching_other_settings(con
         "[polling]\ninterval_seconds = 30\n\n[session_refresh]\ncooldown_seconds = 120\n",
     )
 
-    config.save_session_refresh_enabled(False)
+    config.SESSION_REFRESH_ENABLED.save(False)
 
     loaded = config.load_config()
     assert loaded.session_refresh.enabled is False
     assert loaded.session_refresh.cooldown_seconds == 120
     assert loaded.polling.interval_seconds == 30
 
-    config.save_session_refresh_enabled(True)
+    config.SESSION_REFRESH_ENABLED.save(True)
 
     assert config.load_config().session_refresh.enabled is True
 
@@ -69,7 +70,7 @@ def test_session_refresh_toggle_is_persisted_without_touching_other_settings(con
 def test_session_refresh_toggle_seeds_the_section_when_it_is_absent(config_path):
     _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
 
-    config.save_session_refresh_enabled(False)
+    config.SESSION_REFRESH_ENABLED.save(False)
 
     saved_text = config_path.read_text(encoding="utf-8")
     assert config.load_config().session_refresh.enabled is False
@@ -86,12 +87,12 @@ def test_seeded_config_documents_the_session_refresh_section(config_path):
 def test_taskbar_visibility_is_persisted_in_existing_config(config_path):
     _write_config(config_path, "[polling]\ninterval_seconds = 30\n")
 
-    config.save_taskbar_enabled(False)
+    config.TASKBAR_ENABLED.save(False)
 
     assert config.load_config().taskbar.enabled is False
     assert config.load_config().polling.interval_seconds == 30
 
-    config.save_taskbar_enabled(True)
+    config.TASKBAR_ENABLED.save(True)
 
     assert config.load_config().taskbar.enabled is True
     assert config.load_config().polling.interval_seconds == 30
@@ -104,7 +105,7 @@ def test_taskbar_visibility_updates_dotted_toml_without_duplicate_tables(config_
         "# Keep this user note\ntaskbar.enabled = true\n\n[polling]\ninterval_seconds = 45\n",
     )
 
-    config.save_taskbar_enabled(False)
+    config.TASKBAR_ENABLED.save(False)
 
     saved_text = config_path.read_text(encoding="utf-8")
     assert config.load_config().taskbar.enabled is False
@@ -125,7 +126,7 @@ def test_missing_config_is_seeded_with_the_documented_defaults(config_path):
 
 
 def test_saving_seeds_a_missing_config_before_editing_it(config_path):
-    config.save_taskbar_enabled(False)
+    config.TASKBAR_ENABLED.save(False)
 
     assert config.load_config().taskbar.enabled is False
     assert "# ClaudeMonitor config" in config_path.read_text(encoding="utf-8")
@@ -154,22 +155,37 @@ def test_wrongly_typed_values_fall_back_to_that_section_defaults(config_path):
     assert loaded.taskbar.enabled is False
 
 
-def test_saving_never_leaves_a_truncated_config_behind(config_path):
+def test_saving_never_leaves_a_truncated_config_behind(config_path, monkeypatch):
     """The write is atomic, so an interrupted save cannot corrupt the file."""
     _write_config(config_path, "[polling]\ninterval_seconds = 30\n")
-    original_replace = config.os.replace
 
     def fail_before_replacing(source, destination):
         raise OSError("simulated crash during save")
 
-    config.os.replace = fail_before_replacing
-    try:
-        with pytest.raises(OSError):
-            config.save_taskbar_enabled(False)
-    finally:
-        config.os.replace = original_replace
+    monkeypatch.setattr(config.os, "replace", fail_before_replacing)
+
+    config.TASKBAR_ENABLED.save(False)
 
     assert config_path.read_text(encoding="utf-8") == "[polling]\ninterval_seconds = 30\n"
+
+
+def test_a_save_that_cannot_be_written_is_logged_rather_than_raised(
+    config_path, monkeypatch, caplog
+):
+    """Every caller runs on a UI thread and has already changed the running app.
+
+    A file that cannot be written must not undo that, nor take the thread down.
+    """
+
+    def unwritable(source, destination):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(config.os, "replace", unwritable)
+
+    with caplog.at_level(logging.ERROR):
+        config.TASKBAR_ENABLED.save(False)
+
+    assert "taskbar" in caplog.text and "enabled" in caplog.text
 
 
 # ===========================================================================
@@ -193,7 +209,7 @@ def test_codex_toggle_is_persisted_without_touching_other_settings(config_path):
         "[polling]\ninterval_seconds = 45\n\n[codex]\nenabled = true\n",
     )
 
-    config.save_codex_enabled(False)
+    config.CODEX_ENABLED.save(False)
 
     reloaded = config.load_config()
     assert reloaded.codex.enabled is False
@@ -203,7 +219,7 @@ def test_codex_toggle_is_persisted_without_touching_other_settings(config_path):
 def test_codex_toggle_seeds_the_section_when_it_is_absent(config_path):
     _write_config(config_path, "[polling]\ninterval_seconds = 30\n")
 
-    config.save_codex_enabled(False)
+    config.CODEX_ENABLED.save(False)
 
     assert config.load_config().codex.enabled is False
 
@@ -227,14 +243,14 @@ class TestSavingTheNumericSettings:
     def test_the_poll_interval_is_persisted(self, config_path):
         _write_config(config_path, "[polling]\ninterval_seconds = 60\n")
 
-        config.save_poll_interval_seconds(120)
+        config.POLL_INTERVAL.save(120)
 
         assert config.load_config().polling.interval_seconds == 120
 
     def test_the_amber_threshold_is_persisted(self, config_path):
         _write_config(config_path, "[thresholds]\namber_below = 50\nred_below = 20\n")
 
-        config.save_amber_threshold(40)
+        config.AMBER_THRESHOLD.save(40)
 
         loaded = config.load_config()
         assert loaded.thresholds.amber_below == 40
@@ -243,7 +259,7 @@ class TestSavingTheNumericSettings:
     def test_the_red_threshold_is_persisted(self, config_path):
         _write_config(config_path, "[thresholds]\namber_below = 50\nred_below = 20\n")
 
-        config.save_red_threshold(10)
+        config.RED_THRESHOLD.save(10)
 
         loaded = config.load_config()
         assert loaded.thresholds.red_below == 10
@@ -254,7 +270,7 @@ class TestSavingTheNumericSettings:
             config_path, "[session_refresh]\nenabled = true\ncooldown_seconds = 900\n"
         )
 
-        config.save_session_refresh_cooldown(300)
+        config.REFRESH_COOLDOWN.save(300)
 
         loaded = config.load_config()
         assert loaded.session_refresh.cooldown_seconds == 300
@@ -263,12 +279,67 @@ class TestSavingTheNumericSettings:
     def test_a_numeric_write_seeds_a_missing_section(self, config_path):
         _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
 
-        config.save_amber_threshold(35)
+        config.AMBER_THRESHOLD.save(35)
 
         assert config.load_config().thresholds.amber_below == 35
         assert "Keep this user note" in config_path.read_text(encoding="utf-8")
 
     def test_a_numeric_write_seeds_a_missing_config_file(self, config_path):
-        config.save_poll_interval_seconds(90)
+        config.POLL_INTERVAL.save(90)
 
         assert config.load_config().polling.interval_seconds == 90
+
+
+class TestConfigSetting:
+    """One setting names its section and key once, for both the file and the model.
+
+    The section and the key used to be spelled twice — once in a ``save_*``
+    wrapper in this module, once as a string in ``main`` — for every setting
+    the settings window can write.
+    """
+
+    def test_every_setting_names_a_section_the_model_actually_has(self):
+        loaded = config.Config()
+
+        for setting in config.EVERY_SETTING:
+            assert hasattr(loaded, setting.section), setting
+
+    def test_every_setting_names_a_key_that_section_actually_has(self):
+        loaded = config.Config()
+
+        for setting in config.EVERY_SETTING:
+            assert hasattr(getattr(loaded, setting.section), setting.key), setting
+
+    def test_reading_returns_what_the_loaded_config_holds(self):
+        loaded = config.Config()
+        loaded.thresholds.amber_below = 35
+
+        assert config.AMBER_THRESHOLD.read(loaded) == 35
+
+    def test_writing_changes_the_running_config(self):
+        loaded = config.Config()
+
+        config.AMBER_THRESHOLD.write(loaded, 42)
+
+        assert loaded.thresholds.amber_below == 42
+
+    def test_writing_does_not_touch_the_file(self, config_path):
+        _write_config(config_path, "[thresholds]\namber_below = 50\n")
+
+        config.AMBER_THRESHOLD.write(config.Config(), 42)
+
+        assert config.load_config().thresholds.amber_below == 50
+
+    def test_saving_and_reloading_round_trips(self, config_path):
+        for setting, value in (
+            (config.POLL_INTERVAL, 120),
+            (config.AMBER_THRESHOLD, 40),
+            (config.RED_THRESHOLD, 15),
+            (config.REFRESH_COOLDOWN, 300),
+            (config.TASKBAR_ENABLED, False),
+            (config.CODEX_ENABLED, False),
+            (config.SESSION_REFRESH_ENABLED, False),
+        ):
+            setting.save(value)
+
+            assert setting.read(config.load_config()) == value, setting

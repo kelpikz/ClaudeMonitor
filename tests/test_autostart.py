@@ -143,7 +143,6 @@ def _startup_window(monkeypatch):
     monkeypatch.setattr(autostart, "startup_command", lambda: "expected command")
     model = main.build_settings_model(
         companion=_UnusedCompanion(),
-        codex_tracking=main.CodexTracking(enabled=True),
         nudgers=[],
         pollers=[],
         config=Config(),
@@ -163,7 +162,7 @@ def _startup_window(monkeypatch):
 
 def _tick_startup(window, index: int) -> None:
     """Tick the startup box the way Windows does, then report the click."""
-    window._user32.checked[window._field_handles["startup"]] = BST_CHECKED
+    window._user32.checked[window._controls["startup"].label] = BST_CHECKED
     window._window_proc(window._handle, WM_COMMAND, _FIRST_FIELD_ID + index, 0)
 
 

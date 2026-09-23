@@ -7,7 +7,7 @@ from ctypes import wintypes
 import pytest
 from PIL import Image
 
-from claudemonitor.models import LabelSegment, Rect
+from claudemonitor.models import CLAUDE, CODEX, LabelSegment, Rect
 from claudemonitor import win32_bindings
 from claudemonitor.win32_bindings import (
     AC_SRC_ALPHA,
@@ -45,7 +45,6 @@ from claudemonitor import win32_taskbar_window
 from claudemonitor.win32_taskbar_window import (
     Win32TaskbarWindow,
     _bitmap_info_for,
-    _GLYPH_BAND_PADDING,
     _ICON_CONTENT_RIGHT_PADDING,
     _ICON_LEFT_INSET,
     _ICON_SIZE,
@@ -669,7 +668,7 @@ class TestTheme:
         # towards black, which is the background it was rasterised against.
         gdi32 = _FakeGdi32()
         native = _window(gdi32=gdi32)
-        native.set_segments(30, [LabelSegment("claude", "80%")])
+        native.set_segments(30, [LabelSegment(CLAUDE, "80%")])
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -729,7 +728,7 @@ class TestPainting:
     def test_current_text_is_drawn_on_every_paint_request(self):
         user32 = _FakeUser32()
         native = _window(user32=user32)
-        native._segments = [LabelSegment("claude", "80% (3h 0m)")]
+        native._segments = [LabelSegment(CLAUDE, "80% (3h 0m)")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -739,7 +738,7 @@ class TestPainting:
     def test_the_finished_picture_is_handed_to_windows_to_composite(self):
         user32 = _FakeUser32()
         native = _window(user32=user32)
-        native._segments = [LabelSegment("claude", "80% (3h 0m)")]
+        native._segments = [LabelSegment(CLAUDE, "80% (3h 0m)")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -748,7 +747,7 @@ class TestPainting:
     def test_windows_is_told_to_read_the_alpha_channel(self):
         user32 = _FakeUser32()
         native = _window(user32=user32)
-        native._segments = [LabelSegment("claude", "80%")]
+        native._segments = [LabelSegment(CLAUDE, "80%")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -762,7 +761,7 @@ class TestPainting:
         user32 = _FakeUser32()
         user32.client_rect = Rect(left=0, top=0, right=137, bottom=60)
         native = _window(user32=user32)
-        native._segments = [LabelSegment("claude", "80%")]
+        native._segments = [LabelSegment(CLAUDE, "80%")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -772,7 +771,7 @@ class TestPainting:
     def test_the_text_rect_leaves_room_for_the_icon_on_the_left(self):
         user32 = _FakeUser32()
         native = _window(user32=user32)
-        native._segments = [LabelSegment("claude", "80% (3h 0m)")]
+        native._segments = [LabelSegment(CLAUDE, "80% (3h 0m)")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -785,7 +784,7 @@ class TestPainting:
         user32 = _FakeUser32()
         gdi32 = _FakeGdi32()
         native = _window(user32=user32, gdi32=gdi32)
-        native._segments = [LabelSegment("claude", "80%")]
+        native._segments = [LabelSegment(CLAUDE, "80%")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -798,7 +797,7 @@ class TestPainting:
         gdi32 = _FakeGdi32()
         gdi32.results["CreateDIBSection"] = 0
         native = _window(user32=user32, gdi32=gdi32)
-        native._segments = [LabelSegment("claude", "80%")]
+        native._segments = [LabelSegment(CLAUDE, "80%")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -812,7 +811,7 @@ class TestPainting:
         user32 = _FakeUser32()
         user32.client_rect = Rect(left=0, top=0, right=0, bottom=0)
         native = _window(user32=user32)
-        native._segments = [LabelSegment("claude", "80%")]
+        native._segments = [LabelSegment(CLAUDE, "80%")]
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -845,7 +844,7 @@ class TestAntiAliasedEdges:
         return gdi32.bitmap()
 
     def test_a_marks_edge_reaches_windows_partly_transparent(self):
-        bitmap = self._painted_bitmap([LabelSegment("claude", "80%")])
+        bitmap = self._painted_bitmap([LabelSegment(CLAUDE, "80%")])
 
         alphas = {pixel[3] for pixel in bitmap.get_flattened_data()}
         assert alphas & set(range(1, 255))
@@ -854,7 +853,7 @@ class TestAntiAliasedEdges:
         # A pixel the mark does not cover has to be transparent *and* black.
         # Colour left behind at zero alpha is what a premultiplied surface
         # renders as a halo.
-        bitmap = self._painted_bitmap([LabelSegment("claude", "80%")])
+        bitmap = self._painted_bitmap([LabelSegment(CLAUDE, "80%")])
 
         assert not [
             pixel
@@ -865,7 +864,7 @@ class TestAntiAliasedEdges:
     def test_no_pixel_is_brighter_than_its_own_alpha_allows(self):
         # Windows reads this surface as premultiplied. A channel above the alpha
         # it is paired with is the definition of an over-bright edge.
-        bitmap = self._painted_bitmap([LabelSegment("claude", "80%")])
+        bitmap = self._painted_bitmap([LabelSegment(CLAUDE, "80%")])
 
         assert all(
             max(pixel[:3]) <= pixel[3] for pixel in bitmap.get_flattened_data()
@@ -887,7 +886,7 @@ class TestAntiAliasedEdges:
         # reached yet, giving a label that shows its marks alone.
         gdi32 = _FakeGdi32()
         native = _window(gdi32=gdi32)
-        native.set_segments(30, [LabelSegment("claude", "80%")])
+        native.set_segments(30, [LabelSegment(CLAUDE, "80%")])
 
         native._window_proc(30, WM_PAINT, 0, 0)
 
@@ -937,7 +936,7 @@ class TestTextMeasurement:
         gdi32 = self._fake_gdi32_reporting_width(100)
 
         content_width = _window(gdi32=gdi32).content_width_for(
-            [LabelSegment("claude", "anything")]
+            [LabelSegment(CLAUDE, "anything")]
         )
 
         assert content_width == (
@@ -949,9 +948,9 @@ class TestTextMeasurement:
         wider_native = _window(gdi32=self._fake_gdi32_reporting_width(120))
 
         assert native.content_width_for(
-            [LabelSegment("claude", "40%")]
+            [LabelSegment(CLAUDE, "40%")]
         ) < wider_native.content_width_for(
-            [LabelSegment("claude", "100% (not started)")]
+            [LabelSegment(CLAUDE, "100% (not started)")]
         )
 
 
@@ -1090,11 +1089,11 @@ class TestMessagePump:
 
 
 def _claude(text: str) -> LabelSegment:
-    return LabelSegment(provider_key="claude", text=text)
+    return LabelSegment(provider=CLAUDE, text=text)
 
 
 def _codex(text: str) -> LabelSegment:
-    return LabelSegment(provider_key="codex", text=text)
+    return LabelSegment(provider=CODEX, text=text)
 
 
 class TestSegmentWidth:
@@ -1215,14 +1214,13 @@ class TestSegmentPainting:
         claude_mark, codex_mark = (glyph for glyph, _position in placements)
         assert claude_mark.tobytes() != codex_mark.tobytes()
 
-    def test_an_unknown_provider_falls_back_to_the_claude_mark(self):
-        # A new provider key must never crash a paint; a wrong glyph is fine.
-        _user32, placements = self._placed(
-            [LabelSegment("something-else", "80%"), _claude("80%")]
-        )
+    def test_each_row_is_drawn_with_its_own_providers_mark(self):
+        # The segment carries its provider, so a paint can no longer be handed
+        # a name nobody drew and have to guess which mark was meant.
+        _user32, placements = self._placed([_claude("80%"), _codex("64%")])
 
-        fallback, claude_mark = (glyph for glyph, _position in placements)
-        assert fallback.tobytes() == claude_mark.tobytes()
+        claude_mark, codex_mark = (glyph for glyph, _position in placements)
+        assert claude_mark.tobytes() != codex_mark.tobytes()
 
     def test_a_taskbar_too_short_for_the_padding_still_draws_both_rows(self):
         # A taskbar set to small buttons leaves nothing to inset by. Cramped
@@ -1262,7 +1260,7 @@ class TestThemedGlyphs:
 
         assert native._uses_light_theme is True
         assert drawn.tobytes() == label_art.taskbar_glyph(
-            "codex", drawn.width, uses_light_theme=True
+            CODEX, drawn.width, uses_light_theme=True
         ).tobytes()
 
     def test_a_theme_switch_changes_the_mark_that_gets_drawn(self, monkeypatch):

@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="the taskbar label is a Windows-only feature"
 )
 
-from claudemonitor.models import LabelSegment, Rect
+from claudemonitor.models import CLAUDE, CODEX, LabelSegment, Rect
 from claudemonitor.taskbar_companion import companion_slot
 from claudemonitor.win32_bindings import (
     IDC_ARROW,
@@ -30,11 +30,11 @@ from claudemonitor.win32_bindings import (
     USER32_SIGNATURES,
     apply_signatures,
 )
-from claudemonitor.win32_taskbar_window import (
-    Win32TaskbarWindow,
+from claudemonitor.win32_dpi import (
     enable_per_monitor_dpi_awareness,
     process_dpi_awareness,
 )
+from claudemonitor.win32_taskbar_window import Win32TaskbarWindow
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -80,7 +80,7 @@ class TestRealWindowLifecycle:
             assert handle
             native.enable_per_pixel_alpha(handle)
             native.set_segments(
-                handle, [LabelSegment("claude", "79% (2 hours)")]
+                handle, [LabelSegment(CLAUDE, "79% (2 hours)")]
             )
             native.move_window(
                 handle, Rect(left=0, top=0, right=180, bottom=40), topmost=True
@@ -97,23 +97,23 @@ class TestRealWindowLifecycle:
             native.set_segments(
                 handle,
                 [
-                    LabelSegment("claude", "80% (3h 0m)"),
-                    LabelSegment("codex", "64% (2h 0m)"),
+                    LabelSegment(CLAUDE, "80% (3h 0m)"),
+                    LabelSegment(CODEX, "64% (2h 0m)"),
                 ],
             )
             width = native.content_width_for(
                 [
-                    LabelSegment("claude", "80% (3h 0m)"),
-                    LabelSegment("codex", "64% (2h 14m)"),
+                    LabelSegment(CLAUDE, "80% (3h 0m)"),
+                    LabelSegment(CODEX, "64% (2h 14m)"),
                 ]
             )
             # Stacked rows share one width, so the longer string sets it and
             # the shorter one adds nothing.
             assert width == native.content_width_for(
-                [LabelSegment("codex", "64% (2h 14m)")]
+                [LabelSegment(CODEX, "64% (2h 14m)")]
             )
             assert width > native.content_width_for(
-                [LabelSegment("claude", "80% (3h 0m)")]
+                [LabelSegment(CLAUDE, "80% (3h 0m)")]
             )
         finally:
             native.close_window(handle)
@@ -136,8 +136,8 @@ class TestRealWindowLifecycle:
             native.set_segments(
                 handle,
                 [
-                    LabelSegment("claude", "80% (3h 0m)"),
-                    LabelSegment("codex", "64% (2h 14m)"),
+                    LabelSegment(CLAUDE, "80% (3h 0m)"),
+                    LabelSegment(CODEX, "64% (2h 14m)"),
                 ],
             )
 

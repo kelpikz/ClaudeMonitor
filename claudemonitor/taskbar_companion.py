@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .models import LabelSegment, Rect
+from .models import CLAUDE, LabelSegment, Rect
 from .processor import LOADING_TASKBAR_TEXT, LOADING_TOOLTIP
 
 
@@ -196,9 +196,7 @@ class TaskbarCompanion:
         self._stop_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._display_changed = threading.Condition()
-        self._segments = [
-            LabelSegment(provider_key="claude", text=LOADING_TASKBAR_TEXT)
-        ]
+        self._segments = [LabelSegment(provider=CLAUDE, text=LOADING_TASKBAR_TEXT)]
         self._tooltip = LOADING_TOOLTIP
         self._visible = initial_visible
         self._healthy = True

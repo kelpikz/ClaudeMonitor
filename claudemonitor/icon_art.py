@@ -71,18 +71,21 @@ def tile_icon(
 def glyph_mask(glyph: str, size: int) -> Image.Image:
     """Return one provider's glyph as a white-on-black mask.
 
-    An unknown provider falls back to the asterisk: a wrong-looking tile is
-    better than an exception raised inside the poll loop.
+    An unknown name falls back to the asterisk: a wrong-looking tile is better
+    than an exception raised inside the poll loop.
     """
-    if glyph == "codex":
-        return _codex_mask().resize((size, size), Image.Resampling.LANCZOS)
-    return _asterisk_mask(size)
+    return _GLYPH_MASKS.get(glyph, _asterisk_mask)(size)
 
 
 @functools.lru_cache(maxsize=1)
-def _codex_mask() -> Image.Image:
+def _codex_source_mask() -> Image.Image:
     """Load the committed OpenAI mark once and reuse it for every render."""
     return Image.open(CODEX_GLYPH_MASK_PATH).convert("L")
+
+
+def _codex_mask(size: int) -> Image.Image:
+    """Draw the OpenAI mark at one size, from the committed artwork."""
+    return _codex_source_mask().resize((size, size), Image.Resampling.LANCZOS)
 
 
 def _rounded_mask(size: int) -> Image.Image:
@@ -144,6 +147,11 @@ def _ray_points(size: int, index: int) -> list[tuple[float, float]]:
         corner(_RAY_OUTER_RADIUS, _RAY_OUTER_HALF_WIDTH, -1),
         corner(_RAY_INNER_RADIUS, _RAY_INNER_HALF_WIDTH, -1),
     ]
+
+
+# How each provider's mark is drawn. Anthropic's asterisk is geometry, so it
+# is generated; OpenAI's blossom is artwork, so it is loaded and resized.
+_GLYPH_MASKS = {"claude": _asterisk_mask, "codex": _codex_mask}
 
 
 def _knock_out(alpha: Image.Image, mask: Image.Image) -> Image.Image:
