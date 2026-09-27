@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -599,7 +602,7 @@ class TestCircuitBreaker:
 
         assert nudger.exhausted is True
 
-    def test_a_success_clears_the_failure_count(self):
+    def test_a_confirmed_success_clears_the_failure_count(self):
         outcomes = iter([False, False, True, False, False])
         attempts: list[bool] = []
 
@@ -610,8 +613,12 @@ class TestCircuitBreaker:
         nudger = _nudger(invoke)
         expired = usage(fetch_error="token_expired")
 
-        for _ in range(5):
+        for _ in range(3):
             nudger.maybe_nudge(expired)
+        # The fetch after the success shows the token works again.
+        nudger.maybe_nudge(usage(utilization=30.0, resets_at=NOW))
+        nudger.maybe_nudge(expired)
+        nudger.maybe_nudge(expired)
 
         # Two failures, a success that reset the count, then two more failures.
         assert nudger.exhausted is False
@@ -853,3 +860,247 @@ class TestAManualRun:
 
     def test_by_default_it_runs_its_own_providers_cli(self):
         assert ManualRun(CODEX).provider is CODEX
+
+
+class TestARunTheNextFetchDoesNotConfirm:
+    """A CLI that answers has not always fixed anything. Codex can stay at 0%
+    after a lean nudge, and a 403 that is not about the token stays a 403. A
+    run the next fetch does not confirm counts as a failure, so the breaker
+    stops the runs rather than spending usage every cooldown for ever."""
+
+    def test_an_idle_window_that_stays_idle_stops_after_three_runs(self):
+        invoke, attempts = _answers(succeeded=True)
+        nudger = _nudger(invoke)
+
+        for _ in range(10):
+            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+
+        assert len(attempts) == 3
+        assert nudger.exhausted is True
+
+    def test_a_token_that_stays_expired_stops_after_three_runs(self):
+        invoke, attempts = _answers(succeeded=True)
+        nudger = _nudger(invoke)
+
+        for _ in range(10):
+            nudger.maybe_nudge(usage(fetch_error="token_expired"))
+
+        assert len(attempts) == 3
+        assert nudger.exhausted is True
+
+    def test_a_run_the_next_fetch_confirms_is_a_success(self):
+        invoke, attempts = _answers(succeeded=True)
+        nudger = _nudger(invoke)
+
+        for _ in range(5):
+            nudger.maybe_nudge(usage(utilization=0.0))
+            nudger.maybe_nudge(usage(utilization=4.0, resets_at=NOW))
+
+        assert len(attempts) == 5
+        assert nudger.exhausted is False
+
+    def test_a_fetch_that_fails_for_another_reason_waits_for_the_next_one(self):
+        invoke, _attempts = _answers(succeeded=True)
+        nudger = _nudger(invoke, max_consecutive_failures=1)
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        nudger.maybe_nudge(usage(fetch_error="offline"))
+        nudger.maybe_nudge(usage(utilization=4.0, resets_at=NOW))
+
+        assert nudger.exhausted is False
+
+    def test_one_unconfirmed_run_is_counted_once(self):
+        invoke, attempts = _answers(succeeded=True)
+        elapsed = [0.0]
+        nudger = _nudger(
+            invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
+        )
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        # Polls inside the cooldown see the same idle window again and again.
+        for _ in range(5):
+            nudger.maybe_nudge(usage(utilization=0.0))
+
+        assert len(attempts) == 1
+        assert nudger.exhausted is False
+
+
+class TestOneCliRunAtATimePerProvider:
+    """Two runs of the same CLI can both refresh one token. OpenAI rotates the
+    refresh token, so the run that loses can sign the user out."""
+
+    def test_a_nudge_waits_while_a_manual_run_holds_the_cli(self):
+        lock = threading.Lock()
+        invoke, nudges = _answers()
+        nudger = _nudger(invoke, cli_lock=lock)
+        seen_during_run: list[bool] = []
+
+        def manual_invoke(_model, _effort):
+            seen_during_run.append(nudger.maybe_nudge(usage(utilization=0.0)))
+            return CliReply(succeeded=True)
+
+        _manual_run(manual_invoke, cli_lock=lock).start("", "", finished=lambda: None)
+
+        assert seen_during_run == [False]
+        assert nudges == []
+
+    def test_a_refused_nudge_does_not_start_the_cooldown(self):
+        lock = threading.Lock()
+        invoke, nudges = _answers()
+        nudger = _nudger(invoke, RefreshOptions(cooldown_seconds=60), cli_lock=lock)
+
+        with lock:
+            assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert len(nudges) == 1
+
+    def test_a_manual_run_waits_for_a_nudge_to_finish(self):
+        lock = threading.Lock()
+        pending: list = []
+        invoke, _nudges = _answers()
+        nudger = _nudger(invoke, start_background=pending.append, cli_lock=lock)
+        manual_started = threading.Event()
+
+        def manual_invoke(_model, _effort):
+            manual_started.set()
+            return CliReply(succeeded=True)
+
+        run = _manual_run(manual_invoke, cli_lock=lock, start_background=_start_thread)
+
+        nudger.maybe_nudge(usage(fetch_error="token_expired"))
+        assert run.start("", "", finished=lambda: None) is True
+        assert manual_started.wait(0.2) is False
+        assert run.state.phase == "running"
+
+        pending[0]()  # the nudge finishes and lets go of the CLI
+
+        assert manual_started.wait(5) is True
+
+    def test_a_nudge_that_raises_still_lets_go_of_the_cli(self):
+        lock = threading.Lock()
+
+        def explode(_options):
+            raise RuntimeError("subprocess layer blew up")
+
+        _nudger(explode, cli_lock=lock).maybe_nudge(usage(utilization=0.0))
+
+        assert lock.acquire(blocking=False) is True
+
+    def test_a_manual_run_that_raises_still_lets_go_of_the_cli(self):
+        lock = threading.Lock()
+
+        def explode(_model, _effort):
+            raise RuntimeError("subprocess layer blew up")
+
+        _manual_run(explode, cli_lock=lock).start("", "", finished=lambda: None)
+
+        assert lock.acquire(blocking=False) is True
+
+
+def _start_thread(work):
+    """Run background work on a real thread, as the application does."""
+    threading.Thread(target=work, daemon=True).start()
+
+
+class _FakeProcess:
+    """A Popen stand-in whose first wait times out when asked to."""
+
+    def __init__(self, *, hangs: bool):
+        self.pid = 4242
+        self.returncode = None if hangs else 0
+        self._hangs = hangs
+        self.waits: list[float | None] = []
+
+    def communicate(self, timeout=None):
+        self.waits.append(timeout)
+        if self._hangs:
+            raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+        return ("out", "err")
+
+
+class TestRunningTheCliProcess:
+    """`codex` is a .cmd shim, so the CLI is a grandchild of the process we
+    start. Killing only the child leaves the grandchild holding the output
+    pipes, and the wait for them never ends."""
+
+    def test_a_process_that_finishes_gives_its_code_and_output(self):
+        process = _FakeProcess(hangs=False)
+
+        completed = cli_refresher.run_cli_process(
+            ["codex"], timeout=5, popen=lambda *a, **k: process, kill_tree=_never_kill
+        )
+
+        assert (completed.returncode, completed.stdout, completed.stderr) == (0, "out", "err")
+
+    def test_captured_output_is_piped(self):
+        opened: list[dict] = []
+
+        def popen(args, **kwargs):
+            opened.append(kwargs)
+            return _FakeProcess(hangs=False)
+
+        cli_refresher.run_cli_process(
+            ["codex"],
+            timeout=5,
+            capture_output=True,
+            text=True,
+            popen=popen,
+            kill_tree=_never_kill,
+        )
+
+        assert opened[0]["stdout"] == subprocess.PIPE
+        assert opened[0]["stderr"] == subprocess.PIPE
+        assert opened[0]["text"] is True
+        assert "capture_output" not in opened[0]
+
+    def test_a_process_that_hangs_has_its_whole_tree_killed(self):
+        process = _FakeProcess(hangs=True)
+        killed: list[int] = []
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            cli_refresher.run_cli_process(
+                ["codex"], timeout=5, popen=lambda *a, **k: process, kill_tree=killed.append
+            )
+
+        assert killed == [4242]
+
+    def test_the_wait_after_a_kill_is_itself_bounded(self):
+        # A tree that survives the kill must not hang the caller either.
+        process = _FakeProcess(hangs=True)
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            cli_refresher.run_cli_process(
+                ["codex"], timeout=5, popen=lambda *a, **k: process, kill_tree=lambda pid: None
+            )
+
+        assert len(process.waits) == 2
+        assert process.waits[1] is not None
+
+    def test_the_cli_is_run_this_way_unless_a_test_says_otherwise(self, monkeypatch):
+        runner = _RecordingRunner()
+        monkeypatch.setattr(cli_refresher, "run_cli_process", runner)
+
+        run_provider_cli(CLAUDE, which=_which_finds_claude)
+
+        assert len(runner.calls) == 1
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="taskkill is Windows only")
+    def test_a_real_grandchild_holding_the_pipes_does_not_block_the_timeout(self):
+        grandchild = "import time; time.sleep(30)"
+        child = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]); time.sleep(30)"
+        )
+        started_at = time.monotonic()
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            cli_refresher.run_cli_process(
+                [sys.executable, "-c", child], timeout=2, capture_output=True, text=True
+            )
+
+        assert time.monotonic() - started_at < 15
+
+
+def _never_kill(pid: int) -> None:
+    raise AssertionError(f"process {pid} should not have been killed")

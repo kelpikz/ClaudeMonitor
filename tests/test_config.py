@@ -147,15 +147,32 @@ def test_a_save_that_cannot_be_written_is_logged_rather_than_raised(
 
 
 class TestProviderSectionDefaults:
-    """Both providers are tracked and refreshed unless the user says otherwise."""
+    """Both providers are refreshed unless the user says otherwise. Only Claude is
+    tracked by default: a user without Codex would otherwise get a grey icon."""
 
     @pytest.mark.parametrize("section", [ClaudeConfig, CodexConfig])
-    def test_tracking_and_both_refreshes_are_on(self, section):
+    def test_both_refreshes_are_on(self, section):
         loaded = section()
 
-        assert loaded.enabled is True
         assert loaded.renew_token is True
         assert loaded.wake_session is True
+
+    def test_claude_is_tracked_by_default(self):
+        assert ClaudeConfig().enabled is True
+
+    def test_codex_is_not_tracked_until_the_user_turns_it_on(self):
+        assert CodexConfig().enabled is False
+
+    def test_a_config_from_before_codex_leaves_codex_off(self, config_path):
+        _write_config(config_path, "[claude]\nenabled = true\n")
+
+        assert config.load_config().codex.enabled is False
+
+    def test_the_seeded_file_leaves_codex_off(self, config_path):
+        loaded = config.load_config()
+
+        assert loaded.claude.enabled is True
+        assert loaded.codex.enabled is False
 
     @pytest.mark.parametrize("section", [ClaudeConfig, CodexConfig])
     def test_the_cooldown_is_fifteen_minutes(self, section):
@@ -201,9 +218,9 @@ class TestReadingAProviderSection:
         assert config.load_config().claude.wake_session is True
 
     def test_a_wrongly_typed_section_falls_back_to_its_defaults(self, config_path):
-        _write_config(config_path, '[codex]\nenabled = "yes please"\n')
+        _write_config(config_path, '[claude]\nenabled = "yes please"\n')
 
-        assert config.load_config().codex.enabled is True
+        assert config.load_config().claude.enabled is True
 
     def test_the_seeded_file_documents_both_sections(self, config_path):
         config.load_config()

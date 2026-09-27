@@ -50,7 +50,8 @@ effort = ""
 # Track OpenAI Codex usage: a second line in the tray tooltip, and a second
 # row in the taskbar label. One tray icon serves both.
 # Reads ~/.codex/auth.json, which the Codex CLI writes when you log in.
-enabled = true
+# Off until you turn it on: without Codex, the tray icon would stay grey.
+enabled = false
 # The same refresh settings as [claude], for the Codex CLI.
 renew_token = true
 wake_session = true
@@ -92,6 +93,9 @@ class ClaudeConfig(ProviderConfig):
 
 
 class CodexConfig(ProviderConfig):
+    # Off by default, so a Claude-only user who updates keeps a green icon
+    # rather than a grey "not logged in" row for a CLI they never installed.
+    enabled: bool = False
     effort: str = "low"
 
 

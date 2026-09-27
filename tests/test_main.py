@@ -227,6 +227,26 @@ class TestApplyDisplay:
         assert companion.updates
 
 
+class TestOneProvidersTwoWaysToRunItsCli:
+    """The automatic nudge and Run now must never run one CLI twice at once."""
+
+    def test_they_share_one_lock(self):
+        nudger, run = main.create_cli_runners(CLAUDE, Config(), threading.Event())
+
+        assert nudger.cli_lock is run.cli_lock
+
+    def test_each_provider_has_a_lock_of_its_own(self):
+        claude_nudger, _ = main.create_cli_runners(CLAUDE, Config(), threading.Event())
+        codex_nudger, _ = main.create_cli_runners(CODEX, Config(), threading.Event())
+
+        assert claude_nudger.cli_lock is not codex_nudger.cli_lock
+
+    def test_both_belong_to_the_provider_asked_for(self):
+        nudger, run = main.create_cli_runners(CODEX, Config(), threading.Event())
+
+        assert (nudger.provider, run.provider) == (CODEX, CODEX)
+
+
 class TestSessionNudgerWiring:
     """Each nudger reads its own provider's section of the running config."""
 
@@ -530,10 +550,16 @@ class TestTrackingOneProvider:
 class TestActiveProviders:
     """The poll loop only works on providers the user is actually tracking."""
 
-    def test_both_providers_are_polled_when_codex_is_on(self):
+    def test_only_claude_is_polled_by_default(self):
         claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
 
-        assert main._active_pollers([claude, codex], Config()) == [claude, codex]
+        assert main._active_pollers([claude, codex], Config()) == [claude]
+
+    def test_both_providers_are_polled_when_codex_is_on(self):
+        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
+        config = Config(codex=CodexConfig(enabled=True))
+
+        assert main._active_pollers([claude, codex], config) == [claude, codex]
 
     def test_codex_is_dropped_when_switched_off(self):
         claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
@@ -546,7 +572,7 @@ class TestActiveProviders:
     def test_claude_is_dropped_when_switched_off(self):
         claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
 
-        config = Config()
+        config = Config(codex=CodexConfig(enabled=True))
         CLAUDE_SETTINGS.tracking.write(config, False)
 
         assert main._active_pollers([claude, codex], config) == [codex]
@@ -831,10 +857,10 @@ class TestSettingsWiring:
         model, fields = self._model()
         codex = self._field(model, "codex_tracking")
 
-        assert codex.is_on() is True
-        codex.write(False)
+        assert codex.is_on() is False
+        codex.write(True)
 
-        assert main._is_tracked(CODEX, fields["config"]) is False
+        assert main._is_tracked(CODEX, fields["config"]) is True
 
     def test_a_providers_switch_asks_for_a_fresh_poll(self):
         woken = threading.Event()

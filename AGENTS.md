@@ -128,7 +128,16 @@ the one state a single message repairs — was never woken.
 Each of those two reasons has its own switch per provider (`renew_token`, `wake_session`), and each
 provider has its own cooldown, model, and effort. A `SessionNudger` reads them from the running
 config on every poll through a `RefreshOptions` callable, so nothing has to push a change into it.
-Each run is logged: the tokens it used, or the CLI's own reason when it failed. The CLIs are asked
+Each run is logged: the tokens it used, or the CLI's own reason when it failed.
+A run counts as a success only when the next fetch no longer needs one; otherwise it counts
+toward the three-failure breaker. Codex can stay at 0% after a nudge, and a 403 that is not about
+the token stays a 403, and each of those used to run the CLI every cooldown for ever. One
+`threading.Lock` per provider (`main.create_cli_runners`) is shared by its `SessionNudger` and its
+`ManualRun`, so the same CLI never runs twice at once: OpenAI rotates the refresh token, and the
+run that loses can sign the user out. The CLI runs through `cli_refresher.run_cli_process`, which
+kills the whole process tree on a timeout — `codex` is a `.cmd` shim, and killing cmd.exe alone
+left the real CLI holding the output pipes. Codex is off by default (`CodexConfig.enabled`), so a
+user without it keeps a green icon. The CLIs are asked
 for JSON (`--output-format json`, `--json`) so that reason and those counts can be read; free text
 on stderr gave neither.
 

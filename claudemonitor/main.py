@@ -452,6 +452,28 @@ def create_session_nudger(
     )
 
 
+def create_cli_runners(
+    provider: Provider,
+    cfg: Config,
+    manual_refresh: threading.Event,
+    **overrides,
+) -> tuple[cli_refresher.SessionNudger, cli_refresher.ManualRun]:
+    """Build one provider's automatic nudge and its Run now, sharing one lock.
+
+    Two runs of one CLI at once can both refresh the same token. OpenAI rotates
+    the refresh token, so the run that loses can sign the user out.
+    ``overrides`` (a test's ``start_background``) reach both.
+    """
+    cli_lock = threading.Lock()
+    nudger = create_session_nudger(
+        provider, cfg, manual_refresh, cli_lock=cli_lock, **overrides
+    )
+    manual_run = cli_refresher.ManualRun(
+        provider, on_refreshed=manual_refresh.set, cli_lock=cli_lock, **overrides
+    )
+    return nudger, manual_run
+
+
 def _next_poll_interval_seconds(
     current_interval_seconds: int,
     data: ProviderUsageData,
@@ -612,12 +634,12 @@ def main() -> None:
     companion = create_taskbar_companion(initial_visible=cfg.taskbar.enabled)
     # Built before the tray so its menu toggles have something to flip; the
     # poll loop starts later and closes over the same instances.
-    nudgers = [
-        create_session_nudger(provider, cfg, manual_refresh) for provider in PROVIDERS
-    ]
+    runners = {
+        provider.key: create_cli_runners(provider, cfg, manual_refresh)
+        for provider in PROVIDERS
+    }
     pollers = [
-        ProviderPoller(provider, cfg, nudger)
-        for provider, nudger in zip(PROVIDERS, nudgers)
+        ProviderPoller(provider, cfg, runners[provider.key][0]) for provider in PROVIDERS
     ]
 
     settings_window = create_settings_controller(
@@ -627,6 +649,7 @@ def main() -> None:
             config=cfg,
             log_dir=log_dir,
             wake_poll_loop=manual_refresh.set,
+            manual_runs={key: manual_run for key, (_, manual_run) in runners.items()},
         )
     )
 

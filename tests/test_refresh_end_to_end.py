@@ -126,22 +126,17 @@ class _CodexApp:
             "which",
             lambda name: f"C:/bin/{name}.CMD" if installed else None,
         )
-        monkeypatch.setattr(cli_refresher.subprocess, "run", cli)
+        monkeypatch.setattr(cli_refresher, "run_cli_process", cli)
         self.cli = cli
         self.config = config or Config()
         self.woken = threading.Event()
-        self.nudger = main.create_session_nudger(
-            CODEX,
-            self.config,
-            self.woken,
-            start_background=lambda work: work(),
+        # The production pair, so the nudge and Run now share the real lock.
+        self.nudger, self.manual_run = main.create_cli_runners(
+            CODEX, self.config, self.woken, start_background=lambda work: work()
         )
         self.poller = main.ProviderPoller(CODEX, self.config, self.nudger)
         self.clipboard: list[str] = []
         self.changes: list[str] = []
-        self.manual_run = cli_refresher.ManualRun(
-            CODEX, on_refreshed=self.woken.set, start_background=lambda work: work()
-        )
         self.settings = main.build_settings_model(
             companion=_Companion(),
             pollers=[self.poller],
@@ -246,6 +241,43 @@ class TestWhenTheRunFails:
         assert len(app.cli.commands) == 3
 
 
+class TestARunThatFixesNothing:
+    """A CLI that answers every time, and a fetch that never changes. Without a
+    limit, each poll past the cooldown would spend another run for ever."""
+
+    def test_a_window_that_stays_at_zero_stops_after_three_runs(self, monkeypatch):
+        config = Config(codex=CodexConfig(cooldown_seconds=0))
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
+
+        for _ in range(10):
+            app.poll(_Response(200, _codex_body(0.0)))
+
+        assert len(app.cli.commands) == 3
+        assert app.nudger.exhausted is True
+
+    def test_a_refusal_that_is_not_about_the_token_stops_after_three_runs(
+        self, monkeypatch
+    ):
+        config = Config(codex=CodexConfig(cooldown_seconds=0))
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
+
+        for _ in range(10):
+            app.poll(_Response(403, {}))
+
+        assert len(app.cli.commands) == 3
+
+    def test_a_run_that_starts_the_window_is_not_counted_against_it(self, monkeypatch):
+        config = Config(codex=CodexConfig(cooldown_seconds=0))
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
+
+        for _ in range(5):
+            app.poll(_Response(200, _codex_body(0.0)))
+            app.poll(_Response(200, _codex_body(3.0)))
+
+        assert len(app.cli.commands) == 5
+        assert app.nudger.exhausted is False
+
+
 class TestWhenTheApiAnswerIsNoUse:
     """Nothing is run on an answer that says nothing about the session."""
 
@@ -347,7 +379,7 @@ class TestAnExpiredClaudeToken:
         )
         cli = _Cli(stdout=answer)
         monkeypatch.setattr(cli_refresher.shutil, "which", lambda name: f"C:/bin/{name}.EXE")
-        monkeypatch.setattr(cli_refresher.subprocess, "run", cli)
+        monkeypatch.setattr(cli_refresher, "run_cli_process", cli)
         expired = ProviderUsageData(
             fetch_error="token_expired", fetched_at=datetime.now(timezone.utc)
         )
@@ -489,7 +521,7 @@ class TestRunNowForClaude:
             }
         )
         monkeypatch.setattr(cli_refresher.shutil, "which", lambda name: f"C:/bin/{name}.EXE")
-        monkeypatch.setattr(cli_refresher.subprocess, "run", _Cli(stdout=answer))
+        monkeypatch.setattr(cli_refresher, "run_cli_process", _Cli(stdout=answer))
         run = cli_refresher.ManualRun(CLAUDE, start_background=lambda work: work())
         settings = main.build_settings_model(
             companion=_Companion(),

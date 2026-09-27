@@ -32,6 +32,8 @@ from .models import CliReply, Provider, ProviderUsageData
 log = logging.getLogger(__name__)
 
 COMMAND_TIMEOUT_SECONDS = 120
+# How long to wait for the output pipes to close once the CLI's tree is killed.
+_KILLED_TREE_WAIT_SECONDS = 5
 DEFAULT_COOLDOWN_SECONDS = 900  # 15 mins
 MAX_CONSECUTIVE_FAILURES = 3
 
@@ -122,6 +124,49 @@ def _quiet_folder() -> str | None:
         log.warning("unable to create %s (%s); the CLI starts in the app's folder", folder, exc)
         return None
     return str(folder)
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Stop a process and every process it started.
+
+    `codex` is a .cmd shim, so the CLI runs as a grandchild of cmd.exe. Killing
+    cmd.exe alone leaves the grandchild alive and holding the output pipes.
+    """
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(pid)],
+        capture_output=True,
+        creationflags=_CREATE_NO_WINDOW,
+    )
+
+
+def run_cli_process(
+    args: list[str],
+    *,
+    timeout: float,
+    capture_output: bool = False,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    kill_tree: Callable[[int], None] = _kill_process_tree,
+    **popen_arguments,
+) -> subprocess.CompletedProcess:
+    """Run a command like subprocess.run, but kill its whole tree on a timeout.
+
+    subprocess.run kills only the process it started, then waits for the
+    output pipes to close. A grandchild that still holds them makes that wait
+    last until the grandchild exits, which can be never.
+    """
+    if capture_output:
+        popen_arguments.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = popen(args, **popen_arguments)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(process.pid)
+        try:
+            process.communicate(timeout=_KILLED_TREE_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            log.warning("the %s process tree outlived its kill", args[0])
+        raise
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def _run_cli(
@@ -239,7 +284,7 @@ def run_provider_cli(
         arguments=provider.cli_arguments(model, effort),
         read_reply=provider.read_cli_reply,
         which=which or shutil.which,
-        run=run or subprocess.run,
+        run=run or run_cli_process,
         clock=clock,
     )
 
@@ -280,8 +325,11 @@ class SessionNudger:
         clock: Callable[[], float] = time.monotonic,
         start_background: Callable[[Callable[[], None]], None] = _start_daemon_thread,
         max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
+        cli_lock: threading.Lock | None = None,
     ) -> None:
         self.provider = provider
+        # Held while this provider's CLI runs; shared with its ManualRun.
+        self.cli_lock = cli_lock or threading.Lock()
         self._options = options
         self._invoke = invoke or (
             lambda chosen: run_provider_cli(provider, chosen.model, chosen.effort)
@@ -291,8 +339,9 @@ class SessionNudger:
         self._start_background = start_background
         self._max_consecutive_failures = max_consecutive_failures
         self._last_attempt_at: float | None = None
-        self._running = False
         self._consecutive_failures = 0
+        # Set when a run succeeded and no fetch has judged it yet.
+        self._awaiting_confirmation = False
 
     @property
     def exhausted(self) -> bool:
@@ -315,6 +364,11 @@ class SessionNudger:
         3. Give up after 3 consecutive failures — dead credentials report
            `token_expired` forever and no prompt can fix them, so retrying is
            just a doomed subprocess every cooldown until the app restarts.
+        4. A run counts as a success only if the next fetch no longer needs
+           one. Codex can stay at 0% after a nudge, and a 403 that is not about
+           the token stays a 403; without this, each would run every cooldown.
+        5. Never run while this provider's CLI is already running, whether
+           from here or from Run now.
         """
         reason = nudge_reason(data)
         if data.fetch_error is None and reason is None:
@@ -322,19 +376,40 @@ class SessionNudger:
             # Re-arming on any successful fetch would be wrong: a missing CLI
             # fails while fetches keep succeeding, and that would loop forever.
             self._consecutive_failures = 0
+        self._judge_last_run(data, reason)
 
-        if reason is None or self._running:
+        if reason is None:
             return False
         options = self._options()
         if not options.allows(reason):
             return False
         if self.exhausted or self._within_cooldown(options.cooldown_seconds):
             return False
+        if not self.cli_lock.acquire(blocking=False):
+            return False
 
         self._last_attempt_at = self._clock()
-        self._running = True
         self._start_background(lambda: self._nudge(options))
         return True
+
+    def _judge_last_run(self, data: ProviderUsageData, reason: NudgeReason | None) -> None:
+        """Count a successful run as a failure if this fetch still needs one.
+
+        A fetch that failed for another reason says nothing either way, so the
+        judgement waits for the next one.
+        """
+        if not self._awaiting_confirmation:
+            return
+        if reason is not None:
+            self._awaiting_confirmation = False
+            log.warning(
+                "the %s CLI answered, but the next fetch still shows %s",
+                self.provider.cli_executable,
+                reason,
+            )
+            self._record_failure()
+        elif data.fetch_error is None:
+            self._awaiting_confirmation = False
 
     def _within_cooldown(self, cooldown_seconds: float) -> bool:
         """Return whether the previous attempt is still too recent to repeat."""
@@ -353,10 +428,11 @@ class SessionNudger:
             )
 
     def _nudge(self, options: RefreshOptions) -> None:
-        """Run one CLI refresh and announce it, always reopening the gate after."""
+        """Run one CLI refresh and announce it, always letting go of the CLI after."""
         try:
             if self._invoke(options).succeeded:
-                self._consecutive_failures = 0
+                # The failure count is cleared by the fetch that confirms it.
+                self._awaiting_confirmation = True
                 self._on_refreshed()
             else:
                 self._record_failure()
@@ -364,7 +440,7 @@ class SessionNudger:
             log.exception("session refresh failed")
             self._record_failure()
         finally:
-            self._running = False
+            self.cli_lock.release()
 
 
 # What the Run now button has done most recently.
@@ -389,7 +465,8 @@ class ManualRun:
 
     This is the settings window's Run now button. It ignores the cooldown and
     the switches, because the user asked for it, but a success still asks the
-    poll loop for fresh numbers, as an automatic nudge does.
+    poll loop for fresh numbers, as an automatic nudge does. It waits for an
+    automatic nudge of the same CLI to finish before it starts.
     """
 
     def __init__(
@@ -399,8 +476,11 @@ class ManualRun:
         invoke: Callable[[str, str], CliReply] | None = None,
         on_refreshed: Callable[[], None] = lambda: None,
         start_background: Callable[[Callable[[], None]], None] = _start_daemon_thread,
+        cli_lock: threading.Lock | None = None,
     ) -> None:
         self.provider = provider
+        # Held while this provider's CLI runs; shared with its SessionNudger.
+        self.cli_lock = cli_lock or threading.Lock()
         self._invoke = invoke or (
             lambda model, effort: run_provider_cli(provider, model, effort)
         )
@@ -439,7 +519,8 @@ class ManualRun:
     ) -> None:
         """Run the CLI, keep its reply, and tell the caller; never raise."""
         try:
-            reply = self._invoke(model, effort)
+            with self.cli_lock:
+                reply = self._invoke(model, effort)
         except Exception as exc:
             log.exception("manual %s run failed", self.provider.cli_executable)
             reply = CliReply(succeeded=False, detail=f"The run failed: {exc!r}")
