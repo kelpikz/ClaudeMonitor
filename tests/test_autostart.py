@@ -143,7 +143,6 @@ def _startup_window(monkeypatch):
     monkeypatch.setattr(autostart, "startup_command", lambda: "expected command")
     model = main.build_settings_model(
         companion=_UnusedCompanion(),
-        nudgers=[],
         pollers=[],
         config=Config(),
         log_dir=Path("."),

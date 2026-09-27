@@ -9,8 +9,10 @@ claudemonitor/
   main.py                 — entry point; logging setup, single-instance mutex, poll loop, wires everything together
   usage_request.py        — the one HTTP usage request both providers make, and the single ladder of
                             ways it fails; nothing raises across this boundary
-  fetcher.py              — what is Claude's own: its credentials file, its URL, its body shape
-  codex_fetcher.py        — the same for Codex: ~/.codex/auth.json, the ChatGPT usage endpoint
+  fetcher.py              — what is Claude's own: its credentials file, its URL, its body shape,
+                            and the CLI nudge's argv and how to read the JSON result it prints
+  codex_fetcher.py        — the same for Codex: ~/.codex/auth.json, the ChatGPT usage endpoint,
+                            and the `codex exec --json` argv and the JSONL events it prints
   processor.py            — pure functions: ProviderUsageData -> DisplayState, plus the combining of
                             those states into one TrayState and one TaskbarLabel; owns all formatting,
                             including the one row per FetchError that every surface reads
@@ -24,7 +26,8 @@ claudemonitor/
   config.py               — reads/seeds %APPDATA%\claudemonitor\config.toml; exposes typed Config and
                             one ConfigSetting per writable value (read it, change it, save it)
   notifications.py        — decides when a threshold crossing warrants a desktop notification
-  cli_refresher.py        — runs a provider's CLI to wake an idle session or an expired token
+  cli_refresher.py        — runs a provider's CLI to wake an idle session or an expired token,
+                            and logs each run: the tokens it used, or why it failed
   settings.py             — the tabs, groups, and fields the settings window contains, the buffer that
                             holds an edit until Apply, and the one-window-at-a-time controller
   settings_layout.py      — where every control in that window sits; pure geometry, no user32
@@ -34,6 +37,7 @@ claudemonitor/
   win32_settings_window.py — user32/gdi32 for the settings dialog; implements the SettingsView protocol
   win32_dpi.py            — this process's DPI awareness, and what a 96-DPI constant is worth on it
   win32_text.py           — the system UI font and text measurement, shared by both windows
+  win32_clipboard.py      — puts text on the clipboard (the settings window's Copy command button)
   win32_bindings.py       — Windows constants, C structs, and function signature tables (no behavior)
 
 tests/          — pytest suite (run via uv run pytest)
@@ -99,18 +103,20 @@ All architecture docs are in `docs/`. Start with `docs/design-v1.md` for the ful
 ### Two providers
 
 Claude and Codex share every module. Everything that varies is a field on `models.Provider`: its key
-and label, its usage URL, the CLI that renews its token and the argv to run, the fetcher that answers
-for it, and the `ConfigSetting` that switches it off (`None` for Claude, which is always tracked).
-Nothing else in the application branches on which provider it is holding, and no function names one.
+and label, its usage URL, the CLI that renews its token, the function that builds its argv from a
+model and an effort, the function that reads what the CLI prints, the fetcher that answers for it,
+and `settings` — the `ProviderSettings` of its own config section, named by its key. Nothing else in
+the application branches on which provider it is holding, and no function names one.
 
 Adding a third provider is therefore:
 
 1. a fetcher module — the credentials, the URL, and the body shape; the request itself is shared;
-2. a `Provider` constant in `models.py`, plus the small deferred-import shim that calls its fetcher
-   (deferred because the fetcher imports `models` for its return type);
+2. a `Provider` constant in `models.py`, plus the small deferred-import shims that call its fetcher,
+   its argv builder, and its reply reader (deferred because that module imports `models`);
 3. a `_WORDING` entry in `processor.py` — every sentence about a provider is written there;
 4. a glyph: a mask builder in `icon_art._GLYPH_MASKS` and a tone pair in `label_art._GLYPH_COLORS`;
-5. and, only if the user may switch it off, a `[section]` in the seeded config with a `ConfigSetting`.
+5. a `[section]` in the seeded config, a `ProviderConfig` subclass on `Config`, and
+   `provider_settings(<key>)` in `config.py`. The settings window then lists it on the Providers tab.
 
 Each of those refuses to be forgotten: a missing wording, glyph, or tone raises rather than quietly
 borrowing another provider's.
@@ -118,6 +124,47 @@ borrowing another provider's.
 Both providers are judged by one nudge rule in `cli_refresher.py`: an expired token, or an untouched
 five-hour window. Codex briefly had a rule of its own, and the result was that an idle Codex window —
 the one state a single message repairs — was never woken.
+
+Each of those two reasons has its own switch per provider (`renew_token`, `wake_session`), and each
+provider has its own cooldown, model, and effort. A `SessionNudger` reads them from the running
+config on every poll through a `RefreshOptions` callable, so nothing has to push a change into it.
+Each run is logged: the tokens it used, or the CLI's own reason when it failed. The CLIs are asked
+for JSON (`--output-format json`, `--json`) so that reason and those counts can be read; free text
+on stderr gave neither.
+
+### A lean nudge
+
+A nudge only has to make one authenticated request, so each `cli_arguments` strips the request
+down to that: no tools, no MCP servers, no skills or plugins, no CLAUDE.md or AGENTS.md, and a
+one-line system prompt (`NUDGE_INSTRUCTIONS`). A blank effort asks for low. This cut Claude from
+about 27,700 tokens to about 600 and Codex from about 21,100 to about 1,900. Both CLIs start in an
+empty folder under `%TEMP%` (`cli_refresher._quiet_folder`). Measurements and gotchas are in
+`docs/agentNotes/2026-09-23-claude-nudge-token-cost.md`. The rules that keep it working:
+
+- **Never `claude --bare`.** It never reads OAuth, so it can neither renew a token nor start a
+  subscription window. `--setting-sources=` is what drops CLAUDE.md, and OAuth still works with it.
+- **The copied command must be the run command.** Settings offers the argv to copy, so no argument
+  is empty (`--tools=`, not `--tools ""`) and no Codex `-c` value has a double quote. PowerShell 5.1
+  drops the first and strips the second. Codex reads a value that is not valid TOML as a string.
+- **Codex features go off with `-c features.<name>=false`, never `--disable <name>`.** `--disable`
+  stops Codex on a name it does not know, so a Codex update that removes one would break every
+  nudge. An unknown `-c` key is ignored without a warning, so check each new key with a real run.
+- **Codex MCP servers go off one by one.** `mcp_servers={}` does not remove them.
+  `codex_fetcher._configured_mcp_servers` reads their names from `$CODEX_HOME/config.toml`.
+  `tests/conftest.py` points `CODEX_HOME` at an empty folder, so no test reads this machine's config.
+
+The Auto-refresh group of each provider has **Copy command** and **Run now**. Under it, a group
+"Last run" holds a read-only box in Consolas (`win32_text.create_monospace_font`). The window hides
+a group that holds only output boxes while all of them are empty, caption and border included, so
+"Last run" appears only after the first copy or run: an idle `manual_run_text` is "". Run now is a `cli_refresher.ManualRun`: one run at a time, no cooldown, and a success wakes
+the poll loop. Both buttons act on the model and effort shown, applied or not. The box shows the
+reply, the tokens, the cost (Claude reports one; Codex does not), and the command. It is written by
+`processor.manual_run_text`. The run finishes on a thread of its own, so the window is told through
+a posted `_WM_OUTPUT_CHANGED` and rereads the box on its own thread.
+
+Every provider can be switched off, Claude too. With none tracked the taskbar label hides (an empty
+label; `visible` still holds the user's choice) and the tray icon stays grey, because Settings is
+where a provider is switched back on.
 
 ### One row per failure
 
@@ -180,11 +227,20 @@ things sits, and `win32_settings_window.py` is the only one that calls user32. T
 tested without a desktop.
 
 The window is a tabbed dialog — General, Providers, Taskbar — of captioned group boxes, with
-OK / Cancel / Apply along the bottom. **Nothing is written as it is clicked.** Every change goes into
-a `PendingSettings` buffer and reaches the real setting only on OK or Apply, which is what lets
-Cancel mean cancel. Each write changes the running application as well as `config.toml`: a new poll
-interval resets every `ProviderPoller`, a new cooldown reaches every `SessionNudger`, and a new
-threshold is followed by a wake-up so the icon redraws at once.
+OK / Cancel / Apply along the bottom. The Providers tab has a list of providers on the left. The
+selected provider's section is on the right: Tracking and Auto-refresh (two switches, cooldown, a
+model text box with a "CLI default" placeholder, an effort drop-down, Copy command and Run now on one
+row), and Last run (hidden until there is a run). Buttons that follow each other share a row
+(`settings_layout._rows`). A tab gets this layout by
+holding `sections` in place of `groups`. `SettingsTab.add_section` puts an "Add provider…" button
+under the list. The layout and the window support it, but `build_settings` keeps it commented out
+until a provider can be added at run time.
+**Nothing is written as it is clicked.** Every change goes into a `PendingSettings` buffer and
+reaches the real setting only on OK or Apply, which is what lets Cancel mean cancel. Each write
+changes the running application as well as `config.toml`: a new poll interval resets every
+`ProviderPoller`, a provider's refresh settings are read by its `SessionNudger` at the next poll,
+and a new threshold is followed by a wake-up so the icon redraws at once. The effort list is a `CBS_DROPDOWNLIST` combo box; in dark mode it needs the
+`DarkMode_CFD` theme, because it ignores `DarkMode_Explorer`.
 
 ### What the settings dialog fights with Windows about
 
@@ -193,7 +249,8 @@ Four arrangements are load-bearing, and each one was a visible bug first:
 - **Each tab page is a window, not a set of loose controls.** Laying every page's controls onto the
   frame and hiding the inactive ones looks the same until the first tab change, when whatever the
   hidden controls last drew stays printed on the page. A hidden control cannot repaint the pixels it
-  owns, and no invalidation of the frame or of a group box reaches them.
+  owns, and no invalidation of the frame or of a group box reaches them. For the same reason, each
+  section of the Providers tab is a window of its own on the page.
 - **A page must not have `WS_CLIPCHILDREN`.** A themed group box or checkbox paints no background of
   its own — it asks its parent to paint one. With the children clipped out of the page's erase, the
   frame's grey shows through the middle of every group box.

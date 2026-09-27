@@ -13,13 +13,11 @@ from typing import Callable
 
 import pystray
 
-from . import autostart, cli_refresher, processor, tray
+from . import autostart, cli_refresher, processor, tray, win32_clipboard
 from .config import (
     AMBER_THRESHOLD,
     POLL_INTERVAL,
     RED_THRESHOLD,
-    REFRESH_COOLDOWN,
-    SESSION_REFRESH_ENABLED,
     TASKBAR_ENABLED,
     Config,
     ConfigSetting,
@@ -29,7 +27,11 @@ from .models import PROVIDERS, DisplayState, Provider, ProviderUsageData
 from .notifications import ThresholdNotifier, UsageNotification
 from .settings import (
     ProviderFields,
+    SettingChoice,
+    SettingCommand,
     SettingNumber,
+    SettingOutput,
+    SettingText,
     SettingToggle,
     SettingsModel,
     SettingsView,
@@ -50,8 +52,8 @@ _DISPLAY_REFRESH_INTERVAL_SECONDS = 1
 _CTRL_C_EVENT = 0
 _CTRL_BREAK_EVENT = 1
 
-# Used only when no provider is being tracked, which cannot normally happen:
-# Claude is always on. It keeps the loop's wait from collapsing to zero.
+# Used when the user has switched every provider off. It keeps the loop's
+# wait from collapsing to zero while it waits for one to be switched on.
 _FALLBACK_POLL_INTERVAL_SECONDS = 60
 
 
@@ -81,50 +83,9 @@ def _set_taskbar_visibility(companion: TaskbarDisplay, visible: bool) -> None:
     TASKBAR_ENABLED.save(visible)
 
 
-def _set_session_refresh(
-    nudgers: list[cli_refresher.SessionNudger],
-    enabled: bool,
-) -> None:
-    """Switch every provider's CLI nudge on or off together.
-
-    One switch for both: the nudge exists to renew an expired token, and a
-    user who wants that automated wants it for whichever CLI needs it.
-    """
-    for nudger in nudgers:
-        nudger.set_enabled(enabled)
-    SESSION_REFRESH_ENABLED.save(enabled)
-
-
-def _set_session_refresh_cooldown(
-    nudgers: list[cli_refresher.SessionNudger],
-    config: Config,
-    seconds: int,
-) -> None:
-    """Change how long a nudge waits before it may run again.
-
-    The running nudgers are told as well as the file, or the new gap would
-    only take effect at the next launch.
-    """
-    REFRESH_COOLDOWN.write(config, seconds)
-    for nudger in nudgers:
-        nudger.set_cooldown_seconds(seconds)
-    REFRESH_COOLDOWN.save(seconds)
-
-
-def _session_refresh_is_enabled(
-    nudgers: list[cli_refresher.SessionNudger],
-) -> bool:
-    """Return the shared nudge setting, as the tray checkmark reads it."""
-    return any(nudger.enabled for nudger in nudgers)
-
-
 def _is_tracked(provider: Provider, config: Config) -> bool:
-    """Return whether the user is tracking this provider at all.
-
-    A provider with no tracking setting is always shown — Claude has none,
-    because an application showing nothing is not a state worth offering.
-    """
-    return provider.tracking is None or bool(provider.tracking.read(config))
+    """Return whether the user is tracking this provider at all."""
+    return bool(provider.settings.tracking.read(config))
 
 
 def _set_tracking(
@@ -138,9 +99,31 @@ def _set_tracking(
     Only a poll decides which providers are shown, so without the wake-up the
     switch would appear to do nothing for up to a polling interval.
     """
-    provider.tracking.write(config, enabled)
-    provider.tracking.save(enabled)
+    provider.settings.tracking.write(config, enabled)
+    provider.settings.tracking.save(enabled)
     wake_poll_loop()
+
+
+def _set_provider_setting(config: Config, setting: ConfigSetting, value: object) -> None:
+    """Change one of a provider's refresh settings, in the app and in the file.
+
+    Each nudger reads its settings from the running config on every poll, so
+    changing the config is all it takes for the next poll to use the value.
+    """
+    setting.write(config, value)
+    setting.save(value)
+
+
+def refresh_options(provider: Provider, config: Config) -> cli_refresher.RefreshOptions:
+    """Read one provider's nudge settings out of the running config."""
+    settings = provider.settings
+    return cli_refresher.RefreshOptions(
+        renew_token=bool(settings.renew_token.read(config)),
+        wake_session=bool(settings.wake_session.read(config)),
+        cooldown_seconds=float(settings.cooldown.read(config)),
+        model=str(settings.model.read(config)),
+        effort=str(settings.effort.read(config)),
+    )
 
 
 def _set_poll_interval(
@@ -185,21 +168,82 @@ _MIN_REFRESH_COOLDOWN_SECONDS = 60
 _MAX_REFRESH_COOLDOWN_SECONDS = 86_400
 
 
+def _provider_toggle(config: Config, setting: ConfigSetting) -> SettingToggle:
+    """Wire one of a provider's switches to its own setting."""
+    return SettingToggle(
+        is_on=lambda: bool(setting.read(config)),
+        write=lambda enabled: _set_provider_setting(config, setting, enabled),
+    )
+
+
+def _copy_command(
+    run: cli_refresher.ManualRun,
+    model: str,
+    effort: str,
+    copy_text: Callable[[str], bool],
+    changed: Callable[[], None],
+) -> None:
+    """Put one provider's nudge on the clipboard, and say so in the box under it."""
+    command = cli_refresher.command_line(run.provider, model.strip(), effort)
+    if not copy_text(command):
+        return
+    run.note_copied(command)
+    changed()
+
+
+def _run_now(
+    run: cli_refresher.ManualRun,
+    model: str,
+    effort: str,
+    changed: Callable[[], None],
+) -> None:
+    """Start one provider's nudge, and have the box redrawn now and when it ends."""
+    if run.start(model, effort, finished=changed):
+        changed()
+
+
 def _provider_fields(
     provider: Provider,
     config: Config,
     wake_poll_loop: Callable[[], None],
+    manual_run: cli_refresher.ManualRun,
+    copy_text: Callable[[str], bool],
 ) -> ProviderFields:
-    """Wire one provider's box in the settings window to the setting it holds."""
-    if provider.tracking is None:
-        return ProviderFields(provider=provider)
+    """Wire one provider's tab in the settings window to the settings it holds."""
+    settings = provider.settings
     return ProviderFields(
         provider=provider,
         tracking=SettingToggle(
             is_on=lambda: _is_tracked(provider, config),
-            write=lambda enabled: _set_tracking(
-                provider, config, wake_poll_loop, enabled
+            write=lambda enabled: _set_tracking(provider, config, wake_poll_loop, enabled),
+        ),
+        renew_token=_provider_toggle(config, settings.renew_token),
+        wake_session=_provider_toggle(config, settings.wake_session),
+        cooldown=SettingNumber(
+            value=lambda: int(settings.cooldown.read(config)),
+            write=lambda seconds: _set_provider_setting(config, settings.cooldown, seconds),
+            minimum=_MIN_REFRESH_COOLDOWN_SECONDS,
+            maximum=_MAX_REFRESH_COOLDOWN_SECONDS,
+        ),
+        model=SettingText(
+            value=lambda: str(settings.model.read(config)),
+            # A space around a pasted name would reach the CLI as part of it.
+            write=lambda name: _set_provider_setting(config, settings.model, name.strip()),
+        ),
+        effort=SettingChoice(
+            value=lambda: str(settings.effort.read(config)),
+            write=lambda level: _set_provider_setting(config, settings.effort, level),
+        ),
+        copy_command=SettingCommand(
+            act=lambda model, effort, changed: _copy_command(
+                manual_run, model, effort, copy_text, changed
             ),
+        ),
+        run_command=SettingCommand(
+            act=lambda model, effort, changed: _run_now(manual_run, model, effort, changed),
+        ),
+        last_run=SettingOutput(
+            text=lambda: processor.manual_run_text(provider, manual_run.state),
         ),
     )
 
@@ -207,18 +251,28 @@ def _provider_fields(
 def build_settings_model(
     *,
     companion: TaskbarDisplay,
-    nudgers: list[cli_refresher.SessionNudger],
     pollers: list["ProviderPoller"],
     config: Config,
     log_dir: Path,
     providers: tuple[Provider, ...] = PROVIDERS,
     wake_poll_loop: Callable[[], None] = lambda: None,
+    manual_runs: dict[str, cli_refresher.ManualRun] | None = None,
+    copy_text: Callable[[str], bool] = win32_clipboard.copy_text,
 ) -> SettingsModel:
     """Point every field in the settings window at the thing it controls.
 
     Each write changes the running application as well as the config file, so
     Apply means what it says: nothing here waits for the next launch.
+
+    Each provider's Run now button has a ``ManualRun`` of its own. The model is
+    built once at startup, so each run lives as long as the application: the
+    box under the button still shows the last run when the window is opened
+    again.
     """
+    runs = manual_runs or {
+        provider.key: cli_refresher.ManualRun(provider, on_refreshed=wake_poll_loop)
+        for provider in providers
+    }
     return build_settings(
         taskbar=SettingToggle(
             is_on=lambda: companion.visible,
@@ -226,13 +280,11 @@ def build_settings_model(
             available=lambda: companion.healthy,
         ),
         providers=[
-            _provider_fields(provider, config, wake_poll_loop)
+            _provider_fields(
+                provider, config, wake_poll_loop, runs[provider.key], copy_text
+            )
             for provider in providers
         ],
-        session_refresh=SettingToggle(
-            is_on=lambda: _session_refresh_is_enabled(nudgers),
-            write=lambda enabled: _set_session_refresh(nudgers, enabled),
-        ),
         startup=SettingToggle(
             is_on=lambda: _startup_registration_enabled(autostart.is_enabled),
             write=lambda enabled: _set_startup_registration(
@@ -262,14 +314,6 @@ def build_settings_model(
             ),
             minimum=_MIN_THRESHOLD_PERCENT,
             maximum=_MAX_THRESHOLD_PERCENT,
-        ),
-        refresh_cooldown=SettingNumber(
-            value=lambda: int(REFRESH_COOLDOWN.read(config)),
-            write=lambda seconds: _set_session_refresh_cooldown(
-                nudgers, config, seconds
-            ),
-            minimum=_MIN_REFRESH_COOLDOWN_SECONDS,
-            maximum=_MAX_REFRESH_COOLDOWN_SECONDS,
         ),
         log_dir=log_dir,
     )
@@ -397,12 +441,12 @@ def create_session_nudger(
     Waking the loop matters because the whole point of the nudge is that the
     numbers it produces are newer than the ones that triggered it. Which CLI to
     run is the provider's own business, so there is one of these, not one per
-    provider.
+    provider. Its settings are read from the running config on every poll, so
+    a change made in the settings window reaches it without being passed on.
     """
     return cli_refresher.SessionNudger(
         provider,
-        enabled=cfg.session_refresh.enabled,
-        cooldown_seconds=cfg.session_refresh.cooldown_seconds,
+        options=lambda: refresh_options(provider, cfg),
         on_refreshed=manual_refresh.set,
         **overrides,
     )
@@ -579,7 +623,6 @@ def main() -> None:
     settings_window = create_settings_controller(
         build_settings_model(
             companion=companion,
-            nudgers=nudgers,
             pollers=pollers,
             config=cfg,
             log_dir=log_dir,

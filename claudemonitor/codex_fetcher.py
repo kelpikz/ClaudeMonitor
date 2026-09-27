@@ -2,7 +2,8 @@
 
 Only what is Codex's own is here: where the Codex CLI keeps its ``auth.json``,
 how to read an expiry out of the JWT it holds, which URL to ask, and how to
-read the body that comes back. The request itself, and every way it can fail,
+read the body that comes back — and, for the session nudge, what to ask the
+Codex CLI and how to read the events it prints. The request itself, and every way it can fail,
 is in ``usage_request``, which both providers share.
 
 This module only ever reads that credentials file — refreshing an expired
@@ -15,11 +16,20 @@ import base64
 import binascii
 import json
 import os
+import re
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import ProviderUsageData, UsageWindow
+from .cli_refresher import (
+    DEFAULT_NUDGE_EFFORT,
+    NUDGE_INSTRUCTIONS,
+    last_output_line,
+    parsed_object,
+    token_count,
+)
+from .models import CliReply, ProviderUsageData, UsageWindow
 from .usage_request import UsageEndpoint, UsageWindows, fetch_usage
 
 _USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -35,12 +45,15 @@ class CodexCredentials:
     expires_at: datetime | None
 
 
-def _auth_path() -> Path:
-    """Locate the Codex CLI's credential file, honoring a CODEX_HOME override."""
+def _codex_home() -> Path:
+    """Locate the Codex CLI's own folder, honoring a CODEX_HOME override."""
     codex_home = os.environ.get("CODEX_HOME")
-    if codex_home:
-        return Path(codex_home) / "auth.json"
-    return Path.home() / ".codex" / "auth.json"
+    return Path(codex_home) if codex_home else Path.home() / ".codex"
+
+
+def _auth_path() -> Path:
+    """Locate the Codex CLI's credential file."""
+    return _codex_home() / "auth.json"
 
 
 def _token_expiry(access_token: str) -> datetime | None:
@@ -130,3 +143,182 @@ def _endpoint() -> UsageEndpoint:
 def fetch() -> ProviderUsageData:
     """Return current Codex usage, encoding every failure as data."""
     return fetch_usage(_endpoint, named=PROVIDER_NAME)
+
+
+def cli_arguments(model: str, effort: str) -> tuple[str, ...]:
+    """Ask the Codex CLI for one non-interactive turn, printed as JSON events.
+
+    read-only keeps a stray model reply from editing real files, and the repo
+    check would otherwise refuse to start from the tray app's directory.
+
+    Every override after that removes something a one-word reply does not need:
+    the long base instructions, AGENTS.md, the prompt sections, the tools, the
+    plugins, and the user's MCP servers. That cut a nudge from about 21,100
+    tokens to about 1,900. The user's own config is still read, so a blank
+    model is the one it names; a blank effort asks for low, because that
+    config may ask for far more reasoning than a one-word prompt needs.
+    """
+    return (
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        *(("-m", model) if model else ()),
+        *_overrides(
+            f"model_reasoning_effort={effort or DEFAULT_NUDGE_EFFORT}",
+            f"instructions={NUDGE_INSTRUCTIONS}",
+            *_LEAN_PROMPT_OVERRIDES,
+            *(f"features.{feature}=false" for feature in _UNNEEDED_FEATURES),
+            *(f"mcp_servers.{name}.enabled=false" for name in _configured_mcp_servers()),
+        ),
+        "hi",
+    )
+
+
+# Each value is written without quotes. Codex reads a value that is not valid
+# TOML as a plain string, and PowerShell 5.1 strips the inner quotes of a
+# command the user copies. `base_instructions` is not here because Codex
+# ignores it; `instructions` is the key it reads.
+_LEAN_PROMPT_OVERRIDES: tuple[str, ...] = (
+    "project_doc_max_bytes=0",
+    "include_permissions_instructions=false",
+    "include_apps_instructions=false",
+    "include_environment_context=false",
+    "include_collaboration_mode_instructions=false",
+    "skills.include_instructions=false",
+    "agents.enabled=false",
+    "web_search=disabled",
+    "notify=[]",
+)
+
+# Switched off with `-c features.<name>=false` rather than `--disable <name>`:
+# --disable stops Codex on a name it does not know, so a feature removed by a
+# Codex update would break every nudge. An unknown `-c` key is ignored.
+_UNNEEDED_FEATURES: tuple[str, ...] = (
+    "plugins",
+    "apps",
+    "hooks",
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+    "multi_agent",
+    "goals",
+    "image_generation",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "sleep_tool",
+    "tool_suggest",
+    "skill_search",
+    "code_mode_host",
+    "workspace_dependencies",
+)
+
+# A name that is a TOML bare key, so it can sit in a dotted path unquoted.
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _overrides(*settings: str) -> tuple[str, ...]:
+    """Write each setting as the `-c key=value` pair Codex reads it from."""
+    return tuple(part for setting in settings for part in ("-c", setting))
+
+
+def _configured_mcp_servers() -> tuple[str, ...]:
+    """Name every MCP server the user's Codex config starts.
+
+    `mcp_servers={}` does not remove them, so each one is switched off by name.
+    A name that would need quotes is skipped, and an unreadable config names
+    none: the nudge then costs a few hundred tokens more, but it still runs.
+    """
+    try:
+        config = tomllib.loads(_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ()
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return ()
+    return tuple(name for name in servers if _BARE_KEY.match(name))
+
+
+def _config_path() -> Path:
+    """Locate the Codex CLI's config file, honoring a CODEX_HOME override."""
+    return _codex_home() / "config.toml"
+
+
+def read_cli_reply(returncode: int, stdout: str, stderr: str) -> CliReply:
+    """Read the JSON events `codex exec --json` prints, one per line.
+
+    A completed turn is the only proof of a real request. An error event
+    before it may be a retry notice the CLI recovered from, so errors are
+    only read when no turn completed.
+    """
+    events = _events(stdout)
+    completed = next(
+        (event for event in reversed(events) if event.get("type") == "turn.completed"),
+        None,
+    )
+    if returncode == 0 and completed is not None:
+        usage = completed.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        return CliReply(
+            succeeded=True,
+            input_tokens=token_count(usage, "input_tokens"),
+            output_tokens=token_count(usage, "output_tokens"),
+            reply_text=_reply_text(events),
+        )
+    return CliReply(succeeded=False, detail=_failure_detail(events, returncode, stderr))
+
+
+def _reply_text(events: list[dict]) -> str:
+    """Return what the model answered: the text of its last message.
+
+    Other items complete too — a reasoning item, say — and carry no text.
+    """
+    for event in reversed(events):
+        item = event.get("item")
+        if event.get("type") == "item.completed" and isinstance(item, dict):
+            if item.get("type") == "agent_message" and item.get("text"):
+                return str(item["text"]).strip()
+    return ""
+
+
+def _events(stdout: str) -> list[dict]:
+    """Parse each line that is a JSON object, skipping any that is not."""
+    parsed = (parsed_object(line) for line in stdout.splitlines())
+    return [event for event in parsed if event is not None]
+
+
+def _failure_detail(events: list[dict], returncode: int, stderr: str) -> str:
+    """Say why a run failed: its last error event, its last error line, or its code."""
+    for event in reversed(events):
+        message = _event_message(event)
+        if message:
+            return _plain_message(message)
+    if last_output_line(stderr):
+        return last_output_line(stderr)
+    if returncode != 0:
+        return f"The Codex CLI exited with code {returncode}."
+    return "The Codex CLI finished without a reply."
+
+
+def _event_message(event: dict) -> str:
+    """Return the message an error or failed-turn event carries, if any."""
+    if event.get("type") == "turn.failed":
+        error = event.get("error")
+        return str(error.get("message") or "") if isinstance(error, dict) else ""
+    if event.get("type") == "error":
+        return str(event.get("message") or "")
+    return ""
+
+
+def _plain_message(message: str) -> str:
+    """Unwrap an API error body that the CLI passed on as its message."""
+    body = parsed_object(message)
+    if body is None:
+        return message.strip()
+    error = body.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        return str(error["message"])
+    return str(body.get("message") or message).strip()

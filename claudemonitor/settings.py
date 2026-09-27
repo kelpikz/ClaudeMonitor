@@ -83,16 +83,75 @@ class SettingNumber:
 
 
 @dataclass(frozen=True)
-class ProviderFields:
-    """One provider's own box on the Providers tab.
+class SettingText:
+    """One free-text setting: a labelled box the user types into.
 
-    ``tracking`` is the switch that turns the provider off, and is ``None``
-    for a provider the application always shows. The box is built from the
-    ``Provider`` itself, so a third provider adds no code to this module.
+    ``placeholder`` is the grey text the box shows while it is empty, because
+    an empty box means something (the CLI's own default) and looks like nothing.
+    """
+
+    value: Callable[[], str]
+    write: Callable[[str], None]
+    key: str = ""
+    label: str = ""
+    placeholder: str = ""
+
+
+@dataclass(frozen=True)
+class SettingChoice:
+    """One setting picked from a list: each choice is (stored value, shown label)."""
+
+    value: Callable[[], str]
+    write: Callable[[str], None]
+    choices: tuple[tuple[str, str], ...] = ()
+    key: str = ""
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class SettingCommand:
+    """A button that acts on the model and effort being edited, not the saved ones.
+
+    A user who types a model and clicks Run now means that model, whether or
+    not Apply was clicked first. ``act`` is given the model, the effort, and a
+    function to call whenever the text an output box shows has changed; it may
+    call that from any thread.
+    """
+
+    act: Callable[[str, str, Callable[[], None]], None]
+    model_key: str = ""
+    effort_key: str = ""
+    key: str = ""
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class SettingOutput:
+    """A read-only box that shows text the application writes, such as the last run."""
+
+    text: Callable[[], str]
+    key: str = ""
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderFields:
+    """Everything in one provider's section, wired to the setting each one holds.
+
+    The section is built from the ``Provider`` itself, so a third provider adds
+    no code to this module.
     """
 
     provider: Provider
-    tracking: SettingToggle | None = None
+    tracking: SettingToggle
+    renew_token: SettingToggle
+    wake_session: SettingToggle
+    cooldown: SettingNumber
+    model: SettingText
+    effort: SettingChoice
+    copy_command: SettingCommand
+    run_command: SettingCommand
+    last_run: SettingOutput
 
 
 @dataclass(frozen=True)
@@ -104,8 +163,16 @@ class SettingLink:
     open: Callable[[], None]
 
 
-SettingField = Union[SettingToggle, SettingNumber, SettingLink]
-EditableField = Union[SettingToggle, SettingNumber]
+SettingField = Union[
+    SettingToggle,
+    SettingNumber,
+    SettingText,
+    SettingChoice,
+    SettingLink,
+    SettingCommand,
+    SettingOutput,
+]
+EditableField = Union[SettingToggle, SettingNumber, SettingText, SettingChoice]
 
 
 @dataclass(frozen=True)
@@ -117,11 +184,33 @@ class SettingsGroup:
 
 
 @dataclass(frozen=True)
-class SettingsTab:
-    """One page of the tabbed dialog."""
+class SettingsSection:
+    """One entry in a tab's side list, and the groups shown while it is picked."""
 
     title: str
     groups: list[SettingsGroup] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SettingsTab:
+    """One page of the tabbed dialog.
+
+    A page holds either its own ``groups`` or a list of ``sections`` picked
+    from a list down its left side. ``add_section`` is a button under that
+    list; it adds an entry rather than holding a setting, so it is not a field.
+    """
+
+    title: str
+    groups: list[SettingsGroup] = field(default_factory=list)
+    sections: list[SettingsSection] = field(default_factory=list)
+    add_section: SettingLink | None = None
+
+    def all_groups(self) -> list[SettingsGroup]:
+        """Every group on this page: its own, then each section's in list order."""
+        return [
+            *self.groups,
+            *(group for section in self.sections for group in section.groups),
+        ]
 
 
 @dataclass(frozen=True)
@@ -137,7 +226,7 @@ class SettingsModel:
         a field sits in, so it walks this rather than the tree.
         """
         return [
-            item for tab in self.tabs for group in tab.groups for item in group.fields
+            item for tab in self.tabs for group in tab.all_groups() for item in group.fields
         ]
 
     def editable(self) -> list[EditableField]:
@@ -145,7 +234,7 @@ class SettingsModel:
         return [
             item
             for item in self.fields()
-            if isinstance(item, (SettingToggle, SettingNumber))
+            if isinstance(item, (SettingToggle, SettingNumber, SettingText, SettingChoice))
         ]
 
     def links(self) -> list[SettingLink]:
@@ -170,17 +259,15 @@ def build_settings(
     *,
     taskbar: SettingToggle,
     providers: list[ProviderFields],
-    session_refresh: SettingToggle,
     startup: SettingToggle,
     poll_interval: SettingNumber,
     amber_threshold: SettingNumber,
     red_threshold: SettingNumber,
-    refresh_cooldown: SettingNumber,
     log_dir: Path,
     open_url: Callable[[str], None] | None = None,
     open_folder: Callable[[str], None] | None = None,
 ) -> SettingsModel:
-    """Describe the settings window: three tabs of grouped fields.
+    """Describe the settings window: General, Providers, and Taskbar.
 
     The wording is here rather than in the caller so every user-facing string
     about settings stays in one file, as the tray's own labels do.
@@ -239,25 +326,12 @@ def build_settings(
             ),
             SettingsTab(
                 title="Providers",
-                groups=[
-                    SettingsGroup(
-                        title="Sessions",
-                        fields=[
-                            _toggle(
-                                "session_refresh",
-                                "Auto-refresh idle sessions",
-                                session_refresh,
-                            ),
-                            _number(
-                                "refresh_cooldown",
-                                "Wait between refreshes",
-                                "seconds",
-                                refresh_cooldown,
-                            ),
-                        ],
-                    ),
-                    *[_provider_group(entry, open_page) for entry in providers],
-                ],
+                sections=[_provider_section(entry, open_page) for entry in providers],
+                # Not offered yet: every provider this build knows is already
+                # listed. Switch it on once a provider can be added at run time.
+                # add_section=SettingLink(
+                #     key="add_provider", label="Add provider…", open=...
+                # ),
             ),
             SettingsTab(
                 title="Taskbar",
@@ -274,34 +348,81 @@ def build_settings(
     )
 
 
-def _provider_group(
+def _provider_section(
     entry: ProviderFields,
     open_page: Callable[[str], None],
-) -> SettingsGroup:
-    """Build one provider's box: its tracking switch, if it has one, and its link.
+) -> SettingsSection:
+    """Build one provider's entry in the list: tracking, and how its CLI is refreshed.
 
     The keys are derived from the provider's own key, so two providers can
     never be given the same one and a third needs no new name here.
     """
     provider = entry.provider
-    fields: list[SettingField] = []
-    if entry.tracking is not None:
-        fields.append(
-            _toggle(
-                f"{provider.key}_tracking",
-                f"Track {provider.label} usage",
-                entry.tracking,
-            )
-        )
-    fields.append(
-        SettingLink(
-            key=f"{provider.key}_usage",
-            label=f"{provider.label} usage online",
-            # Bound now rather than read from the loop variable when clicked.
-            open=lambda url=provider.usage_url: open_page(url),
-        )
+    key = provider.key
+    return SettingsSection(
+        title=provider.label,
+        groups=[
+            SettingsGroup(
+                title="Tracking",
+                fields=[
+                    _toggle(f"{key}_tracking", f"Track {provider.label} usage", entry.tracking),
+                    SettingLink(
+                        key=f"{key}_usage",
+                        label=f"{provider.label} usage online",
+                        # Bound now rather than read from a loop variable when clicked.
+                        open=lambda url=provider.usage_url: open_page(url),
+                    ),
+                ],
+            ),
+            SettingsGroup(
+                title="Auto-refresh",
+                fields=[
+                    _toggle(f"{key}_renew_token", "Renew an expired token", entry.renew_token),
+                    _toggle(
+                        f"{key}_wake_session", "Start an idle 5-hour window", entry.wake_session
+                    ),
+                    _number(f"{key}_cooldown", "Wait between runs", "seconds", entry.cooldown),
+                    replace(
+                        entry.model,
+                        key=f"{key}_model",
+                        label="Model",
+                        placeholder=f"{provider.label} CLI default",
+                    ),
+                    replace(
+                        entry.effort,
+                        key=f"{key}_effort",
+                        label="Reasoning effort",
+                        choices=_effort_choices(provider),
+                    ),
+                    _command(key, "copy_command", "Copy command", entry.copy_command),
+                    _command(key, "run_command", "Run now", entry.run_command),
+                ],
+            ),
+            # A group of its own, because the window hides a group that holds
+            # only empty boxes: before the first copy or run there is nothing
+            # to show.
+            SettingsGroup(
+                title="Last run",
+                fields=[replace(entry.last_run, key=f"{key}_last_run")],
+            ),
+        ],
     )
-    return SettingsGroup(title=provider.label, fields=fields)
+
+
+def _command(key: str, name: str, label: str, command: SettingCommand) -> SettingCommand:
+    """Name one command button and point it at its own section's model and effort."""
+    return replace(
+        command,
+        key=f"{key}_{name}",
+        label=label,
+        model_key=f"{key}_model",
+        effort_key=f"{key}_effort",
+    )
+
+
+def _effort_choices(provider: Provider) -> tuple[tuple[str, str], ...]:
+    """Name each effort level the provider's CLI accepts; blank asks for low."""
+    return tuple((level, level or "Default (low)") for level in provider.effort_levels)
 
 
 def _toggle(key: str, label: str, toggle: SettingToggle) -> SettingToggle:
@@ -323,9 +444,9 @@ class PendingSettings:
 
     def __init__(self, model: SettingsModel) -> None:
         self._fields = {field.key: field for field in model.editable()}
-        self._edited: dict[str, bool | int] = {}
+        self._edited: dict[str, bool | int | str] = {}
 
-    def value_of(self, key: str) -> bool | int | None:
+    def value_of(self, key: str) -> bool | int | str | None:
         """Return the pending value if there is one, otherwise the stored one."""
         if key in self._edited:
             return self._edited[key]
@@ -334,7 +455,7 @@ class PendingSettings:
             return None
         return self._stored(field)
 
-    def edit(self, key: str, value: bool | int) -> None:
+    def edit(self, key: str, value: bool | int | str) -> None:
         """Record a change, forgetting it again if it matches what is stored.
 
         Clicking a checkbox twice leaves the setting where it started, and an
@@ -376,15 +497,21 @@ class PendingSettings:
                 log.exception("unable to save the %r setting", key)
         self._edited.clear()
 
-    def _stored(self, field: EditableField) -> bool | int:
-        """Read one real setting, treating an unreadable one as off or zero."""
+    def _stored(self, field: EditableField) -> bool | int | str:
+        """Read one real setting, treating an unreadable one as off, least, or empty."""
         try:
             if isinstance(field, SettingToggle):
                 return bool(field.is_on())
-            return int(field.value())
+            if isinstance(field, SettingNumber):
+                return int(field.value())
+            return str(field.value())
         except Exception:
             log.exception("unable to read the %r setting", field.key)
-            return False if isinstance(field, SettingToggle) else field.minimum
+            if isinstance(field, SettingToggle):
+                return False
+            if isinstance(field, SettingNumber):
+                return field.minimum
+            return ""
 
 
 class SettingsView(Protocol):

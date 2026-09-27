@@ -6,7 +6,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel
 
-from .config import CODEX_ENABLED, ConfigSetting
+from .config import CLAUDE_SETTINGS, CODEX_SETTINGS, ProviderSettings
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,58 @@ def _codex_usage() -> "ProviderUsageData":
     return codex_fetcher.fetch()
 
 
+def _claude_cli_arguments(model: str, effort: str) -> tuple[str, ...]:
+    """Build Claude's nudge argv; deferred for the same reason as its fetch."""
+    from . import fetcher
+
+    return fetcher.cli_arguments(model, effort)
+
+
+def _claude_cli_reply(returncode: int, stdout: str, stderr: str) -> "CliReply":
+    """Read what Claude's CLI printed; deferred for the same reason."""
+    from . import fetcher
+
+    return fetcher.read_cli_reply(returncode, stdout, stderr)
+
+
+def _codex_cli_arguments(model: str, effort: str) -> tuple[str, ...]:
+    """Build Codex's nudge argv; deferred for the same reason."""
+    from . import codex_fetcher
+
+    return codex_fetcher.cli_arguments(model, effort)
+
+
+def _codex_cli_reply(returncode: int, stdout: str, stderr: str) -> "CliReply":
+    """Read what Codex's CLI printed; deferred for the same reason."""
+    from . import codex_fetcher
+
+    return codex_fetcher.read_cli_reply(returncode, stdout, stderr)
+
+
+@dataclass(frozen=True)
+class CliReply:
+    """What one run of a provider's CLI answered.
+
+    ``detail`` is one sentence saying why a run failed, in the CLI's own words
+    where it gave any. ``reply_text`` is what the model answered. The counts,
+    the cost, and the duration are ``None`` when nobody could say: Codex never
+    reports a cost, and a CLI that never started has no duration.
+    """
+
+    succeeded: bool
+    detail: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reply_text: str = ""
+    cost_usd: float | None = None
+    duration_seconds: float | None = None
+
+
+# The reasoning efforts both CLIs accept. The empty one asks for low, because a
+# one-word reply needs no reasoning and the user's own default may be xhigh.
+EFFORT_LEVELS: tuple[str, ...] = ("", "low", "medium", "high", "xhigh", "max")
+
+
 @dataclass(frozen=True)
 class Provider:
     """One usage source the app tracks, and everything that varies with it.
@@ -77,23 +129,25 @@ class Provider:
     on which provider it is holding — every wrapper function that used to say
     "claude" or "codex" in its own name reads one of these fields instead.
 
-    ``tracking`` is the setting that switches the provider off. Claude has
-    none, because an application that shows nothing is not a state worth
-    offering; ``None`` therefore means "always tracked" rather than a missing
-    value. Every user-facing *sentence* about a provider is still written by
-    ``processor.py``, which owns all display strings.
+    ``settings`` names the provider's own config section: whether it is
+    tracked, and how its CLI is nudged. Every user-facing *sentence* about a
+    provider is still written by ``processor.py``, which owns all display
+    strings.
     """
 
     key: Literal["claude", "codex"]
     label: str
     # Where the settings window's "… usage online" button goes.
     usage_url: str
-    # The CLI that can renew this provider's token, and the cheapest prompt
-    # that forces it to make a real request while doing so.
+    # The CLI that can renew this provider's token, the argv of the cheapest
+    # prompt that forces it to make a real request (given a model and an
+    # effort), and how to read what it prints back.
     cli_executable: str
-    cli_arguments: tuple[str, ...]
+    cli_arguments: Callable[[str, str], tuple[str, ...]]
+    read_cli_reply: Callable[[int, str, str], CliReply]
     fetch: Callable[[], "ProviderUsageData"]
-    tracking: ConfigSetting | None = None
+    settings: ProviderSettings
+    effort_levels: tuple[str, ...] = EFFORT_LEVELS
 
 
 CLAUDE = Provider(
@@ -101,8 +155,10 @@ CLAUDE = Provider(
     label="Claude",
     usage_url="https://console.anthropic.com/settings/usage",
     cli_executable="claude",
-    cli_arguments=("-p", "--model", "haiku", "hi"),
+    cli_arguments=_claude_cli_arguments,
+    read_cli_reply=_claude_cli_reply,
     fetch=_claude_usage,
+    settings=CLAUDE_SETTINGS,
 )
 
 CODEX = Provider(
@@ -110,11 +166,10 @@ CODEX = Provider(
     label="Codex",
     usage_url="https://chatgpt.com/codex/settings/usage",
     cli_executable="codex",
-    # read-only keeps a stray model reply from editing real files, and the repo
-    # check would otherwise refuse to start from the tray app's directory.
-    cli_arguments=("exec", "--sandbox", "read-only", "--skip-git-repo-check", "hi"),
+    cli_arguments=_codex_cli_arguments,
+    read_cli_reply=_codex_cli_reply,
     fetch=_codex_usage,
-    tracking=CODEX_ENABLED,
+    settings=CODEX_SETTINGS,
 )
 
 # Every provider the application knows, in the order they are displayed.

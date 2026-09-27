@@ -264,16 +264,24 @@ class TaskbarCompanion:
                 return
         self._thread = None
 
+    def _should_show(self) -> bool:
+        """Return whether the label is wanted and has something to draw.
+
+        An empty label means no provider is tracked. It is hidden without
+        touching ``visible``, which is the user's own choice.
+        """
+        return self._visible and bool(self._segments)
+
     def _display_state(self) -> tuple[list[LabelSegment], str, bool]:
         """Take one consistent snapshot of segments, tooltip, and visibility."""
         with self._display_changed:
-            return list(self._segments), self._tooltip, self._visible
+            return list(self._segments), self._tooltip, self._should_show()
 
     def _wait_until_visible(self) -> None:
-        """Sleep without polling until the user shows the companion or quits."""
+        """Sleep without polling until the label can be shown or the app quits."""
         with self._display_changed:
             self._display_changed.wait_for(
-                lambda: self._visible or self._stop_requested.is_set()
+                lambda: self._should_show() or self._stop_requested.is_set()
             )
 
     def _run(self) -> None:

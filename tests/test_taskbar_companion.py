@@ -368,6 +368,48 @@ class TestVisibility:
         assert ("set_text", _handle(native), "80% (3h 0m)") in native.calls
         assert ("set_tooltip", _handle(native), "Claude usage\n5h: 80% left") in native.calls
 
+    def test_an_empty_label_is_hidden(self):
+        # Every provider switched off: nothing to draw, so nothing is shown.
+        native = _FakeNativeWindow()
+        companion = TaskbarCompanion(native=native)
+        original_pump = native.pump_messages
+
+        def empty_during_first_pump(stop_requested, duration_seconds):
+            companion.update([], "No provider tracked")
+            original_pump(stop_requested, duration_seconds)
+
+        native.pump_messages = empty_during_first_pump
+
+        companion.start()
+        try:
+            assert native.visibility_changed.wait(timeout=1)
+            assert ("set_visible", _handle(native), False) in native.calls
+        finally:
+            companion.stop()
+
+    def test_hiding_an_empty_label_keeps_the_user_s_choice(self):
+        # The taskbar switch reads `visible`; an empty label must not untick it.
+        companion = TaskbarCompanion(native=_FakeNativeWindow(), initial_visible=True)
+
+        companion.update([], "No provider tracked")
+
+        assert companion.visible is True
+
+    def test_an_empty_label_comes_back_when_a_provider_does(self):
+        native = _FakeNativeWindow(pump_rounds=1)
+        companion = TaskbarCompanion(native=native)
+        companion.update([], "No provider tracked")
+
+        companion.start()
+        assert native.window_created.wait(timeout=1)
+        assert not native.messages_pumped.wait(timeout=0.1)
+        companion.update(_segments("80%"), "Claude usage")
+        try:
+            assert native.messages_pumped.wait(timeout=1)
+            assert ("set_visible", _handle(native), True) in native.calls
+        finally:
+            companion.stop()
+
     def test_visibility_updates_while_native_window_is_running(self):
         native = _FakeNativeWindow()
         companion = TaskbarCompanion(native=native)

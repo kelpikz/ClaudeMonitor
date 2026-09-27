@@ -7,15 +7,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claudemonitor import cli_refresher, codex_fetcher, main, usage_request
+from claudemonitor.cli_refresher import RefreshOptions
 from claudemonitor.config import (
-    CODEX_ENABLED,
+    CLAUDE_SETTINGS,
+    CODEX_SETTINGS,
+    ClaudeConfig,
+    CodexConfig,
     Config,
     ConfigSetting,
     PollingConfig,
-    SessionRefreshConfig,
     ThresholdsConfig,
 )
-from claudemonitor.models import CLAUDE, CODEX, ProviderUsageData
+from claudemonitor.models import CLAUDE, CODEX, CliReply, ProviderUsageData
 
 import pytest
 
@@ -200,6 +203,20 @@ class TestApplyDisplay:
         ]
         assert tooltip == "Claude usage\n\nCodex usage"
 
+    def test_no_tracked_provider_hides_the_label(self, monkeypatch):
+        # An empty label is what tells the companion there is nothing to show.
+        _icon, companion, _applied = self._run(monkeypatch, [])
+
+        segments, _tooltip = companion.updates[0]
+        assert segments == []
+
+    def test_no_tracked_provider_says_so_on_the_icon(self, monkeypatch):
+        _icon, _companion, applied = self._run(monkeypatch, [])
+
+        _target, tray_state = applied[0]
+        assert tray_state.icon_color == "grey"
+        assert "no provider tracked" in tray_state.tooltip
+
     def test_codex_switched_off_mid_poll_leaves_claude_alone(self, monkeypatch):
         states = [_display_state(CLAUDE, "80%", "Claude usage")]
 
@@ -211,63 +228,93 @@ class TestApplyDisplay:
 
 
 class TestSessionNudgerWiring:
-    """A completed CLI refresh must wake the poll loop so the tray shows it at once."""
+    """Each nudger reads its own provider's section of the running config."""
 
-    def _nudger(self, **session_refresh):
+    def _nudger(self, provider=CLAUDE, config: Config | None = None):
         """Build the production nudger with a synchronous, always-succeeding CLI."""
-        cfg = Config(session_refresh=SessionRefreshConfig(**session_refresh))
+        cfg = config or Config()
         manual_refresh = threading.Event()
+        chosen: list[RefreshOptions] = []
         nudger = main.create_session_nudger(
-            CLAUDE,
+            provider,
             cfg,
             manual_refresh,
-            invoke=lambda: True,
+            invoke=lambda options: chosen.append(options) or CliReply(succeeded=True),
             start_background=lambda work: work(),
         )
-        return nudger, manual_refresh
+        return nudger, manual_refresh, chosen
 
     def test_a_successful_refresh_sets_the_manual_refresh_event(self):
-        nudger, manual_refresh = self._nudger()
+        nudger, manual_refresh, _chosen = self._nudger()
 
         data = ProviderUsageData(fetch_error="token_expired", fetched_at=NOW)
 
         assert nudger.maybe_nudge(data) is True
         assert manual_refresh.is_set()
 
-    def test_disabling_the_config_section_disables_the_nudger(self):
-        nudger, manual_refresh = self._nudger(enabled=False)
+    def test_renewing_switched_off_leaves_an_expired_token_alone(self):
+        config = Config(claude=ClaudeConfig(renew_token=False))
+        nudger, manual_refresh, _chosen = self._nudger(config=config)
 
         data = ProviderUsageData(fetch_error="token_expired", fetched_at=NOW)
 
         assert nudger.maybe_nudge(data) is False
         assert not manual_refresh.is_set()
 
-    def test_switching_it_off_stops_the_nudger_and_persists_the_choice(
-        self, saved_settings
-    ):
-        nudger, _manual_refresh = self._nudger()
+    def test_one_provider_s_switch_does_not_reach_the_other(self):
+        config = Config(claude=ClaudeConfig(renew_token=False))
+        nudger, _manual_refresh, _chosen = self._nudger(CODEX, config)
 
-        main._set_session_refresh([nudger], False)
+        data = ProviderUsageData(fetch_error="token_expired", fetched_at=NOW)
 
-        assert nudger.enabled is False
-        assert _saved_values(saved_settings, main.SESSION_REFRESH_ENABLED) == [False]
-
-    def test_switching_it_back_on_reaches_every_nudger(self, saved_settings):
-        first, _refresh = self._nudger()
-        second, _also = self._nudger()
-        main._set_session_refresh([first, second], False)
-
-        main._set_session_refresh([first, second], True)
-
-        assert first.enabled is True and second.enabled is True
+        assert nudger.maybe_nudge(data) is True
 
     def test_the_configured_cooldown_gates_the_second_attempt(self):
-        nudger, _manual_refresh = self._nudger(cooldown_seconds=10_000)
+        config = Config(claude=ClaudeConfig(cooldown_seconds=10_000))
+        nudger, _manual_refresh, _chosen = self._nudger(config=config)
 
         data = ProviderUsageData(fetch_error="token_expired", fetched_at=NOW)
 
         assert nudger.maybe_nudge(data) is True
         assert nudger.maybe_nudge(data) is False
+
+    def test_the_configured_model_and_effort_are_handed_to_the_cli(self):
+        config = Config(codex=CodexConfig(model="gpt-5.5", effort="high"))
+        nudger, _manual_refresh, chosen = self._nudger(CODEX, config)
+
+        nudger.maybe_nudge(ProviderUsageData(fetch_error="token_expired", fetched_at=NOW))
+
+        assert (chosen[0].model, chosen[0].effort) == ("gpt-5.5", "high")
+
+    def test_a_setting_changed_while_running_is_used_at_the_next_poll(self):
+        config = Config()
+        nudger, _manual_refresh, chosen = self._nudger(CODEX, config)
+
+        CODEX_SETTINGS.model.write(config, "gpt-5.5")
+        nudger.maybe_nudge(ProviderUsageData(fetch_error="token_expired", fetched_at=NOW))
+
+        assert chosen[0].model == "gpt-5.5"
+
+
+class TestRefreshOptionsFromConfig:
+    def test_every_option_is_read_from_the_provider_s_section(self):
+        config = Config(
+            codex=CodexConfig(
+                renew_token=False,
+                wake_session=True,
+                cooldown_seconds=60,
+                model="gpt-5.5",
+                effort="high",
+            )
+        )
+
+        assert main.refresh_options(CODEX, config) == RefreshOptions(
+            renew_token=False,
+            wake_session=True,
+            cooldown_seconds=60,
+            model="gpt-5.5",
+            effort="high",
+        )
 
 
 def test_wait_refreshes_the_display_each_second_until_next_poll():
@@ -439,7 +486,7 @@ class TestTrackingOneProvider:
         main._set_tracking(CODEX, config, lambda: None, False)
 
         assert main._is_tracked(CODEX, config) is False
-        assert _saved_values(saved_settings, CODEX_ENABLED) == [False]
+        assert _saved_values(saved_settings, CODEX_SETTINGS.tracking) == [False]
 
     def test_switching_it_back_on_restores_tracking(self, saved_settings):
         config = Config()
@@ -471,11 +518,13 @@ class TestTrackingOneProvider:
 
         assert woken.is_set()
 
-    def test_a_provider_with_no_switch_is_always_tracked(self):
-        # Claude has none: an application that shows nothing is not a state
-        # worth offering, so there is no setting that could turn it off.
-        assert CLAUDE.tracking is None
-        assert main._is_tracked(CLAUDE, Config()) is True
+    def test_claude_can_be_switched_off_too(self, saved_settings):
+        config = Config()
+
+        main._set_tracking(CLAUDE, config, lambda: None, False)
+
+        assert main._is_tracked(CLAUDE, config) is False
+        assert _saved_values(saved_settings, CLAUDE_SETTINGS.tracking) == [False]
 
 
 class TestActiveProviders:
@@ -490,9 +539,26 @@ class TestActiveProviders:
         claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
 
         config = Config()
-        CODEX_ENABLED.write(config, False)
+        CODEX_SETTINGS.tracking.write(config, False)
 
         assert main._active_pollers([claude, codex], config) == [claude]
+
+    def test_claude_is_dropped_when_switched_off(self):
+        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
+
+        config = Config()
+        CLAUDE_SETTINGS.tracking.write(config, False)
+
+        assert main._active_pollers([claude, codex], config) == [codex]
+
+    def test_nothing_is_polled_when_both_are_switched_off(self):
+        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
+
+        config = Config()
+        CLAUDE_SETTINGS.tracking.write(config, False)
+        CODEX_SETTINGS.tracking.write(config, False)
+
+        assert main._active_pollers([claude, codex], config) == []
 
 
 class TestSharedPollInterval:
@@ -599,9 +665,11 @@ class _RecordingCli:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
 
-    def __call__(self, *, executable_name, arguments, which, run) -> bool:
+    def __call__(
+        self, *, executable_name, arguments, read_reply, which, run, clock
+    ) -> CliReply:
         self.commands.append([f"{executable_name}.CMD", *arguments])
-        return True
+        return CliReply(succeeded=True)
 
 
 def _codex_usage_body(used_percent: float, reset_at: int | None) -> dict:
@@ -631,7 +699,7 @@ class TestIdleCodexWindowWakesTheCli:
     and no part was wrong on its own.
     """
 
-    def _codex_poller(self, monkeypatch, body: dict):
+    def _codex_poller(self, monkeypatch, body: dict, config: Config | None = None):
         """Build the production Codex poller over a canned response body."""
         monkeypatch.setattr(
             codex_fetcher,
@@ -650,7 +718,7 @@ class TestIdleCodexWindowWakesTheCli:
         cli = _RecordingCli()
         monkeypatch.setattr(cli_refresher, "_run_cli", cli)
 
-        config = Config()
+        config = config or Config()
         nudger = main.create_session_nudger(
             CODEX,
             config,
@@ -672,6 +740,24 @@ class TestIdleCodexWindowWakesTheCli:
         assert commands[0][0] == "codex.CMD"
         assert commands[0][1] == "exec"
         assert commands[0][-1] == "hi"
+
+    def test_the_configured_model_and_effort_reach_the_codex_argv(self, monkeypatch):
+        config = Config(codex=CodexConfig(model="gpt-5.5", effort="low"))
+        poller, cli = self._codex_poller(monkeypatch, _codex_usage_body(0.0, None), config)
+
+        poller.poll()
+
+        command = cli.commands[0]
+        assert command[command.index("-m") + 1] == "gpt-5.5"
+        assert "model_reasoning_effort=low" in command
+
+    def test_waking_switched_off_leaves_an_idle_window_alone(self, monkeypatch):
+        config = Config(codex=CodexConfig(wake_session=False))
+        poller, cli = self._codex_poller(monkeypatch, _codex_usage_body(0.0, None), config)
+
+        poller.poll()
+
+        assert cli.commands == []
 
     def test_a_window_reported_as_zero_percent_used_runs_the_cli(self, monkeypatch):
         # Codex reports a reset time even for a window nothing was sent to, so
@@ -722,7 +808,6 @@ class TestSettingsWiring:
     def _model(self, **overrides):
         fields = {
             "companion": _SettingsCompanion(visible=True),
-            "nudgers": [main.cli_refresher.SessionNudger(CLAUDE, enabled=True)],
             "pollers": [_SettingsPoller(60), _SettingsPoller(60)],
             "config": Config(),
             "log_dir": Path("C:/logs"),
@@ -759,14 +844,51 @@ class TestSettingsWiring:
 
         assert woken.is_set()
 
-    def test_the_refresh_switch_reads_and_writes_every_nudger(self, monkeypatch):
+    def test_each_refresh_switch_reads_and_writes_its_own_provider(self, saved_settings):
         model, fields = self._model()
-        refresh = self._field(model, "session_refresh")
+        renew = self._field(model, "codex_renew_token")
 
-        assert refresh.is_on() is True
-        refresh.write(False)
+        assert renew.is_on() is True
+        renew.write(False)
 
-        assert all(not nudger.enabled for nudger in fields["nudgers"])
+        assert fields["config"].codex.renew_token is False
+        assert fields["config"].claude.renew_token is True
+        assert _saved_values(saved_settings, CODEX_SETTINGS.renew_token) == [False]
+
+    def test_the_wake_switch_reads_and_writes_its_setting(self, saved_settings):
+        model, fields = self._model()
+
+        self._field(model, "claude_wake_session").write(False)
+
+        assert fields["config"].claude.wake_session is False
+        assert _saved_values(saved_settings, CLAUDE_SETTINGS.wake_session) == [False]
+
+    def test_claude_now_has_a_tracking_switch(self):
+        model, fields = self._model()
+
+        self._field(model, "claude_tracking").write(False)
+
+        assert main._is_tracked(CLAUDE, fields["config"]) is False
+
+    def test_the_model_box_reads_and_writes_its_setting(self, saved_settings):
+        model, fields = self._model()
+        box = self._field(model, "claude_model")
+
+        assert box.value() == "haiku"
+        box.write("  sonnet ")
+
+        assert fields["config"].claude.model == "sonnet"
+        assert _saved_values(saved_settings, CLAUDE_SETTINGS.model) == ["sonnet"]
+
+    def test_the_effort_list_reads_and_writes_its_setting(self, saved_settings):
+        model, fields = self._model()
+        effort = self._field(model, "codex_effort")
+
+        assert effort.value() == "low"
+        effort.write("high")
+
+        assert fields["config"].codex.effort == "high"
+        assert _saved_values(saved_settings, CODEX_SETTINGS.effort) == ["high"]
 
     def test_the_startup_switch_reads_the_registry(self, monkeypatch):
         monkeypatch.setattr(main.autostart, "is_enabled", lambda: True)
@@ -800,6 +922,148 @@ class TestSettingsWiring:
         assert opened == [str(Path("C:/logs"))]
 
 
+def _immediate_run(provider, reply: CliReply | None = None, **kwargs):
+    """A manual run that finishes before start() returns, answering one reply."""
+    return cli_refresher.ManualRun(
+        provider,
+        invoke=lambda model, effort: reply or CliReply(succeeded=True, reply_text="Hi"),
+        start_background=lambda work: work(),
+        **kwargs,
+    )
+
+
+class TestCommandButtonsWiring:
+    """Copy command and Run now reach the clipboard, the CLI, and the box under them."""
+
+    def _model(self, **overrides):
+        fields = {
+            "companion": _SettingsCompanion(visible=True),
+            "pollers": [_SettingsPoller(60), _SettingsPoller(60)],
+            "config": Config(),
+            "log_dir": Path("C:/logs"),
+            "manual_runs": {
+                "claude": _immediate_run(CLAUDE),
+                "codex": _immediate_run(CODEX),
+            },
+            "copy_text": lambda text: True,
+        }
+        fields.update(overrides)
+        return main.build_settings_model(**fields)
+
+    def _field(self, model, key: str):
+        return next(field for field in model.fields() if field.key == key)
+
+    def test_nothing_has_run_when_the_window_opens(self):
+        box = self._field(self._model(), "codex_last_run")
+
+        assert box.text() == ""
+
+    def test_the_copy_button_puts_the_command_on_the_clipboard(self):
+        copied: list[str] = []
+        model = self._model(copy_text=lambda text: copied.append(text) or True)
+
+        self._field(model, "codex_copy_command").act("gpt-5.5", "", lambda: None)
+
+        assert copied == [cli_refresher.command_line(CODEX, "gpt-5.5", "")]
+
+    def test_a_copied_command_is_shown_in_the_box(self):
+        model = self._model()
+
+        self._field(model, "claude_copy_command").act("haiku", "", lambda: None)
+
+        assert self._field(model, "claude_last_run").text().startswith(
+            "Command copied to the clipboard:\nclaude -p "
+        )
+
+    def test_a_model_with_spaces_around_it_is_copied_trimmed(self):
+        copied: list[str] = []
+        model = self._model(copy_text=lambda text: copied.append(text) or True)
+
+        self._field(model, "claude_copy_command").act("  haiku ", "", lambda: None)
+
+        assert copied == [cli_refresher.command_line(CLAUDE, "haiku", "")]
+
+    def test_the_copy_button_announces_the_new_text(self):
+        told: list[str] = []
+        model = self._model()
+
+        self._field(model, "codex_copy_command").act("", "", lambda: told.append("changed"))
+
+        assert told == ["changed"]
+
+    def test_a_clipboard_that_refuses_leaves_the_box_as_it_was(self):
+        model = self._model(copy_text=lambda text: False)
+
+        self._field(model, "codex_copy_command").act("", "", lambda: None)
+
+        assert self._field(model, "codex_last_run").text() == ""
+
+    def test_the_run_button_runs_the_cli_with_the_model_and_effort_given(self):
+        asked: list[tuple[str, str]] = []
+        run = cli_refresher.ManualRun(
+            CODEX,
+            invoke=lambda model, effort: asked.append((model, effort)) or CliReply(True),
+            start_background=lambda work: work(),
+        )
+        model = self._model(manual_runs={"claude": _immediate_run(CLAUDE), "codex": run})
+
+        self._field(model, "codex_run_command").act("gpt-5.5", "high", lambda: None)
+
+        assert asked == [("gpt-5.5", "high")]
+
+    def test_a_finished_run_is_shown_in_the_box(self):
+        model = self._model()
+
+        self._field(model, "claude_run_command").act("haiku", "", lambda: None)
+
+        assert self._field(model, "claude_last_run").text().startswith("Succeeded.\nReply: Hi")
+
+    def test_the_run_button_announces_the_start_and_the_end(self):
+        told: list[str] = []
+        model = self._model()
+
+        self._field(model, "claude_run_command").act("", "", lambda: told.append("changed"))
+
+        assert told == ["changed", "changed"]
+
+    def test_a_click_during_a_run_announces_nothing(self):
+        told: list[str] = []
+        pending = cli_refresher.ManualRun(CLAUDE, start_background=lambda work: None)
+        model = self._model(manual_runs={"claude": pending, "codex": _immediate_run(CODEX)})
+        button = self._field(model, "claude_run_command")
+        button.act("", "", lambda: None)
+
+        button.act("", "", lambda: told.append("changed"))
+
+        assert told == []
+
+    def test_each_provider_s_box_shows_only_its_own_run(self):
+        model = self._model()
+
+        self._field(model, "claude_run_command").act("", "", lambda: None)
+
+        assert self._field(model, "codex_last_run").text() == ""
+
+    def test_by_default_a_successful_run_asks_for_fresh_usage(self, monkeypatch):
+        monkeypatch.setattr(
+            cli_refresher,
+            "run_provider_cli",
+            lambda provider, model, effort: CliReply(succeeded=True),
+        )
+        woken = threading.Event()
+        model = main.build_settings_model(
+            companion=_SettingsCompanion(visible=True),
+            pollers=[],
+            config=Config(),
+            log_dir=Path("C:/logs"),
+            wake_poll_loop=woken.set,
+        )
+
+        self._field(model, "codex_run_command").act("", "", lambda: None)
+
+        assert woken.wait(timeout=5)
+
+
 class TestNumericSettingsWiring:
     """A number written in the window has to change the app that is running,
     not only the file it will read at the next launch."""
@@ -807,7 +1071,6 @@ class TestNumericSettingsWiring:
     def _model(self, **overrides):
         fields = {
             "companion": _SettingsCompanion(visible=True),
-            "nudgers": [main.cli_refresher.SessionNudger(CLAUDE, enabled=True)],
             "pollers": [_SettingsPoller(60), _SettingsPoller(60)],
             "config": Config(),
             "log_dir": Path("C:/logs"),
@@ -872,19 +1135,21 @@ class TestNumericSettingsWiring:
         assert fields["config"].thresholds.amber_below == 40
         assert fields["config"].thresholds.red_below == 15
 
-    def test_the_cooldown_reads_the_config(self):
-        config = Config(session_refresh=SessionRefreshConfig(cooldown_seconds=300))
+    def test_each_cooldown_reads_its_own_provider(self):
+        config = Config(codex=CodexConfig(cooldown_seconds=300))
         model, _fields = self._model(config=config)
 
-        assert self._field(model, "refresh_cooldown").value() == 300
+        assert self._field(model, "codex_cooldown").value() == 300
+        assert self._field(model, "claude_cooldown").value() == 900
 
-    def test_writing_the_cooldown_reaches_every_nudger(self, monkeypatch):
-        nudger = main.cli_refresher.SessionNudger(CLAUDE, enabled=True, cooldown_seconds=900)
-        model, _fields = self._model(nudgers=[nudger])
+    def test_writing_a_cooldown_changes_only_that_provider(self, saved_settings):
+        model, fields = self._model()
 
-        self._field(model, "refresh_cooldown").write(300)
+        self._field(model, "claude_cooldown").write(300)
 
-        assert nudger._cooldown_seconds == 300
+        assert fields["config"].claude.cooldown_seconds == 300
+        assert fields["config"].codex.cooldown_seconds == 900
+        assert _saved_values(saved_settings, CLAUDE_SETTINGS.cooldown) == [300]
 
     def test_the_running_app_is_changed_before_the_file_is_written(self, monkeypatch):
         # These run on the settings window's own thread, where an escaping
@@ -912,7 +1177,6 @@ class TestSettingsControllerWiring:
     def _model(self):
         return main.build_settings_model(
             companion=_SettingsCompanion(),
-            nudgers=[],
             pollers=[],
             config=Config(),
             log_dir=Path("."),

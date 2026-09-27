@@ -1,19 +1,40 @@
 from __future__ import annotations
 
+import logging
 import subprocess
+import tempfile
+from pathlib import Path
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from claudemonitor import cli_refresher
 from claudemonitor.cli_refresher import (
+    ManualRun,
+    ManualRunState,
+    RefreshOptions,
     SessionNudger,
-    needs_session_nudge,
+    command_line,
+    nudge_reason,
     run_provider_cli,
 )
-from claudemonitor.models import CLAUDE, CODEX, PROVIDERS, ProviderUsageData, UsageWindow
+from claudemonitor.models import (
+    CLAUDE,
+    CODEX,
+    PROVIDERS,
+    CliReply,
+    ProviderUsageData,
+    UsageWindow,
+)
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+
+CLAUDE_REPLY = (
+    '{"type":"result","is_error":false,"result":"Hi!",'
+    '"usage":{"input_tokens":3,"cache_creation_input_tokens":100,'
+    '"cache_read_input_tokens":900,"output_tokens":5}}'
+)
 
 
 def usage(
@@ -34,7 +55,7 @@ def usage(
 class _CompletedProcess:
     """Stand-in for subprocess.CompletedProcess with only the fields we read."""
 
-    def __init__(self, returncode: int = 0, stdout: str = "Hello!", stderr: str = ""):
+    def __init__(self, returncode: int = 0, stdout: str = CLAUDE_REPLY, stderr: str = ""):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
@@ -59,10 +80,6 @@ def _which_finds_claude(_name: str) -> str:
     return r"C:\Users\someone\.local\bin\claude.EXE"
 
 
-def _which_finds_codex(_name: str) -> str:
-    return r"C:\Users\someone\AppData\Roaming\npm\codex.CMD"
-
-
 def _which_finds_nothing(_name: str) -> None:
     return None
 
@@ -72,28 +89,94 @@ def _run_immediately(work):
     work()
 
 
-class TestSessionNudgeEndToEnd:
-    """Fetched usage data in, Claude CLI invocation (or not) out."""
+def _answers(succeeded: bool = True, **fields):
+    """Build an invoker that records the options it was run with."""
+    seen: list[RefreshOptions] = []
 
-    def _nudger(self, *, runner: _RecordingRunner, **kwargs) -> tuple[SessionNudger, list[str]]:
+    def invoke(options: RefreshOptions) -> CliReply:
+        seen.append(options)
+        return CliReply(succeeded=succeeded, **fields)
+
+    return invoke, seen
+
+
+def _nudger(invoke, options: RefreshOptions | None = None, **kwargs) -> SessionNudger:
+    """Build a synchronous nudger with a fixed clock unless the test overrides it."""
+    settings = {
+        "options": lambda: options or RefreshOptions(cooldown_seconds=0),
+        "invoke": invoke,
+        "start_background": _run_immediately,
+        "clock": lambda: 0.0,
+    }
+    settings.update(kwargs)
+    return SessionNudger(CLAUDE, **settings)
+
+
+class TestSessionNudgeEndToEnd:
+    """Fetched usage data in, Claude CLI invocation and recorded result out."""
+
+    def _nudger(self, *, runner: _RecordingRunner, options=None):
         refreshed: list[str] = []
         nudger = SessionNudger(
             CLAUDE,
-            invoke=lambda: run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner),
+            options=lambda: options or RefreshOptions(model="haiku"),
+            invoke=lambda chosen: run_provider_cli(
+                CLAUDE,
+                model=chosen.model,
+                effort=chosen.effort,
+                which=_which_finds_claude,
+                run=runner,
+            ),
             on_refreshed=lambda: refreshed.append("refreshed"),
             start_background=_run_immediately,
             clock=lambda: 0.0,
-            **kwargs,
         )
         return nudger, refreshed
 
-    def test_unstarted_session_runs_the_haiku_prompt_and_requests_a_refetch(self):
+    def test_unstarted_session_runs_the_chosen_model_and_requests_a_refetch(self):
         runner = _RecordingRunner()
         nudger, refreshed = self._nudger(runner=runner)
 
         assert nudger.maybe_nudge(usage(utilization=0.0, resets_at=None)) is True
-        assert runner.calls[0][0][1:] == ["-p", "--model", "haiku", "hi"]
+        command = runner.calls[0][0]
+        assert command[command.index("--model") + 1] == "haiku"
+        assert command[-1] == "hi"
         assert refreshed == ["refreshed"]
+
+    def test_the_chosen_effort_reaches_the_cli(self):
+        runner = _RecordingRunner()
+        nudger, _refreshed = self._nudger(
+            runner=runner, options=RefreshOptions(model="haiku", effort="low")
+        )
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+
+        command = runner.calls[0][0]
+        assert command[command.index("--effort") + 1] == "low"
+
+    def test_a_successful_run_logs_its_tokens(self, caplog):
+        nudger, _refreshed = self._nudger(runner=_RecordingRunner())
+
+        with caplog.at_level(logging.INFO):
+            nudger.maybe_nudge(usage(utilization=0.0))
+
+        assert "1003 tokens in, 5 out" in caplog.text
+
+    def test_a_rejected_model_logs_the_cli_s_own_reason(self, caplog):
+        runner = _RecordingRunner(
+            _CompletedProcess(
+                returncode=1,
+                stdout='{"type":"result","is_error":true,'
+                '"result":"There\'s an issue with the selected model."}',
+            )
+        )
+        nudger, refreshed = self._nudger(runner=runner)
+
+        with caplog.at_level(logging.WARNING):
+            nudger.maybe_nudge(usage(fetch_error="token_expired"))
+
+        assert refreshed == []
+        assert "There's an issue with the selected model." in caplog.text
 
     def test_full_window_with_an_active_reset_time_also_nudges(self):
         runner = _RecordingRunner()
@@ -121,14 +204,6 @@ class TestSessionNudgeEndToEnd:
         assert runner.calls == []
         assert refreshed == []
 
-    def test_silent_cli_output_does_not_claim_a_refresh_happened(self):
-        runner = _RecordingRunner(_CompletedProcess(stdout="   \n"))
-        nudger, refreshed = self._nudger(runner=runner)
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-        assert len(runner.calls) == 1
-        assert refreshed == []
-
     def test_failing_cli_does_not_propagate_or_claim_a_refresh(self):
         runner = _RecordingRunner(raises=OSError("cannot spawn"))
         nudger, refreshed = self._nudger(runner=runner)
@@ -136,24 +211,17 @@ class TestSessionNudgeEndToEnd:
         assert nudger.maybe_nudge(usage(fetch_error="token_expired")) is True
         assert refreshed == []
 
-    def test_disabled_nudger_never_touches_the_cli(self):
-        runner = _RecordingRunner()
-        nudger, _refreshed = self._nudger(runner=runner, enabled=False)
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-        assert runner.calls == []
-
     def test_repeated_unstarted_polls_only_nudge_once_per_cooldown(self):
         runner = _RecordingRunner()
         elapsed = [0.0]
-        refreshed: list[str] = []
         nudger = SessionNudger(
             CLAUDE,
-            invoke=lambda: run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner),
-            on_refreshed=lambda: refreshed.append("refreshed"),
+            options=lambda: RefreshOptions(cooldown_seconds=900),
+            invoke=lambda chosen: run_provider_cli(
+                CLAUDE, which=_which_finds_claude, run=runner
+            ),
             start_background=_run_immediately,
             clock=lambda: elapsed[0],
-            cooldown_seconds=900,
         )
 
         assert nudger.maybe_nudge(usage(utilization=0.0)) is True
@@ -164,64 +232,177 @@ class TestSessionNudgeEndToEnd:
         assert len(runner.calls) == 2
 
 
-class TestNeedsSessionNudge:
-    """needs_session_nudge: decides whether a fetch result warrants a CLI call."""
+class TestNudgeReason:
+    """nudge_reason: which of the two things a CLI run could fix, if either."""
 
-    def test_untouched_window_without_a_reset_time_needs_a_nudge(self):
-        assert needs_session_nudge(usage(utilization=0.0, resets_at=None)) is True
+    def test_untouched_window_without_a_reset_time_is_an_idle_window(self):
+        assert nudge_reason(usage(utilization=0.0, resets_at=None)) == "idle_window"
 
-    def test_untouched_window_with_a_reset_time_needs_a_nudge(self):
+    def test_untouched_window_with_a_reset_time_is_an_idle_window(self):
         data = usage(utilization=0.0, resets_at=NOW + timedelta(hours=1))
-        assert needs_session_nudge(data) is True
+        assert nudge_reason(data) == "idle_window"
 
-    def test_expired_token_needs_a_nudge(self):
-        assert needs_session_nudge(usage(fetch_error="token_expired")) is True
+    def test_expired_token_is_its_own_reason(self):
+        assert nudge_reason(usage(fetch_error="token_expired")) == "token_expired"
 
     def test_any_usage_at_all_means_the_session_is_already_running(self):
-        assert needs_session_nudge(usage(utilization=0.4)) is False
+        assert nudge_reason(usage(utilization=0.4)) is None
 
     def test_missing_credentials_cannot_be_fixed_by_a_prompt(self):
-        assert needs_session_nudge(usage(fetch_error="no_credentials")) is False
+        assert nudge_reason(usage(fetch_error="no_credentials")) is None
 
     def test_transport_errors_say_nothing_about_the_session(self):
-        assert needs_session_nudge(usage(fetch_error="offline")) is False
-        assert needs_session_nudge(usage(fetch_error="timeout")) is False
-        assert needs_session_nudge(usage(fetch_error="rate_limited")) is False
-        assert needs_session_nudge(usage(fetch_error="bad_response")) is False
+        for error in ("offline", "timeout", "rate_limited", "bad_response"):
+            assert nudge_reason(usage(fetch_error=error)) is None
 
     def test_response_without_a_five_hour_window_is_not_evidence_of_an_idle_session(self):
-        assert needs_session_nudge(usage()) is False
+        assert nudge_reason(usage()) is None
+
+    def test_no_provider_specific_predicate_survives(self):
+        # Two predicates meant two behaviours to keep in step, and they drifted.
+        assert not hasattr(cli_refresher, "needs_codex_nudge")
 
 
-class TestWhatEachProviderAsksItsCli:
-    """The argv is the provider's own data now, not a function per provider."""
+class TestRefreshOptions:
+    """Each reason has its own switch, so a user can allow one and not the other."""
 
-    def test_claude_asks_haiku_for_the_cheapest_possible_reply(self):
-        assert CLAUDE.cli_arguments == ("-p", "--model", "haiku", "hi")
+    def test_both_reasons_are_allowed_by_default(self):
+        options = RefreshOptions()
+        assert options.allows("token_expired") is True
+        assert options.allows("idle_window") is True
 
-    def test_codex_runs_a_non_interactive_turn(self):
-        assert CODEX.cli_arguments[0] == "exec"
-        assert CODEX.cli_arguments[-1] == "hi"
+    def test_the_token_switch_only_governs_an_expired_token(self):
+        options = RefreshOptions(renew_token=False)
+        assert options.allows("token_expired") is False
+        assert options.allows("idle_window") is True
 
-    def test_codex_refuses_to_touch_the_users_files(self):
-        # The nudge only exists to make one authenticated request. A sandbox
-        # that could write would let an off-hand model reply edit real files.
-        arguments = CODEX.cli_arguments
-        assert arguments[arguments.index("--sandbox") + 1] == "read-only"
+    def test_the_session_switch_only_governs_an_idle_window(self):
+        options = RefreshOptions(wake_session=False)
+        assert options.allows("token_expired") is True
+        assert options.allows("idle_window") is False
 
-    def test_codex_does_not_require_a_git_repository(self):
-        # The tray app runs from wherever Windows launched it, which is usually
-        # not a repository; without this the CLI refuses to start at all.
-        assert "--skip-git-repo-check" in CODEX.cli_arguments
 
-    def test_every_provider_names_an_executable_and_a_prompt(self):
-        for provider in PROVIDERS:
-            assert provider.cli_executable, provider
-            assert provider.cli_arguments, provider
+class TestTheSwitchesGateTheNudge:
+    """The switches are read on every poll, so a change in Settings acts at once."""
+
+    def test_an_expired_token_is_left_alone_when_renewing_is_off(self):
+        invoke, seen = _answers()
+        nudger = _nudger(invoke, RefreshOptions(renew_token=False, cooldown_seconds=0))
+
+        assert nudger.maybe_nudge(usage(fetch_error="token_expired")) is False
+        assert seen == []
+
+    def test_an_idle_window_is_still_woken_when_only_renewing_is_off(self):
+        invoke, seen = _answers()
+        nudger = _nudger(invoke, RefreshOptions(renew_token=False, cooldown_seconds=0))
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert len(seen) == 1
+
+    def test_an_idle_window_is_left_alone_when_waking_is_off(self):
+        invoke, seen = _answers()
+        nudger = _nudger(invoke, RefreshOptions(wake_session=False, cooldown_seconds=0))
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+        assert seen == []
+
+    def test_both_switches_off_never_touch_the_cli(self):
+        invoke, seen = _answers()
+        nudger = _nudger(
+            invoke,
+            RefreshOptions(renew_token=False, wake_session=False, cooldown_seconds=0),
+        )
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        nudger.maybe_nudge(usage(fetch_error="token_expired"))
+
+        assert seen == []
+
+    def test_options_are_read_again_on_every_poll(self):
+        current = [RefreshOptions(wake_session=False, cooldown_seconds=0)]
+        invoke, seen = _answers()
+        nudger = SessionNudger(
+            CLAUDE,
+            options=lambda: current[0],
+            invoke=invoke,
+            start_background=_run_immediately,
+            clock=lambda: 0.0,
+        )
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+
+        current[0] = RefreshOptions(wake_session=True, cooldown_seconds=0)
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert len(seen) == 1
+
+    def test_the_invoker_is_given_the_options_of_that_poll(self):
+        invoke, seen = _answers()
+        nudger = _nudger(
+            invoke, RefreshOptions(model="gpt-5.5", effort="low", cooldown_seconds=0)
+        )
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+
+        assert (seen[0].model, seen[0].effort) == ("gpt-5.5", "low")
+
+
+class TestTheCooldownIsLive:
+    """Each provider's cooldown is its own and can change while the app runs."""
+
+    def _nudger(self, cooldown: list[float], elapsed: list[float]):
+        invoke, seen = _answers()
+        nudger = SessionNudger(
+            CLAUDE,
+            options=lambda: RefreshOptions(cooldown_seconds=cooldown[0]),
+            invoke=invoke,
+            start_background=_run_immediately,
+            clock=lambda: elapsed[0],
+        )
+        return nudger, seen
+
+    def test_a_shorter_cooldown_ends_the_wait_early(self):
+        cooldown, elapsed = [900.0], [0.0]
+        nudger, _seen = self._nudger(cooldown, elapsed)
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+        cooldown[0] = 60
+        elapsed[0] = 100.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+    def test_a_longer_cooldown_takes_effect_at_once(self):
+        cooldown, elapsed = [60.0], [0.0]
+        nudger, _seen = self._nudger(cooldown, elapsed)
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+        cooldown[0] = 900
+        elapsed[0] = 100.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+
+    def test_switching_off_and_on_again_does_not_reset_the_cooldown(self):
+        current = [RefreshOptions(cooldown_seconds=900)]
+        elapsed = [0.0]
+        invoke, _seen = _answers()
+        nudger = SessionNudger(
+            CLAUDE,
+            options=lambda: current[0],
+            invoke=invoke,
+            start_background=_run_immediately,
+            clock=lambda: elapsed[0],
+        )
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+
+        current[0] = replace(current[0], wake_session=False)
+        nudger.maybe_nudge(usage(utilization=0.0))
+        current[0] = replace(current[0], wake_session=True)
+        elapsed[0] = 100.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
 
 
 class TestRunProviderCli:
-    """One runner for every provider: "did the CLI answer?", and never a raise."""
+    """One runner for every provider: what the CLI answered, and never a raise."""
 
     @pytest.mark.parametrize("provider", PROVIDERS)
     def test_the_providers_own_executable_is_looked_up(self, provider):
@@ -241,43 +422,106 @@ class TestRunProviderCli:
     ):
         runner = _RecordingRunner()
 
-        run_provider_cli(provider, which=lambda name: name + ".EXE", run=runner)
+        run_provider_cli(
+            provider,
+            model="m",
+            effort="low",
+            which=lambda name: name + ".EXE",
+            run=runner,
+        )
 
         command, _kwargs = runner.calls[0]
-        assert command == [provider.cli_executable + ".EXE", *provider.cli_arguments]
+        assert command == [
+            provider.cli_executable + ".EXE",
+            *provider.cli_arguments("m", "low"),
+        ]
 
-    def test_reports_success_when_the_cli_prints_a_reply(self):
-        runner = _RecordingRunner(_CompletedProcess(stdout="Hello! How can I help?"))
-        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is True
+    def test_the_reply_is_read_by_the_provider(self):
+        runner = _RecordingRunner(_CompletedProcess(stdout=CLAUDE_REPLY))
 
-    def test_reports_failure_when_the_cli_is_not_installed(self):
+        reply = run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
+
+        assert reply.succeeded is True
+        assert (reply.input_tokens, reply.output_tokens) == (1003, 5)
+        assert reply.reply_text == "Hi!"
+
+    def test_the_reply_says_how_long_the_cli_took(self):
+        ticks = iter([10.0, 13.25])
+
+        reply = run_provider_cli(
+            CLAUDE, which=_which_finds_claude, run=_RecordingRunner(), clock=lambda: next(ticks)
+        )
+
+        assert reply.duration_seconds == 3.25
+
+    def test_a_cli_that_never_started_has_no_duration(self):
+        reply = run_provider_cli(CLAUDE, which=_which_finds_nothing, run=_RecordingRunner())
+
+        assert reply.duration_seconds is None
+
+    def test_a_failed_run_still_says_how_long_it_took(self):
+        ticks = iter([0.0, 120.0])
+        runner = _RecordingRunner(raises=subprocess.TimeoutExpired(cmd="claude", timeout=120))
+
+        reply = run_provider_cli(
+            CLAUDE, which=_which_finds_claude, run=runner, clock=lambda: next(ticks)
+        )
+
+        assert reply.duration_seconds == 120.0
+
+    def test_the_cli_starts_in_an_empty_folder_of_its_own(self):
+        # A CLI reads the instruction files of the folder it starts in. Under
+        # `uv run dev` that was this repository, and its AGENTS.md.
         runner = _RecordingRunner()
-        assert run_provider_cli(CLAUDE, which=_which_finds_nothing, run=runner) is False
+        run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
+
+        _command, kwargs = runner.calls[0]
+        folder = Path(kwargs["cwd"])
+        assert folder.parent == Path(tempfile.gettempdir())
+        assert folder.is_dir()
+        assert list(folder.iterdir()) == []
+
+    def test_a_missing_cli_says_so(self):
+        runner = _RecordingRunner()
+
+        reply = run_provider_cli(CLAUDE, which=_which_finds_nothing, run=runner)
+
+        assert reply.succeeded is False
+        assert "not found" in reply.detail
         assert runner.calls == []
 
-    def test_reports_failure_on_a_non_zero_exit_code(self):
-        runner = _RecordingRunner(
-            _CompletedProcess(returncode=1, stdout="", stderr="boom")
-        )
-        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
-
-    def test_reports_failure_on_empty_output(self):
-        runner = _RecordingRunner(_CompletedProcess(stdout="   "))
-        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
-
-    def test_reports_failure_when_the_cli_hangs_past_the_timeout(self):
+    def test_a_cli_that_hangs_past_the_timeout_says_so(self):
         runner = _RecordingRunner(
             raises=subprocess.TimeoutExpired(cmd="claude", timeout=120)
         )
-        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
 
-    def test_reports_failure_when_the_cli_cannot_be_launched(self):
+        reply = run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
+
+        assert reply.succeeded is False
+        assert "120 seconds" in reply.detail
+
+    def test_a_cli_that_cannot_be_launched_says_so(self):
         runner = _RecordingRunner(raises=OSError("not executable"))
-        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
+
+        reply = run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
+
+        assert reply.succeeded is False
+        assert "not executable" in reply.detail
 
     def test_never_lets_an_unexpected_error_escape(self):
         runner = _RecordingRunner(raises=RuntimeError("unexpected"))
-        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner) is False
+
+        assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner).succeeded is False
+
+    def test_a_reader_that_raises_is_a_failure_not_a_crash(self, monkeypatch):
+        def broken(*_args):
+            raise ValueError("bad reader")
+
+        provider = replace(CLAUDE, read_cli_reply=broken)
+
+        reply = run_provider_cli(provider, which=_which_finds_claude, run=_RecordingRunner())
+
+        assert reply.succeeded is False
 
     def test_captures_output_under_a_timeout_and_hides_the_console_window(self):
         runner = _RecordingRunner()
@@ -288,6 +532,16 @@ class TestRunProviderCli:
         assert kwargs["text"] is True
         assert kwargs["timeout"] == cli_refresher.COMMAND_TIMEOUT_SECONDS
         assert kwargs["creationflags"] == cli_refresher._CREATE_NO_WINDOW
+
+    def test_output_is_decoded_as_utf8(self):
+        # Both CLIs write UTF-8; the Windows default code page cannot decode
+        # every reply and would lose the whole result to one curly quote.
+        runner = _RecordingRunner()
+        run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
+
+        _command, kwargs = runner.calls[0]
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
 
     def test_stdin_is_closed_so_the_cli_cannot_read_the_terminal(self):
         """`capture_output` redirects only stdout/stderr, leaving stdin inherited.
@@ -312,16 +566,9 @@ class TestCircuitBreaker:
     fix that — so repeated failures must stop the retries instead of running one
     doomed subprocess every cooldown until the machine is rebooted."""
 
-    def _nudger(self, *, succeeds: bool, cooldown_seconds: float = 0.0):
-        attempts: list[str] = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: attempts.append("attempt") or succeeds,
-            start_background=_run_immediately,
-            clock=lambda: 0.0,
-            cooldown_seconds=cooldown_seconds,
-        )
-        return nudger, attempts
+    def _nudger(self, *, succeeds: bool):
+        invoke, seen = _answers(succeeded=succeeds)
+        return _nudger(invoke), seen
 
     def test_three_failures_stop_any_further_attempts(self):
         nudger, attempts = self._nudger(succeeds=False)
@@ -353,15 +600,14 @@ class TestCircuitBreaker:
         assert nudger.exhausted is True
 
     def test_a_success_clears_the_failure_count(self):
-        attempts: list[bool] = []
         outcomes = iter([False, False, True, False, False])
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: attempts.append(True) or next(outcomes),
-            start_background=_run_immediately,
-            clock=lambda: 0.0,
-            cooldown_seconds=0.0,
-        )
+        attempts: list[bool] = []
+
+        def invoke(_options):
+            attempts.append(True)
+            return CliReply(succeeded=next(outcomes))
+
+        nudger = _nudger(invoke)
         expired = usage(fetch_error="token_expired")
 
         for _ in range(5):
@@ -401,16 +647,10 @@ class TestCircuitBreaker:
         assert len(attempts) == 3
 
     def test_an_exception_from_the_cli_counts_as_a_failure(self):
-        def explode() -> bool:
+        def explode(_options):
             raise RuntimeError("subprocess layer blew up")
 
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=explode,
-            start_background=_run_immediately,
-            clock=lambda: 0.0,
-            cooldown_seconds=0.0,
-        )
+        nudger = _nudger(explode)
         expired = usage(fetch_error="token_expired")
 
         for _ in range(3):
@@ -419,15 +659,8 @@ class TestCircuitBreaker:
         assert nudger.exhausted is True
 
     def test_the_failure_limit_is_configurable(self):
-        attempts: list[str] = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: attempts.append("attempt") or False,
-            start_background=_run_immediately,
-            clock=lambda: 0.0,
-            cooldown_seconds=0.0,
-            max_consecutive_failures=1,
-        )
+        invoke, attempts = _answers(succeeded=False)
+        nudger = _nudger(invoke, max_consecutive_failures=1)
         expired = usage(fetch_error="token_expired")
 
         assert nudger.maybe_nudge(expired) is True
@@ -439,109 +672,13 @@ class TestCircuitBreaker:
         assert nudger.exhausted is False
 
 
-class TestRuntimeToggle:
-    """The tray flips the nudger while it is running, so the switch is live state."""
-
-    def _nudger(self, *, enabled: bool):
-        started: list[str] = []
-        nudger = SessionNudger(
-            CLAUDE,
-            enabled=enabled,
-            invoke=lambda: started.append("invoked") or True,
-            start_background=_run_immediately,
-            clock=lambda: 0.0,
-        )
-        return nudger, started
-
-    def test_enabled_reports_the_current_setting(self):
-        nudger, _started = self._nudger(enabled=True)
-        assert nudger.enabled is True
-
-        nudger.set_enabled(False)
-
-        assert nudger.enabled is False
-
-    def test_enabling_at_runtime_allows_the_next_nudge(self):
-        nudger, started = self._nudger(enabled=False)
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-
-        nudger.set_enabled(True)
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-        assert started == ["invoked"]
-
-    def test_disabling_at_runtime_stops_the_next_nudge(self):
-        nudger, started = self._nudger(enabled=True)
-
-        nudger.set_enabled(False)
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-        assert started == []
-
-    def test_re_enabling_does_not_reset_the_cooldown(self):
-        elapsed = [0.0]
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: True,
-            start_background=_run_immediately,
-            clock=lambda: elapsed[0],
-            cooldown_seconds=900,
-        )
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-
-        nudger.set_enabled(False)
-        nudger.set_enabled(True)
-        elapsed[0] = 100.0
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-
-    def test_the_cooldown_can_be_changed_while_running(self):
-        # The settings window writes a new cooldown on Apply; a nudger that
-        # kept the value it started with would ignore it until the next launch.
-        elapsed = [0.0]
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: True,
-            start_background=_run_immediately,
-            clock=lambda: elapsed[0],
-            cooldown_seconds=900,
-        )
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-
-        nudger.set_cooldown_seconds(60)
-        elapsed[0] = 100.0
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-
-    def test_a_longer_cooldown_takes_effect_at_once(self):
-        elapsed = [0.0]
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: True,
-            start_background=_run_immediately,
-            clock=lambda: elapsed[0],
-            cooldown_seconds=60,
-        )
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-
-        nudger.set_cooldown_seconds(900)
-        elapsed[0] = 100.0
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-
-
 class TestConcurrentNudges:
     """A nudge outlives one poll, so a second poll must not stack another CLI call."""
 
     def test_a_nudge_still_running_blocks_a_second_one(self):
-        started: list[ProviderUsageData] = []
         pending: list = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: started.append("invoked") or True,
-            start_background=pending.append,
-            clock=lambda: 0.0,
-        )
+        invoke, started = _answers()
+        nudger = _nudger(invoke, start_background=pending.append)
 
         assert nudger.maybe_nudge(usage(utilization=0.0)) is True
         assert nudger.maybe_nudge(usage(utilization=0.0)) is False
@@ -552,12 +689,12 @@ class TestConcurrentNudges:
     def test_the_gate_reopens_after_the_background_work_finishes(self):
         elapsed = [0.0]
         pending: list = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: True,
+        invoke, _started = _answers()
+        nudger = _nudger(
+            invoke,
+            RefreshOptions(cooldown_seconds=60),
             start_background=pending.append,
             clock=lambda: elapsed[0],
-            cooldown_seconds=60,
         )
 
         nudger.maybe_nudge(usage(utilization=0.0))
@@ -567,96 +704,152 @@ class TestConcurrentNudges:
         assert nudger.maybe_nudge(usage(utilization=0.0)) is True
 
 
-# ===========================================================================
-# Codex — the same nudge, decided by the same rule.
-# ===========================================================================
+class TestTheCommandToCopy:
+    """The one line a user can paste into a terminal to run the same nudge."""
 
-
-class TestCodexSharesTheNudgeRule:
-    """One rule decides for both providers, because one message fixes both.
-
-    Codex used to own a predicate that fired on an expired token and nothing
-    else, on the theory that Codex reports a reset time whether or not the
-    window has been used. The effect was that an idle Codex window — the one
-    state a single message actually repairs — was never woken, and the user
-    had to run ``codex exec`` by hand.
-    """
-
-    def test_expired_token_is_worth_nudging(self):
-        assert needs_session_nudge(usage(fetch_error="token_expired")) is True
-
-    def test_untouched_window_is_worth_nudging(self):
-        assert needs_session_nudge(usage(utilization=0.0)) is True
-
-    def test_healthy_usage_is_left_alone(self):
-        assert needs_session_nudge(usage(utilization=42.0)) is False
-
-    def test_other_errors_are_not_nudgeable(self):
-        for error in ("offline", "timeout", "no_credentials", "rate_limited"):
-            assert needs_session_nudge(usage(fetch_error=error)) is False
-
-    def test_no_provider_specific_predicate_survives(self):
-        # Two predicates meant two behaviours to keep in step, and they drifted.
-        assert not hasattr(cli_refresher, "needs_codex_nudge")
-
-
-def _only_on_expiry(data: ProviderUsageData) -> bool:
-    """A stub predicate that ignores everything except an expired token."""
-    return data.fetch_error == "token_expired"
-
-
-class TestNudgerHonorsItsPredicate:
-    """SessionNudger asks the injected predicate, not the shared rule."""
-
-    def test_an_injected_predicate_can_suppress_the_idle_window_nudge(self):
-        calls: list[int] = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: (calls.append(1), True)[1],
-            needs_nudge=_only_on_expiry,
-            start_background=_run_immediately,
+    def test_it_is_the_executable_and_the_providers_own_arguments(self):
+        assert command_line(CLAUDE, "haiku", "low") == subprocess.list2cmdline(
+            ["claude", *CLAUDE.cli_arguments("haiku", "low")]
         )
 
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-        assert calls == []
+    def test_it_names_the_executable_rather_than_its_full_path(self):
+        assert command_line(CLAUDE, "", "").startswith("claude -p ")
 
-    def test_an_injected_predicate_fires_on_what_it_accepts(self):
-        calls: list[int] = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: (calls.append(1), True)[1],
-            needs_nudge=_only_on_expiry,
-            start_background=_run_immediately,
+    def test_an_argument_with_a_space_is_quoted(self):
+        assert '--system-prompt "Reply briefly."' in command_line(CLAUDE, "", "")
+
+    def test_the_codex_command_is_built_the_same_way(self, monkeypatch):
+        monkeypatch.setattr(
+            "claudemonitor.codex_fetcher._configured_mcp_servers", lambda: ()
         )
 
-        assert nudger.maybe_nudge(usage(fetch_error="token_expired")) is True
-        assert calls == [1]
+        line = command_line(CODEX, "", "")
 
-    def test_breaker_rearms_using_the_injected_predicate(self):
-        # An idle window is "nothing left to fix" under this stub rule, so a
-        # run of failures must be forgiven once fetches recover.
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: False,
-            needs_nudge=_only_on_expiry,
-            cooldown_seconds=0,
-            start_background=_run_immediately,
+        assert line.startswith("codex exec --json ")
+        assert " -c model_reasoning_effort=low " in line
+        assert line.endswith(" hi")
+
+
+def _manual_run(invoke=None, **kwargs) -> ManualRun:
+    """Build a manual run that finishes before start() returns."""
+    settings = {
+        "invoke": invoke or (lambda model, effort: CliReply(succeeded=True)),
+        "start_background": _run_immediately,
+    }
+    settings.update(kwargs)
+    return ManualRun(CLAUDE, **settings)
+
+
+class TestAManualRun:
+    """The Run now button: one run at a time, and what the last one did."""
+
+    def test_nothing_has_run_at_first(self):
+        assert _manual_run().state == ManualRunState(phase="idle")
+
+    def test_a_run_asks_the_cli_with_the_model_and_effort_given(self):
+        asked: list[tuple[str, str]] = []
+        run = _manual_run(lambda model, effort: asked.append((model, effort)) or CliReply(True))
+
+        run.start("haiku", "high", finished=lambda: None)
+
+        assert asked == [("haiku", "high")]
+
+    def test_a_model_is_trimmed_before_it_reaches_the_cli(self):
+        asked: list[str] = []
+        run = _manual_run(lambda model, effort: asked.append(model) or CliReply(True))
+
+        run.start("  haiku ", "", finished=lambda: None)
+
+        assert asked == ["haiku"]
+
+    def test_a_finished_run_keeps_its_reply_and_its_command(self):
+        reply = CliReply(succeeded=True, reply_text="Hi!", input_tokens=600)
+        run = _manual_run(lambda model, effort: reply)
+
+        run.start("haiku", "", finished=lambda: None)
+
+        assert run.state == ManualRunState(
+            phase="finished", command=command_line(CLAUDE, "haiku", ""), reply=reply
         )
-        for _ in range(3):
-            nudger.maybe_nudge(usage(fetch_error="token_expired"))
-        assert nudger.exhausted is True
 
-        nudger.maybe_nudge(usage(utilization=0.0))
+    def test_the_caller_is_told_when_the_run_finishes(self):
+        told: list[str] = []
+        run = _manual_run()
 
-        assert nudger.exhausted is False
+        run.start("", "", finished=lambda: told.append("done"))
 
-    def test_the_shared_rule_is_the_default_predicate(self):
-        calls: list[int] = []
-        nudger = SessionNudger(
-            CLAUDE,
-            invoke=lambda: (calls.append(1), True)[1],
-            start_background=_run_immediately,
+        assert told == ["done"]
+
+    def test_a_run_in_progress_says_so(self):
+        run = _manual_run(start_background=lambda work: None)
+
+        assert run.start("haiku", "", finished=lambda: None) is True
+        assert run.state == ManualRunState(
+            phase="running", command=command_line(CLAUDE, "haiku", "")
         )
 
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-        assert calls == [1]
+    def test_a_second_run_is_refused_while_one_is_in_progress(self):
+        started: list[object] = []
+        run = _manual_run(start_background=started.append)
+        run.start("", "", finished=lambda: None)
+
+        assert run.start("", "", finished=lambda: None) is False
+        assert len(started) == 1
+
+    def test_a_finished_run_can_be_run_again(self):
+        run = _manual_run()
+        run.start("", "", finished=lambda: None)
+
+        assert run.start("", "", finished=lambda: None) is True
+
+    def test_a_success_asks_for_fresh_usage(self):
+        refreshed: list[str] = []
+        run = _manual_run(on_refreshed=lambda: refreshed.append("poll"))
+
+        run.start("", "", finished=lambda: None)
+
+        assert refreshed == ["poll"]
+
+    def test_a_failure_does_not_ask_for_fresh_usage(self):
+        refreshed: list[str] = []
+        run = _manual_run(
+            lambda model, effort: CliReply(succeeded=False, detail="Not logged in"),
+            on_refreshed=lambda: refreshed.append("poll"),
+        )
+
+        run.start("", "", finished=lambda: None)
+
+        assert refreshed == []
+
+    def test_an_invoker_that_raises_is_a_failed_run_not_a_crash(self, caplog):
+        def broken(model, effort):
+            raise RuntimeError("boom")
+
+        told: list[str] = []
+        run = _manual_run(broken)
+
+        with caplog.at_level(logging.ERROR):
+            run.start("", "", finished=lambda: told.append("done"))
+
+        assert run.state.phase == "finished"
+        assert run.state.reply.succeeded is False
+        assert "boom" in run.state.reply.detail
+        assert told == ["done"]
+
+    def test_a_copied_command_is_remembered(self):
+        run = _manual_run()
+
+        run.note_copied("claude -p hi")
+
+        assert run.state == ManualRunState(phase="copied", command="claude -p hi")
+
+    def test_copying_during_a_run_does_not_hide_the_run(self):
+        run = _manual_run(start_background=lambda work: None)
+        run.start("", "", finished=lambda: None)
+
+        run.note_copied("claude -p hi")
+
+        assert run.state.phase == "running"
+
+    def test_by_default_it_runs_its_own_providers_cli(self):
+        assert ManualRun(CODEX).provider is CODEX

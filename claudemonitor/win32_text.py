@@ -15,12 +15,20 @@ from typing import Any
 
 from .win32_bindings import (
     DEFAULT_GUI_FONT,
+    FF_MODERN,
+    FIXED_PITCH,
+    LOGFONTW,
     NONCLIENTMETRICSW,
     SIZE,
     SPI_GETNONCLIENTMETRICS,
 )
 
 log = logging.getLogger(__name__)
+
+# The fixed-width face every Windows since Vista ships with.
+MONOSPACE_FACE = "Consolas"
+# The size used when the system UI font cannot be read, in points.
+_FALLBACK_POINT_SIZE = 9
 
 
 def read_message_font_metrics(user32: Any, dpi: int) -> NONCLIENTMETRICSW | None:
@@ -65,6 +73,23 @@ def create_message_font(user32: Any, gdi32: Any, dpi: int) -> tuple[int, bool]:
         log.warning("unable to read system UI font metrics; using the stock font")
         return gdi32.GetStockObject(DEFAULT_GUI_FONT), True
     return gdi32.CreateFontIndirectW(ctypes.byref(metrics.lfMessageFont)), False
+
+
+def create_monospace_font(user32: Any, gdi32: Any, dpi: int) -> tuple[int, bool]:
+    """Build a fixed-width font as tall as the system UI font at ``dpi``.
+
+    It is always a font of its own, so the caller always releases it. The
+    family asks Windows for another fixed-width face should Consolas be missing.
+    """
+    metrics = read_message_font_metrics(user32, dpi)
+    if metrics is not None:
+        description = LOGFONTW.from_buffer_copy(metrics.lfMessageFont)
+    else:
+        description = LOGFONTW()
+        description.lfHeight = -round(_FALLBACK_POINT_SIZE * dpi / 72)
+    description.lfFaceName = MONOSPACE_FACE
+    description.lfPitchAndFamily = FIXED_PITCH | FF_MODERN
+    return gdi32.CreateFontIndirectW(ctypes.byref(description)), False
 
 
 def measure_text_width(gdi32: Any, font: int | None, text: str) -> int:

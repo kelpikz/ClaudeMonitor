@@ -29,7 +29,8 @@ class TestEveryProviderIsComplete:
     @pytest.mark.parametrize("provider", PROVIDERS)
     def test_it_names_the_cli_that_can_renew_its_token(self, provider):
         assert provider.cli_executable
-        assert provider.cli_arguments
+        assert provider.cli_arguments("", "")
+        assert callable(provider.read_cli_reply)
 
     @pytest.mark.parametrize("provider", PROVIDERS)
     def test_it_has_sentences_written_about_it(self, provider):
@@ -78,21 +79,23 @@ class TestWhichFetcherAnswers:
         assert callable(provider.fetch)
 
 
-class TestWhetherAProviderCanBeSwitchedOff:
-    """``tracking`` is the setting that hides a provider, or None for always on."""
-
-    def test_claude_is_always_tracked(self):
-        # An application showing nothing is not a state worth offering.
-        assert CLAUDE.tracking is None
-
-    def test_codex_is_switchable(self):
-        assert CODEX.tracking == config.CODEX_ENABLED
+class TestEveryProviderCanBeSwitchedOff:
+    """Each provider owns one config section, named by its own key."""
 
     @pytest.mark.parametrize("provider", PROVIDERS)
-    def test_a_tracking_setting_is_one_the_config_really_has(self, provider):
-        if provider.tracking is None:
-            return
-        assert provider.tracking in config.EVERY_SETTING
+    def test_its_settings_live_in_the_section_named_by_its_key(self, provider):
+        assert {setting.section for setting in provider.settings.every()} == {
+            provider.key
+        }
+
+    @pytest.mark.parametrize("provider", PROVIDERS)
+    def test_its_settings_are_ones_the_config_really_has(self, provider):
+        for setting in provider.settings.every():
+            assert setting in config.EVERY_SETTING
+
+    def test_claude_can_be_switched_off_as_codex_can(self):
+        assert CLAUDE.settings.tracking == config.ConfigSetting("claude", "enabled")
+        assert CODEX.settings.tracking == config.ConfigSetting("codex", "enabled")
 
 
 def _any_time():

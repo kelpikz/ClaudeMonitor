@@ -52,16 +52,22 @@ from .settings_layout import (
     _TAB_JOIN_HEIGHT,
     FieldLayout,
     GroupLayout,
+    SectionLayout,
     SettingsLayout,
     TabLayout,
     settings_layout,
 )
 from .settings import (
     PendingSettings,
+    SettingChoice,
+    SettingCommand,
     SettingLink,
     SettingNumber,
+    SettingOutput,
+    SettingText,
     SettingToggle,
     SettingsModel,
+    SettingsTab,
     WINDOW_TITLE,
     parse_number,
 )
@@ -76,10 +82,17 @@ from .win32_bindings import (
     BS_GROUPBOX,
     BS_PUSHBUTTON,
     BUTTON_CLASS,
+    CBN_SELCHANGE,
+    CBS_DROPDOWNLIST,
+    CB_ADDSTRING,
+    CB_GETCURSEL,
+    CB_SETCURSEL,
+    COMBOBOX_CLASS,
     COMCTL32_SIGNATURES,
     CS_HREDRAW,
     CS_VREDRAW,
     CW_USEDEFAULT,
+    DARK_MODE_COMBOBOX_THEME,
     DARK_MODE_CONTROL_THEME,
     DARK_THEME_BORDER,
     DARK_THEME_TAB_INACTIVE,
@@ -90,10 +103,14 @@ from .win32_bindings import (
     DWMAPI_SIGNATURES,
     DWMWA_USE_IMMERSIVE_DARK_MODE,
     EDIT_CLASS,
+    EM_SETCUEBANNER,
     EN_CHANGE,
     ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL,
     ES_LEFT,
+    ES_MULTILINE,
     ES_NUMBER,
+    ES_READONLY,
     GDI32_SIGNATURES,
     GWLP_WNDPROC,
     HWND_BOTTOM,
@@ -105,6 +122,13 @@ from .win32_bindings import (
     IDOK,
     INITCOMMONCONTROLSEX,
     KERNEL32_SIGNATURES,
+    LBN_SELCHANGE,
+    LBS_NOINTEGRALHEIGHT,
+    LBS_NOTIFY,
+    LB_ADDSTRING,
+    LB_GETCURSEL,
+    LB_SETCURSEL,
+    LISTBOX_CLASS,
     NMHDR,
     PAINTSTRUCT,
     SETTINGS_CLASS_NAME,
@@ -141,10 +165,12 @@ from .win32_bindings import (
     USER32_SIGNATURES,
     USER_DEFAULT_SCREEN_DPI,
     UXTHEME_SIGNATURES,
+    WM_APP,
     WM_CLOSE,
     WM_COMMAND,
     WM_CTLCOLORBTN,
     WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX,
     WM_CTLCOLORSTATIC,
     WM_DESTROY,
     WM_ERASEBKGND,
@@ -165,6 +191,7 @@ from .win32_bindings import (
     WS_SYSMENU,
     WS_TABSTOP,
     WS_VISIBLE,
+    WS_VSCROLL,
     apply_signatures,
     background_color_for_theme,
     field_background_color_for_theme,
@@ -184,7 +211,17 @@ _TAB_ID = 100
 _FIRST_FIELD_ID = 1000
 _FIRST_EDITOR_ID = 2000
 _FIRST_SPINNER_ID = 3000
+_FIRST_LIST_ID = 4000  # One per sectioned tab: the list down its left side.
+_FIRST_ADD_ID = 5000  # The button under that list, when the tab offers one.
 _UNUSED_ID = 0  # Group boxes and labels are never clicked, so never routed.
+
+# Posted to the frame when an output box has new text to show. A manual CLI run
+# finishes on a thread of its own, and only the thread that made a control may
+# safely write to it, so the change is posted here rather than drawn there.
+_WM_OUTPUT_CHANGED = WM_APP + 1
+
+# How many rows an open effort list shows before it scrolls.
+_CHOICE_LIST_ROWS = 8
 
 
 # The window class is registered once and outlives every window made from it,
@@ -208,12 +245,22 @@ class FieldControls:
 
     One record per field rather than a map per control: three maps keyed by the
     same field key were three chances to hold two of them and not the third.
-    A toggle and a link have only ``label``; a number has all three.
+    A toggle and a link have only ``label``; a text and a choice have a label
+    and an ``editor``; a number has all three.
     """
 
     label: int
     editor: int | None = None
     spinner: int | None = None
+
+
+@dataclass(frozen=True)
+class SideList:
+    """A sectioned tab's list, the section window behind each entry, and its add action."""
+
+    handle: int
+    sections: list[int]
+    add: SettingLink | None = None
 
 
 def _default_window_proc(hwnd: int, message: int, wparam: int, lparam: int) -> int:
@@ -277,8 +324,14 @@ class Win32SettingsWindow:
         self._handle: int | None = None
         self._tab_handle: int | None = None
         self._page_handles: list[int] = []
+        self._side_lists: list[SideList] = []
         self._font: int | None = None
         self._font_is_stock = False
+        # The Last run box shows a command line, in a fixed-width face.
+        self._monospace_font: int | None = None
+        # Each group that holds only output boxes, and the caption and border
+        # that are hidden with it while every one of those boxes is empty.
+        self._output_groups: list[tuple[list[SettingOutput], list[int]]] = []
         self._background_brush: int | None = None
         self._page_brush: int | None = None
         self._field_brush: int | None = None
@@ -288,6 +341,8 @@ class Win32SettingsWindow:
         self._original_tab_proc: int | None = None
         self._foreground_color = 0
         self._controls: dict[str, FieldControls] = {}
+        # The stored value behind each entry of each drop-down list, by field key.
+        self._choice_values: dict[str, list[str]] = {}
         # Set while the window writes a value into a box itself, so the change
         # notification that causes is not mistaken for something the user typed.
         self._syncing = False
@@ -309,10 +364,12 @@ class Win32SettingsWindow:
             self._create()
             self._pump()
         finally:
-            for handle in [*self._page_handles, self._handle]:
+            sections = [handle for side in self._side_lists for handle in side.sections]
+            for handle in [*sections, *self._page_handles, self._handle]:
                 if handle is not None:
                     _active_windows.pop(handle, None)
             self._page_handles = []
+            self._side_lists = []
             if self._tab_handle is not None:
                 _active_tab_strips.pop(self._tab_handle, None)
             self._release_resources()
@@ -347,6 +404,9 @@ class Win32SettingsWindow:
 
         dpi = self._system_dpi()
         self._font, self._font_is_stock = win32_text.create_message_font(
+            self._user32, self._gdi32, dpi
+        )
+        self._monospace_font, _ = win32_text.create_monospace_font(
             self._user32, self._gdi32, dpi
         )
         self._handle = self._create_frame()
@@ -707,11 +767,22 @@ class Win32SettingsWindow:
         """Create one window per tab and fill it with that tab's controls."""
         indexed = {field.key: index for index, field in enumerate(self._fields)}
         self._page_handles = [
-            self._create_page(tab, layout.page, indexed) for tab in layout.tabs
+            self._create_page(tab, placed, layout.page, indexed)
+            for tab, placed in zip(self._model.tabs, layout.tabs)
         ]
 
-    def _create_page(self, tab: TabLayout, page: Rect, indexed: dict[str, int]) -> int:
-        """Create one page window over the tab's display area, and its contents.
+    def _create_page(
+        self, tab: SettingsTab, placed: TabLayout, page: Rect, indexed: dict[str, int]
+    ) -> int:
+        """Create one page window over the tab's display area, and its contents."""
+        handle = self._create_child_window(page, self._handle)
+        self._create_groups(placed.groups, handle, indexed)
+        if placed.side_list is not None:
+            self._create_side_list(tab, placed, handle, indexed)
+        return handle
+
+    def _create_child_window(self, rect: Rect, parent: int) -> int:
+        """Create one plain window of our own class: a page, or a section on a page.
 
         It shares the frame's class, so its own messages — the colour requests
         from its controls, and their clicks — arrive at the same procedure.
@@ -725,39 +796,94 @@ class Win32SettingsWindow:
             # background of its own and would otherwise leave the frame's
             # colour showing through the middle of the page.
             WS_CHILD | WS_CLIPSIBLINGS,
-            page.left,
-            page.top,
-            page.width,
-            page.height,
-            self._handle,
+            rect.left,
+            rect.top,
+            rect.width,
+            rect.height,
+            parent,
             _UNUSED_ID,
             self._kernel32.GetModuleHandleW(None),
             None,
         )
         _active_windows[handle] = self
         self._apply_dark_control_theme(handle)
-        for group in tab.groups:
+        return handle
+
+    def _create_groups(
+        self, groups: list[GroupLayout], parent: int, indexed: dict[str, int]
+    ) -> None:
+        """Create every group box on one window, and the fields inside each."""
+        for group in groups:
             # The fields come first: a group box fills its own interior with
             # the colour it is given, and a child made later sits lower in the
             # z-order, which is what leaves the box behind what it surrounds.
-            for placed in group.fields:
-                index = indexed[placed.key]
-                self._create_field(self._fields[index], placed, index, handle)
-            self._create_group_box(group, handle)
+            items = [self._fields[indexed[placed.key]] for placed in group.fields]
+            for item, placed in zip(items, group.fields):
+                self._create_field(item, placed, indexed[placed.key], parent)
+            frame = self._create_group_box(group, parent)
+            if items and all(isinstance(item, SettingOutput) for item in items):
+                self._output_groups.append((items, frame))
+                self._show_output_group(items, frame)
+
+    def _create_side_list(
+        self, tab: SettingsTab, placed: TabLayout, page: int, indexed: dict[str, int]
+    ) -> None:
+        """Create a sectioned tab's list, one window per section, and the add button.
+
+        Each section is a window for the reason each page is one: hidden loose
+        controls leave the last section printed through the next.
+        """
+        list_index = len(self._side_lists)
+        listbox = self._create_control(
+            LISTBOX_CLASS,
+            "",
+            LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP,
+            placed.side_list,
+            _FIRST_LIST_ID + list_index,
+            page,
+        )
+        for section in placed.sections:
+            text = ctypes.create_unicode_buffer(section.title)
+            self._user32.SendMessageW(listbox, LB_ADDSTRING, 0, ctypes.addressof(text))
+        if placed.add_button is not None and tab.add_section is not None:
+            self._create_control(
+                BUTTON_CLASS,
+                tab.add_section.label,
+                BS_PUSHBUTTON | WS_TABSTOP,
+                placed.add_button,
+                _FIRST_ADD_ID + list_index,
+                page,
+            )
+        side = SideList(
+            handle=listbox,
+            sections=[self._create_section(section, page, indexed) for section in placed.sections],
+            add=tab.add_section,
+        )
+        self._side_lists.append(side)
+        self._user32.SendMessageW(listbox, LB_SETCURSEL, 0, 0)
+        self._show_section(side, 0)
+
+    def _create_section(
+        self, section: SectionLayout, page: int, indexed: dict[str, int]
+    ) -> int:
+        """Create one section window beside the list, and the groups it holds."""
+        handle = self._create_child_window(section.rect, page)
+        self._create_groups(section.groups, handle, indexed)
         return handle
 
-    def _create_group_box(self, group: GroupLayout, parent: int) -> int:
+    def _create_group_box(self, group: GroupLayout, parent: int) -> list[int]:
         """Create one box around a set of related fields, and caption it.
 
         The caption is a static of our own rather than the group box's title,
         because a group box paints its title in whichever colour the visual
         style picks — which on a dark page is black on near-black. The static
-        is created first, so it sits above the border it interrupts.
+        is created first, so it sits above the border it interrupts. Both
+        handles are returned, caption first, so the pair can be hidden together.
         """
-        self._create_control(
+        caption = self._create_control(
             STATIC_CLASS, group.title, SS_LEFT, group.caption, _UNUSED_ID, parent
         )
-        return self._create_control(
+        box = self._create_control(
             BUTTON_CLASS,
             "",
             BS_GROUPBOX | WS_GROUP,
@@ -765,6 +891,7 @@ class Win32SettingsWindow:
             _UNUSED_ID,
             parent,
         )
+        return [caption, box]
 
     def _create_field(
         self, item, placed: FieldLayout, index: int, parent: int
@@ -780,6 +907,12 @@ class Win32SettingsWindow:
             return [self._create_checkbox(item, placed, index, parent)]
         if isinstance(item, SettingNumber):
             return self._create_number(item, placed, index, parent)
+        if isinstance(item, SettingText):
+            return self._create_text(item, placed, index, parent)
+        if isinstance(item, SettingChoice):
+            return self._create_choice(item, placed, index, parent)
+        if isinstance(item, SettingOutput):
+            return [self._create_output(item, placed, parent)]
         return [
             self._create_control(
                 BUTTON_CLASS,
@@ -827,6 +960,121 @@ class Win32SettingsWindow:
             STATIC_CLASS, item.suffix, SS_LEFT, placed.suffix, _UNUSED_ID, parent
         )
         return [label, editor, spinner, suffix]
+
+    def _create_text(self, item, placed: FieldLayout, index: int, parent: int) -> list[int]:
+        """Create a text field's label and the box it is typed into."""
+        label = self._create_control(
+            STATIC_CLASS, item.label, SS_LEFT, placed.rect, _UNUSED_ID, parent
+        )
+        editor = self._create_control(
+            EDIT_CLASS,
+            str(self._pending.value_of(item.key) or ""),
+            ES_LEFT | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+            placed.editor,
+            _FIRST_EDITOR_ID + index,
+            parent,
+        )
+        self._controls[item.key] = FieldControls(label=label, editor=editor)
+        if item.placeholder:
+            cue = ctypes.create_unicode_buffer(item.placeholder)
+            # wparam 1 keeps the grey text while the empty box has the focus.
+            self._user32.SendMessageW(editor, EM_SETCUEBANNER, 1, ctypes.addressof(cue))
+        return [label, editor]
+
+    def _create_choice(self, item, placed: FieldLayout, index: int, parent: int) -> list[int]:
+        """Create a choice's label and its drop-down list, on the stored entry.
+
+        A combo box is created as tall as its open list; the closed box is
+        drawn at the row's own height.
+        """
+        label = self._create_control(
+            STATIC_CLASS, item.label, SS_LEFT, placed.rect, _UNUSED_ID, parent
+        )
+        box = placed.editor
+        combo = self._create_control(
+            COMBOBOX_CLASS,
+            "",
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+            Rect(box.left, box.top, box.right, box.top + box.height * _CHOICE_LIST_ROWS),
+            _FIRST_FIELD_ID + index,
+            parent,
+        )
+        if not self._uses_light_theme():
+            self._set_theme(combo, DARK_MODE_COMBOBOX_THEME)
+        self._controls[item.key] = FieldControls(label=label, editor=combo)
+        self._fill_choices(item, combo)
+        return [label, combo]
+
+    def _create_output(self, item, placed: FieldLayout, parent: int) -> int:
+        """Create a read-only box of several lines, showing its text as it reads now.
+
+        It is never typed into, so it is never routed: its id is the unused one.
+        """
+        handle = self._create_control(
+            EDIT_CLASS,
+            self._output_text(item),
+            ES_LEFT | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
+            placed.rect,
+            _UNUSED_ID,
+            parent,
+        )
+        self._controls[item.key] = FieldControls(label=handle)
+        self._user32.SendMessageW(handle, WM_SETFONT, self._monospace_font, 1)
+        self._set_shown(handle, bool(self._output_text(item)))
+        return handle
+
+    def _set_shown(self, handle: int, shown: bool) -> None:
+        """Show or hide one control."""
+        self._user32.ShowWindow(handle, SW_SHOW if shown else SW_HIDE)
+
+    def _show_output_group(self, outputs: list, frame: list[int]) -> None:
+        """Show a group of output boxes only while one of them has something to say."""
+        shown = any(self._output_text(item) for item in outputs)
+        for handle in frame:
+            self._set_shown(handle, shown)
+
+    def _output_text(self, item) -> str:
+        """Read one output box's text, with the line breaks an edit control needs."""
+        try:
+            text = str(item.text())
+        except Exception:
+            log.exception("unable to read the %r output", item.key)
+            return ""
+        return "\r\n".join(text.splitlines())
+
+    def _refresh_outputs(self) -> None:
+        """Show what every output box now says, and hide each one with nothing to say."""
+        for item in self._fields:
+            if isinstance(item, SettingOutput) and item.key in self._controls:
+                handle = self._controls[item.key].label
+                text = self._output_text(item)
+                self._user32.SetWindowTextW(handle, text)
+                self._set_shown(handle, bool(text))
+        for outputs, frame in self._output_groups:
+            self._show_output_group(outputs, frame)
+
+    def _fill_choices(self, item, combo: int) -> None:
+        """Add every choice to the list and select the stored one.
+
+        A stored value the list does not offer — a hand-edited config, say —
+        is added as an entry of its own rather than shown as nothing.
+        """
+        entries = list(item.choices)
+        current = str(self._pending.value_of(item.key) or "")
+        if current not in [value for value, _label in entries]:
+            entries.append((current, current))
+        self._choice_values[item.key] = [value for value, _label in entries]
+        for _value, shown in entries:
+            text = ctypes.create_unicode_buffer(shown)
+            self._user32.SendMessageW(combo, CB_ADDSTRING, 0, ctypes.addressof(text))
+        self._select_choice(item)
+
+    def _select_choice(self, item) -> None:
+        """Select the entry that holds the setting's current value."""
+        values = self._choice_values.get(item.key, [])
+        current = str(self._pending.value_of(item.key) or "")
+        index = values.index(current) if current in values else -1
+        self._user32.SendMessageW(self._controls[item.key].editor, CB_SETCURSEL, index, 0)
 
     def _create_spinner(
         self, item, placed: FieldLayout, index: int, editor: int, parent: int
@@ -911,10 +1159,14 @@ class Win32SettingsWindow:
         """Give one control the dark visual style File Explorer uses."""
         if self._uses_light_theme():
             return
+        self._set_theme(handle, DARK_MODE_CONTROL_THEME)
+
+    def _set_theme(self, handle: int, theme: str) -> None:
+        """Give one control a named visual style, logging a refusal."""
         try:
-            self._uxtheme.SetWindowTheme(handle, DARK_MODE_CONTROL_THEME, None)
+            self._uxtheme.SetWindowTheme(handle, theme, None)
         except (AttributeError, OSError) as exc:
-            log.warning("unable to apply the dark control theme (%s)", exc)
+            log.warning("unable to apply the %s theme (%s)", theme, exc)
 
     def _register_class(self) -> None:
         """Register the settings window class once per process."""
@@ -981,13 +1233,16 @@ class Win32SettingsWindow:
         """
         if hwnd != self._handle:
             return self._page_proc(hwnd, message, wparam, lparam)
+        if message == _WM_OUTPUT_CHANGED:
+            self._refresh_outputs()
+            return 0
         if message == WM_COMMAND:
             return self._on_command(hwnd, wparam & 0xFFFF, (wparam >> 16) & 0xFFFF)
         if message == WM_NOTIFY:
             return self._on_notify(lparam)
         if message == WM_ERASEBKGND:
             return self._paint_background(wparam)
-        if message == WM_CTLCOLOREDIT:
+        if message in (WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX):
             return self._color_editor(wparam)
         if message in (WM_CTLCOLORSTATIC, WM_CTLCOLORBTN):
             return self._color_dialog_control(wparam)
@@ -1018,22 +1273,35 @@ class Win32SettingsWindow:
             # and its own device context; left unanswered, the control falls
             # back to the dialog grey and prints a hole in the page.
             return self._fill(wparam, hwnd, self._page_brush)
-        if message == WM_CTLCOLOREDIT:
+        if message in (WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX):
             return self._color_editor(wparam)
         if message in (WM_CTLCOLORSTATIC, WM_CTLCOLORBTN):
             return self._color_page_control(wparam)
         return self._user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     def _on_command(self, hwnd: int, control_id: int, notification: int) -> int:
-        """Route a click, a typed number, or a dialog button to what owns it."""
+        """Route a click, a pick, typed text, or a dialog button to what owns it."""
         field_index = control_id - _FIRST_FIELD_ID
         if 0 <= field_index < len(self._fields):
-            self._field_used(field_index)
+            self._field_used(field_index, notification)
             return 0
 
         editor_index = control_id - _FIRST_EDITOR_ID
         if notification == EN_CHANGE and 0 <= editor_index < len(self._fields):
-            self._number_typed(editor_index)
+            self._editor_typed(editor_index)
+            return 0
+
+        list_index = control_id - _FIRST_LIST_ID
+        if 0 <= list_index < len(self._side_lists):
+            if notification == LBN_SELCHANGE:
+                self._section_picked(self._side_lists[list_index])
+            return 0
+
+        add_index = control_id - _FIRST_ADD_ID
+        if 0 <= add_index < len(self._side_lists):
+            add = self._side_lists[add_index].add
+            if add is not None:
+                self._open_link(add)
             return 0
 
         if control_id == IDOK:
@@ -1071,17 +1339,45 @@ class Win32SettingsWindow:
         for page, handle in enumerate(self._page_handles):
             self._user32.ShowWindow(handle, SW_SHOW if page == index else SW_HIDE)
 
-    def _field_used(self, index: int) -> None:
-        """Record a checkbox click, or run a link button."""
+    def _section_picked(self, side: SideList) -> None:
+        """Show the section the user picked in a side list."""
+        picked = int(self._user32.SendMessageW(side.handle, LB_GETCURSEL, 0, 0))
+        self._show_section(side, picked)
+
+    def _show_section(self, side: SideList, index: int) -> None:
+        """Show one section window and hide the others; ignore an index it lacks."""
+        if not 0 <= index < len(side.sections):
+            return
+        for position, handle in enumerate(side.sections):
+            self._user32.ShowWindow(handle, SW_SHOW if position == index else SW_HIDE)
+
+    def _field_used(self, index: int, notification: int) -> None:
+        """Record a checkbox click or a picked entry, or run a link or command button."""
         item = self._fields[index]
         if isinstance(item, SettingLink):
             self._open_link(item)
             return
+        if isinstance(item, SettingCommand):
+            self._run_command(item)
+            return
         if isinstance(item, SettingToggle):
             self._pending.edit(item.key, self._reads_checked(self._controls[item.key].label))
+            return
+        if isinstance(item, SettingChoice) and notification == CBN_SELCHANGE:
+            self._choice_picked(item)
 
-    def _number_typed(self, index: int) -> None:
-        """Record what a number box now says, ignoring our own writes to it.
+    def _choice_picked(self, item) -> None:
+        """Record the entry the user picked from a drop-down list."""
+        controls = self._controls.get(item.key)
+        if controls is None or controls.editor is None:
+            return
+        picked = int(self._user32.SendMessageW(controls.editor, CB_GETCURSEL, 0, 0))
+        values = self._choice_values.get(item.key, [])
+        if 0 <= picked < len(values):
+            self._pending.edit(item.key, values[picked])
+
+    def _editor_typed(self, index: int) -> None:
+        """Record what a number or text box now says, ignoring our own writes to it.
 
         An edit control announces its very first text while CreateWindowExW is
         still running, before there is a handle to read it back through, so an
@@ -1091,14 +1387,42 @@ class Win32SettingsWindow:
             return
         item = self._fields[index]
         controls = self._controls.get(item.key)
-        if not isinstance(item, SettingNumber) or controls is None or controls.editor is None:
+        if controls is None or controls.editor is None:
             return
-        typed = parse_number(item, self._control_text(controls.editor))
+        typed_text = self._control_text(controls.editor)
+        if isinstance(item, SettingText):
+            self._pending.edit(item.key, typed_text)
+            return
+        if not isinstance(item, SettingNumber):
+            return
+        typed = parse_number(item, typed_text)
         if typed is None:
             # A box part-way through being typed into; the last usable value
             # stands rather than being replaced by a half-formed one.
             return
         self._pending.edit(item.key, typed)
+
+    def _run_command(self, command) -> None:
+        """Run one command button on the model and effort shown, applied or not.
+
+        A failure is kept out of the window procedure, like a link's.
+        """
+        model = str(self._pending.value_of(command.model_key) or "")
+        effort = str(self._pending.value_of(command.effort_key) or "")
+        try:
+            command.act(model, effort, self._announce_output_changed)
+        except Exception:
+            log.exception("settings command %r failed", command.label)
+
+    def _announce_output_changed(self) -> None:
+        """Ask the window's own thread to reread its output boxes; callable from any thread.
+
+        A run can outlive the window, so a closed window is simply not told.
+        """
+        handle = self._handle
+        if handle is None:
+            return
+        self._user32.PostMessageW(handle, _WM_OUTPUT_CHANGED, 0, 0)
 
     def _open_link(self, link) -> None:
         """Open one link, keeping a failure out of the window procedure."""
@@ -1123,6 +1447,13 @@ class Win32SettingsWindow:
                     )
                 elif isinstance(item, SettingNumber):
                     self._set_number(item)
+                elif isinstance(item, SettingText):
+                    self._user32.SetWindowTextW(
+                        self._controls[item.key].editor,
+                        str(self._pending.value_of(item.key) or ""),
+                    )
+                elif isinstance(item, SettingChoice):
+                    self._select_choice(item)
         finally:
             self._syncing = False
 
@@ -1210,6 +1541,10 @@ class Win32SettingsWindow:
         if self._font is not None and not self._font_is_stock:
             self._delete_object(self._font)
         self._font = None
+        if self._monospace_font:
+            self._delete_object(self._monospace_font)
+        self._monospace_font = None
+        self._output_groups = []
         for brush in (
             "_background_brush",
             "_page_brush",

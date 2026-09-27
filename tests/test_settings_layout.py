@@ -13,21 +13,33 @@ from pathlib import Path
 from claudemonitor.models import CLAUDE, CODEX, Insets
 from claudemonitor.settings import (
     ProviderFields,
+    SettingChoice,
+    SettingCommand,
     SettingLink,
     SettingNumber,
+    SettingOutput,
+    SettingText,
     SettingToggle,
     SettingsGroup,
     SettingsModel,
+    SettingsSection,
     SettingsTab,
     build_settings,
 )
 from claudemonitor.settings_layout import (
+    _BUTTON_GAP,
     _BUTTON_HEIGHT,
     _BUTTON_MIN_WIDTH,
+    _GROUP_PADDING,
+    _OUTPUT_HEIGHT,
+    _OUTPUT_MIN_WIDTH,
     _CHECKBOX_INDICATOR,
+    _CHOICE_WIDTH,
+    _TEXT_WIDTH,
     _GROUP_BOTTOM_PADDING,
     _GROUP_CAPTION_HEIGHT,
     _GROUP_GAP,
+    _LIST_MIN_WIDTH,
     _ROW_GAP,
     _ROW_HEIGHT,
     _button_width,
@@ -91,18 +103,55 @@ def _one_tab(*fields, title: str = "General", group: str = "Startup") -> Setting
     )
 
 
+def _text(key: str = "claude_model", label: str = "Model"):
+    """One text box field, wired to nothing."""
+    return SettingText(key=key, label=label, value=lambda: "haiku", write=lambda _: None)
+
+
+def _choice(key: str = "claude_effort", label: str = "Reasoning effort"):
+    """One drop-down field, wired to nothing."""
+    return SettingChoice(
+        key=key,
+        label=label,
+        value=lambda: "",
+        write=lambda _: None,
+        choices=(("", "Default"), ("low", "low")),
+    )
+
+
+def _provider_fields(provider) -> ProviderFields:
+    """One provider's tab, wired to nothing."""
+    return ProviderFields(
+        provider=provider,
+        tracking=SettingToggle(is_on=lambda: True, write=lambda _: None),
+        renew_token=SettingToggle(is_on=lambda: True, write=lambda _: None),
+        wake_session=SettingToggle(is_on=lambda: True, write=lambda _: None),
+        cooldown=SettingNumber(
+            value=lambda: 900, write=lambda _: None, minimum=60, maximum=86400
+        ),
+        model=SettingText(value=lambda: "haiku", write=lambda _: None),
+        effort=SettingChoice(value=lambda: "", write=lambda _: None),
+        copy_command=_command(),
+        run_command=_command(),
+        last_run=_output(),
+    )
+
+
+def _command(key: str = "claude_copy_command", label: str = "Copy command"):
+    """One command button, wired to nothing."""
+    return SettingCommand(key=key, label=label, act=lambda model, effort, changed: None)
+
+
+def _output(key: str = "claude_last_run"):
+    """One read-only output box, wired to nothing."""
+    return SettingOutput(key=key, text=lambda: "Not run yet.")
+
+
 def _production_model() -> SettingsModel:
-    """Build the real three-tab model, so the tests bind to what ships."""
+    """Build the real model, so the tests bind to what ships."""
     return build_settings(
         taskbar=SettingToggle(is_on=lambda: True, write=lambda _: None),
-        providers=[
-            ProviderFields(provider=CLAUDE),
-            ProviderFields(
-                provider=CODEX,
-                tracking=SettingToggle(is_on=lambda: True, write=lambda _: None),
-            ),
-        ],
-        session_refresh=SettingToggle(is_on=lambda: True, write=lambda _: None),
+        providers=[_provider_fields(CLAUDE), _provider_fields(CODEX)],
         startup=SettingToggle(is_on=lambda: True, write=lambda _: None),
         poll_interval=SettingNumber(
             value=lambda: 60, write=lambda _: None, minimum=10, maximum=600
@@ -113,12 +162,39 @@ def _production_model() -> SettingsModel:
         red_threshold=SettingNumber(
             value=lambda: 20, write=lambda _: None, minimum=1, maximum=99
         ),
-        refresh_cooldown=SettingNumber(
-            value=lambda: 900, write=lambda _: None, minimum=60, maximum=86400
-        ),
         log_dir=Path("."),
         open_url=lambda url: None,
         open_folder=lambda path: None,
+    )
+
+
+def _placed_groups(layout):
+    """Every placed group with the width and height of the window it sits in.
+
+    A tab's own groups sit on its page; a section's groups sit on the
+    section's window, which is placed from its own top left corner.
+    """
+    placed = []
+    for tab in layout.tabs:
+        placed += [(group, layout.page.width, layout.page.height) for group in tab.groups]
+        for section in tab.sections:
+            placed += [
+                (group, section.rect.width, section.rect.height) for group in section.groups
+            ]
+    return placed
+
+
+def _sectioned(*sections, add_section=None) -> SettingsModel:
+    """One tab whose groups are split into sections picked from a side list."""
+    return SettingsModel(
+        tabs=[SettingsTab(title="Providers", sections=list(sections), add_section=add_section)]
+    )
+
+
+def _section(title: str, *fields) -> SettingsSection:
+    """One side-list entry holding a single group of the given fields."""
+    return SettingsSection(
+        title=title, groups=[SettingsGroup(title="Tracking", fields=list(fields))]
     )
 
 
@@ -152,10 +228,7 @@ class TestSettingsLayout:
     def test_every_group_and_field_is_placed(self):
         layout = self._layout()
         placed = {
-            field.key
-            for tab in layout.tabs
-            for group in tab.groups
-            for field in group.fields
+            field.key for group, _width, _height in _placed_groups(layout) for field in group.fields
         }
 
         assert placed == {field.key for field in _production_model().fields()}
@@ -165,12 +238,11 @@ class TestSettingsLayout:
         # its own top left corner rather than from the frame's.
         layout = self._layout()
 
-        for tab in layout.tabs:
-            for group in tab.groups:
-                assert group.rect.left >= 0
-                assert group.rect.top >= 0
-                assert group.rect.right <= layout.page.width
-                assert group.rect.bottom <= layout.page.height
+        for group, width, height in _placed_groups(layout):
+            assert group.rect.left >= 0
+            assert group.rect.top >= 0
+            assert group.rect.right <= width
+            assert group.rect.bottom <= height
 
     def test_groups_on_a_page_do_not_overlap(self):
         general = self._layout().tabs[0]
@@ -182,23 +254,21 @@ class TestSettingsLayout:
     def test_every_group_caption_sits_on_its_own_border(self):
         layout = self._layout()
 
-        for tab in layout.tabs:
-            for group in tab.groups:
-                assert group.caption.left > group.rect.left
-                assert group.caption.top >= group.rect.top
-                assert group.caption.right <= group.rect.right
-                assert group.caption.bottom < group.rect.bottom
+        for group, _width, _height in _placed_groups(layout):
+            assert group.caption.left > group.rect.left
+            assert group.caption.top >= group.rect.top
+            assert group.caption.right <= group.rect.right
+            assert group.caption.bottom < group.rect.bottom
 
     def test_every_field_stays_inside_its_group(self):
         layout = self._layout()
 
-        for tab in layout.tabs:
-            for group in tab.groups:
-                for field in group.fields:
-                    assert field.rect.left >= group.rect.left
-                    assert field.rect.right <= group.rect.right
-                    assert field.rect.top >= group.rect.top
-                    assert field.rect.bottom <= group.rect.bottom
+        for group, _width, _height in _placed_groups(layout):
+            for field in group.fields:
+                assert field.rect.left >= group.rect.left
+                assert field.rect.right <= group.rect.right
+                assert field.rect.top >= group.rect.top
+                assert field.rect.bottom <= group.rect.bottom
 
     def test_a_number_field_gets_a_box_a_spinner_and_a_unit(self):
         placed = self._layout(_one_tab(_number())).tabs[0].groups[0].fields[0]
@@ -246,11 +316,7 @@ class TestSettingsLayout:
         layout = self._layout()
 
         assert layout.page.height > 0
-        assert all(
-            group.rect.bottom <= layout.page.height
-            for tab in layout.tabs
-            for group in tab.groups
-        )
+        assert all(group.rect.bottom <= height for group, _width, height in _placed_groups(layout))
 
     def test_the_window_is_wide_enough_for_the_longest_label(self):
         layout = self._layout(_one_tab(_toggle(label="A" * 90)))
@@ -289,7 +355,167 @@ class TestSettingsLayout:
         assert layout.width > 0 and layout.height > 0
 
 
+class TestASectionedTab:
+    """A list down the left of the page, and the picked section beside it."""
+
+    def _layout(self, model: SettingsModel):
+        return settings_layout(model, measure=_measure, tab_frame=Insets(4, 24, 4, 4))
+
+    def test_a_plain_tab_has_no_list(self):
+        tab = self._layout(_one_tab(_toggle())).tabs[0]
+
+        assert tab.side_list is None and tab.add_button is None and tab.sections == []
+
+    def test_a_sectioned_tab_gets_a_list_on_the_left_of_its_page(self):
+        tab = self._layout(_sectioned(_section("Claude", _toggle()))).tabs[0]
+
+        assert tab.side_list is not None
+        assert tab.side_list.left > 0 and tab.side_list.top > 0
+
+    def test_every_section_is_laid_out_in_order(self):
+        tab = self._layout(
+            _sectioned(_section("Claude", _toggle()), _section("Codex", _toggle(key="b")))
+        ).tabs[0]
+
+        assert [section.title for section in tab.sections] == ["Claude", "Codex"]
+
+    def test_every_section_sits_right_of_the_list(self):
+        tab = self._layout(
+            _sectioned(_section("Claude", _toggle()), _section("Codex", _toggle(key="b")))
+        ).tabs[0]
+
+        assert all(section.rect.left >= tab.side_list.right for section in tab.sections)
+
+    def test_every_section_shares_one_rectangle(self):
+        # Only one section shows at a time, in the same place.
+        tab = self._layout(
+            _sectioned(_section("Claude", _toggle()), _section("Codex", _toggle(key="b")))
+        ).tabs[0]
+
+        assert tab.sections[0].rect == tab.sections[1].rect
+
+    def test_a_section_stays_inside_the_page(self):
+        layout = self._layout(_sectioned(_section("Claude", _toggle(label="A" * 60))))
+        section = layout.tabs[0].sections[0]
+
+        assert section.rect.right <= layout.page.width
+        assert section.rect.bottom <= layout.page.height
+
+    def test_the_first_group_lines_up_with_the_top_of_the_list(self):
+        layout = self._layout(_sectioned(_section("Claude", _toggle())))
+        tab = layout.tabs[0]
+
+        assert tab.sections[0].rect.top + tab.sections[0].groups[0].rect.top == tab.side_list.top
+
+    def test_the_list_is_at_least_its_minimum_width(self):
+        tab = self._layout(_sectioned(_section("C", _toggle()))).tabs[0]
+
+        assert tab.side_list.width >= _LIST_MIN_WIDTH
+
+    def test_a_long_section_title_widens_the_list(self):
+        tab = self._layout(_sectioned(_section("A" * 30, _toggle()))).tabs[0]
+
+        assert tab.side_list.width > _measure("A" * 30)
+
+    def test_the_page_is_wide_enough_for_the_list_and_the_widest_group(self):
+        layout = self._layout(_sectioned(_section("Claude", _toggle(label="A" * 60))))
+
+        assert layout.page.width > _LIST_MIN_WIDTH + _measure("A" * 60)
+
+    def test_the_page_is_tall_enough_for_the_tallest_section(self):
+        short = _section("Claude", _toggle())
+        tall = _section("Codex", *[_toggle(key=f"t{n}") for n in range(8)])
+        layout = self._layout(_sectioned(short, tall))
+
+        assert layout.page.height >= _group_height(tall.groups[0], _unscaled)
+
+    def test_without_an_add_action_the_list_runs_to_the_bottom(self):
+        layout = self._layout(_sectioned(_section("Claude", _toggle())))
+        tab = layout.tabs[0]
+
+        assert tab.add_button is None
+        assert tab.side_list.bottom == layout.page.height - tab.side_list.top
+
+    def test_an_add_action_gets_a_button_under_the_list(self):
+        layout = self._layout(
+            _sectioned(_section("Claude", _toggle()), add_section=_link("add", "Add provider…"))
+        )
+        tab = layout.tabs[0]
+
+        assert tab.add_button.top > tab.side_list.bottom
+        assert tab.add_button.left == tab.side_list.left
+        assert tab.add_button.bottom <= layout.page.height
+
+    def test_the_add_button_is_as_wide_as_the_list(self):
+        tab = self._layout(
+            _sectioned(_section("Claude", _toggle()), add_section=_link("add", "Add provider…"))
+        ).tabs[0]
+
+        assert tab.add_button.width == tab.side_list.width
+
+    def test_a_long_add_label_widens_the_list(self):
+        label = "Add a provider that has a long name"
+        tab = self._layout(
+            _sectioned(_section("C", _toggle()), add_section=_link("add", label))
+        ).tabs[0]
+
+        assert tab.side_list.width >= _button_width(label, _measure, _unscaled)
+
+    def test_the_production_providers_tab_lists_every_provider(self):
+        layout = self._layout(_production_model())
+        providers = layout.tabs[1]
+
+        assert [section.title for section in providers.sections] == ["Claude", "Codex"]
+        assert providers.groups == []
+
+
 # -------------------------------------------------------------- the parts of it
+
+
+class TestTextAndChoiceFields:
+    """A model box and an effort list sit on the same column a number does."""
+
+    def _placed(self, *fields):
+        layout = settings_layout(
+            _one_tab(*fields), measure=_measure, tab_frame=Insets(4, 25, 4, 4)
+        )
+        return {placed.key: placed for placed in layout.tabs[0].groups[0].fields}
+
+    def test_a_text_field_gets_a_label_and_a_box(self):
+        placed = self._placed(_text())["claude_model"]
+
+        assert placed.editor is not None
+        assert placed.editor.width == _TEXT_WIDTH
+        assert placed.spinner is None
+
+    def test_a_choice_gets_a_label_and_a_list(self):
+        placed = self._placed(_choice())["claude_effort"]
+
+        assert placed.editor is not None
+        assert placed.editor.width == _CHOICE_WIDTH
+
+    def test_the_label_sits_before_the_box(self):
+        placed = self._placed(_text())["claude_model"]
+
+        assert placed.rect.right <= placed.editor.left
+
+    def test_a_number_a_text_and_a_choice_share_one_column(self):
+        placed = self._placed(
+            _number(key="claude_cooldown", label="Wait between runs"),
+            _text(),
+            _choice(),
+        )
+
+        lefts = {placed[key].editor.left for key in placed}
+        assert len(lefts) == 1
+
+    def test_a_long_choice_label_moves_the_shared_column(self):
+        short = self._placed(_number(label="Wait"), _text(label="Model"))
+        longer = self._placed(
+            _number(label="Wait"), _text(label="Model"), _choice(label="A much longer label")
+        )
+
+        assert longer["claude_model"].editor.left > short["claude_model"].editor.left
 
 
 class TestRowHeight:
@@ -450,3 +676,103 @@ class TestButtonRow:
         )
 
         assert (ok.width, cancel.width, apply_button.width) == (80, 90, 100)
+
+
+class TestCommandsAndTheirOutput:
+    """Copy command and Run now share a row; the box under them spans the group."""
+
+    def _group(self, *fields):
+        layout = settings_layout(
+            _one_tab(*fields, group="Auto-refresh"),
+            measure=_measure,
+            tab_frame=Insets(4, 24, 4, 4),
+            dpi=96,
+        )
+        return layout.tabs[0].groups[0]
+
+    def _two_buttons_and_a_box(self):
+        return self._group(
+            _command(),
+            _command(key="claude_run_command", label="Run now"),
+            _output(),
+        )
+
+    def test_two_buttons_in_a_row_share_one_line(self):
+        copy, run, _box = self._two_buttons_and_a_box().fields
+
+        assert (copy.rect.top, copy.rect.bottom) == (run.rect.top, run.rect.bottom)
+
+    def test_the_second_button_follows_the_first_after_a_gap(self):
+        copy, run, _box = self._two_buttons_and_a_box().fields
+
+        assert run.rect.left == copy.rect.right + _BUTTON_GAP
+
+    def test_each_button_keeps_the_width_of_its_own_label(self):
+        copy, run, _box = self._two_buttons_and_a_box().fields
+
+        assert copy.rect.width == _button_width("Copy command", _measure, _unscaled)
+        assert run.rect.width == _button_width("Run now", _measure, _unscaled)
+
+    def test_a_button_after_a_different_field_starts_a_row_of_its_own(self):
+        toggle, link = self._group(_toggle(), _link()).fields
+
+        assert link.rect.top > toggle.rect.bottom
+
+    def test_the_box_sits_below_the_buttons(self):
+        copy, _run, box = self._two_buttons_and_a_box().fields
+
+        assert box.rect.top == copy.rect.bottom + _ROW_GAP
+
+    def test_the_box_spans_the_group_inside_its_padding(self):
+        group = self._two_buttons_and_a_box()
+        box = group.fields[2]
+
+        assert box.rect.left == group.rect.left + _GROUP_PADDING
+        assert box.rect.right == group.rect.right - _GROUP_PADDING
+
+    def test_the_box_is_several_lines_tall(self):
+        box = self._two_buttons_and_a_box().fields[2]
+
+        assert box.rect.height == _OUTPUT_HEIGHT
+
+    def test_a_button_row_is_one_row_high(self):
+        group = SettingsGroup(
+            title="P", fields=[_command(), _command(key="b", label="Run now")]
+        )
+
+        assert _group_height(group, _unscaled) == (
+            _GROUP_CAPTION_HEIGHT + _BUTTON_HEIGHT + _GROUP_BOTTOM_PADDING
+        )
+
+    def test_a_button_row_is_as_wide_as_its_buttons_and_the_gap(self):
+        group = SettingsGroup(
+            title="P", fields=[_command(), _command(key="b", label="Run now")]
+        )
+
+        assert _group_content_width(group, _measure, _unscaled) == (
+            _button_width("Copy command", _measure, _unscaled)
+            + _BUTTON_GAP
+            + _button_width("Run now", _measure, _unscaled)
+        )
+
+    def test_the_box_asks_for_its_minimum_width(self):
+        assert _content_width(_output(), _measure, _unscaled, column=0) == _OUTPUT_MIN_WIDTH
+
+    def test_the_box_gets_a_row_of_its_own_height(self):
+        assert _row_height(_output(), _unscaled) == _OUTPUT_HEIGHT
+
+    def test_a_command_gets_the_button_row(self):
+        assert _row_height(_command(), _unscaled) == _BUTTON_HEIGHT
+
+    def test_the_production_refresh_group_holds_both_buttons_on_one_row(self):
+        layout = settings_layout(
+            _production_model(), measure=_measure, tab_frame=Insets(4, 24, 4, 4)
+        )
+        refresh, last_run = layout.tabs[1].sections[0].groups[1:3]
+        placed = {field.key: field for field in refresh.fields}
+        (box,) = last_run.fields
+
+        assert placed["claude_copy_command"].rect.top == placed["claude_run_command"].rect.top
+        assert box.key == "claude_last_run"
+        assert last_run.rect.top > refresh.rect.bottom
+        assert box.rect.bottom <= last_run.rect.bottom

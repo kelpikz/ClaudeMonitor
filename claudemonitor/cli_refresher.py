@@ -6,35 +6,72 @@ side effect: it refreshes an expired token before sending, and the reply itself
 starts the usage window so a real reset countdown appears.
 
 Both providers use the same ``SessionNudger`` and the same rule for when to
-run it. The only difference between them is the command, which each
+run it. What differs — the argv, and how to read what the CLI prints — each
 ``Provider`` carries, so nothing in this module names a provider.
+
+Each nudger reads its provider's settings on every poll: the two switches
+(renew an expired token, wake an idle window), the cooldown, and the model and
+effort to ask with. Each run is logged: the tokens it used, or why it failed.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
-from typing import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Literal
 
-from .models import Provider, ProviderUsageData
+from .models import CliReply, Provider, ProviderUsageData
 
 log = logging.getLogger(__name__)
 
 COMMAND_TIMEOUT_SECONDS = 120
-DEFAULT_COOLDOWN_SECONDS = 900 # 15 mins
+DEFAULT_COOLDOWN_SECONDS = 900  # 15 mins
 MAX_CONSECUTIVE_FAILURES = 3
+
+# What both CLIs are given in place of their own long system prompt. The
+# default one, with its tool definitions, was most of the tokens a nudge cost.
+NUDGE_INSTRUCTIONS = "Reply briefly."
+# The effort a blank setting asks for. A one-word reply needs no reasoning.
+DEFAULT_NUDGE_EFFORT = "low"
 
 # A windowed build has no console, so an inherited one would flash on screen.
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-_NUDGEABLE_FETCH_ERRORS = frozenset({"token_expired"})
+# The folder both CLIs start in. It stays empty, so no AGENTS.md or CLAUDE.md
+# is found in it or above it — under `uv run dev` the CLI used to start in this
+# repository and read its AGENTS.md into every nudge.
+_QUIET_FOLDER_NAME = "claudemonitor-cli"
+
+# The two things one CLI run can fix.
+NudgeReason = Literal["token_expired", "idle_window"]
 
 
-def needs_session_nudge(data: ProviderUsageData) -> bool:
-    """Return whether this fetch describes a session the CLI could wake.
+@dataclass(frozen=True)
+class RefreshOptions:
+    """One provider's nudge settings, as they read at the moment of a poll."""
+
+    renew_token: bool = True
+    wake_session: bool = True
+    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
+    model: str = ""
+    effort: str = ""
+
+    def allows(self, reason: NudgeReason) -> bool:
+        """Return whether the user lets the CLI run for this reason."""
+        if reason == "token_expired":
+            return self.renew_token
+        return self.wake_session
+
+
+def nudge_reason(data: ProviderUsageData) -> NudgeReason | None:
+    """Return what a CLI run could fix in this fetch, or None if nothing.
 
     Two situations qualify: an expired token, which only the provider's own CLI
     can renew, and a completely untouched five-hour window — whether or not it
@@ -47,36 +84,88 @@ def needs_session_nudge(data: ProviderUsageData) -> bool:
     the state one message actually repairs — waiting for a manual `codex exec`.
     """
     if data.fetch_error is not None:
-        return data.fetch_error in _NUDGEABLE_FETCH_ERRORS
-    if data.five_hour is None:
-        return False
-    return data.five_hour.utilization <= 0.0
+        return "token_expired" if data.fetch_error == "token_expired" else None
+    if data.five_hour is None or data.five_hour.utilization > 0.0:
+        return None
+    return "idle_window"
+
+
+def last_output_line(text: str) -> str:
+    """Return the last line of output that is not blank."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def parsed_object(text: str) -> dict | None:
+    """Parse text as one JSON object, or return None if it is not one."""
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def token_count(usage: dict, key: str) -> int | None:
+    """Read one token count, ignoring anything that is not a whole number."""
+    value = usage.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _quiet_folder() -> str | None:
+    """Return an empty folder for the CLI to start in, or None to inherit ours."""
+    folder = Path(tempfile.gettempdir()) / _QUIET_FOLDER_NAME
+    try:
+        folder.mkdir(exist_ok=True)
+    except OSError as exc:
+        log.warning("unable to create %s (%s); the CLI starts in the app's folder", folder, exc)
+        return None
+    return str(folder)
 
 
 def _run_cli(
     *,
     executable_name: str,
     arguments: tuple[str, ...],
+    read_reply: Callable[[int, str, str], CliReply],
     which,
     run,
-) -> bool:
-    """Run one provider CLI prompt and report whether it answered.
+    clock: Callable[[], float] = time.monotonic,
+) -> CliReply:
+    """Run one provider CLI prompt, and report what it answered and how long it took.
 
     Never raises: this runs off the poll loop's thread, where an escaping error
     would be invisible in a windowed build.
     """
     executable = which(executable_name)
     if executable is None:
-        log.warning(
-            "%s CLI not found on PATH — skipping session refresh", executable_name
-        )
-        return False
+        return _failed(executable_name, f"The {executable_name} CLI was not found on PATH.")
 
+    started_at = clock()
+    reply = _run_and_read(executable_name, executable, arguments, read_reply, run)
+    reply = replace(reply, duration_seconds=clock() - started_at)
+    _log_reply(executable_name, reply)
+    return reply
+
+
+def _run_and_read(
+    executable_name: str,
+    executable: str,
+    arguments: tuple[str, ...],
+    read_reply: Callable[[int, str, str], CliReply],
+    run,
+) -> CliReply:
+    """Start the CLI, wait for it, and read what it printed."""
     try:
         completed = run(
             [executable, *arguments],
             capture_output=True,
             text=True,
+            # Both CLIs write UTF-8. Windows' default code page cannot decode
+            # every reply, and one character it cannot map would lose the rest.
+            encoding="utf-8",
+            errors="replace",
             # capture_output only redirects stdout and stderr, so stdin would
             # stay inherited — a console during `uv run dev`, an invalid handle
             # in the windowed build. The CLI folds piped stdin into its prompt,
@@ -86,61 +175,90 @@ def _run_cli(
             stdin=subprocess.DEVNULL,
             timeout=COMMAND_TIMEOUT_SECONDS,
             creationflags=_CREATE_NO_WINDOW,
+            cwd=_quiet_folder(),
         )
     except subprocess.TimeoutExpired:
-        log.warning(
-            "%s CLI did not answer within %ss", executable_name, COMMAND_TIMEOUT_SECONDS
+        return CliReply(
+            succeeded=False,
+            detail=f"The {executable_name} CLI did not answer within "
+            f"{COMMAND_TIMEOUT_SECONDS} seconds.",
         )
-        return False
     except OSError as exc:
-        log.warning("unable to launch %s CLI: %s", executable_name, exc)
-        return False
+        return CliReply(
+            succeeded=False, detail=f"The {executable_name} CLI could not start: {exc}"
+        )
     except Exception as exc:
-        log.warning("unexpected error running %s CLI: %r", executable_name, exc)
-        return False
+        return CliReply(succeeded=False, detail=f"The {executable_name} CLI failed: {exc!r}")
 
-    if completed.returncode != 0:
-        log.warning(
-            "%s CLI exited with %s: %s",
+    try:
+        return read_reply(completed.returncode, completed.stdout or "", completed.stderr or "")
+    except Exception as exc:
+        return CliReply(
+            succeeded=False,
+            detail=f"The {executable_name} CLI reply could not be read: {exc!r}",
+        )
+
+
+def _failed(executable_name: str, detail: str) -> CliReply:
+    """Log and return a run that failed before the CLI could start."""
+    reply = CliReply(succeeded=False, detail=detail)
+    _log_reply(executable_name, reply)
+    return reply
+
+
+def _log_reply(executable_name: str, reply: CliReply) -> None:
+    """Write one line saying what a CLI run did."""
+    if reply.succeeded:
+        log.info(
+            "%s CLI answered — token and session refreshed (%s tokens in, %s out)",
             executable_name,
-            completed.returncode,
-            (completed.stderr or "").strip(),
+            reply.input_tokens,
+            reply.output_tokens,
         )
-        return False
-
-    if not (completed.stdout or "").strip():
-        log.warning(
-            "%s CLI returned no output — session may not have started", executable_name
-        )
-        return False
-
-    log.info("%s CLI answered — token and session refreshed", executable_name)
-    return True
+    else:
+        log.warning("%s CLI refresh failed: %s", executable_name, reply.detail)
 
 
 def run_provider_cli(
     provider: Provider,
-    which: Callable[[str], str | None] = shutil.which,
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> bool:
-    """Ask one provider's CLI for a throwaway reply, and say whether it answered.
+    model: str = "",
+    effort: str = "",
+    which: Callable[[str], str | None] | None = None,
+    run: Callable[..., subprocess.CompletedProcess] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> CliReply:
+    """Ask one provider's CLI for a throwaway reply, and say what it answered.
 
-    Which executable and which arguments are the provider's own, so there is
-    no per-provider wrapper here: a third provider adds nothing to this file.
+    Which executable, which arguments, and how to read the answer are the
+    provider's own, so there is no per-provider wrapper here: a third provider
+    adds nothing to this file. The lookup and the runner are resolved at call
+    time so a test can stand in for either.
     """
     return _run_cli(
         executable_name=provider.cli_executable,
-        arguments=provider.cli_arguments,
-        which=which,
-        run=run,
+        arguments=provider.cli_arguments(model, effort),
+        read_reply=provider.read_cli_reply,
+        which=which or shutil.which,
+        run=run or subprocess.run,
+        clock=clock,
     )
+
+
+def command_line(provider: Provider, model: str, effort: str) -> str:
+    """Write the nudge as one line a user can paste into a terminal.
+
+    It names the executable rather than the full path the app resolves, so the
+    line reads the way the user would type it. Every argument is written so
+    that cmd, PowerShell, and bash all pass it on unchanged.
+    """
+    return subprocess.list2cmdline([provider.cli_executable, *provider.cli_arguments(model, effort)])
 
 
 def _start_daemon_thread(work: Callable[[], None]) -> None:
     """Run the CLI off the poll loop so the countdown keeps ticking meanwhile.
-    
-    We are running in a separate thread because, 
-    even if it fails, nothing will happen to our main code
+
+    A separate thread also means a CLI that fails or hangs cannot stop the
+    poll loop.
     """
     threading.Thread(target=work, name="cli-session-nudge", daemon=True).start()
 
@@ -156,20 +274,18 @@ class SessionNudger:
         self,
         provider: Provider,
         *,
-        enabled: bool = True,
-        cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
-        invoke: Callable[[], bool] | None = None,
-        needs_nudge: Callable[[ProviderUsageData], bool] = needs_session_nudge,
+        options: Callable[[], RefreshOptions] = RefreshOptions,
+        invoke: Callable[[RefreshOptions], CliReply] | None = None,
         on_refreshed: Callable[[], None] = lambda: None,
         clock: Callable[[], float] = time.monotonic,
         start_background: Callable[[Callable[[], None]], None] = _start_daemon_thread,
         max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
     ) -> None:
         self.provider = provider
-        self._enabled = enabled
-        self._cooldown_seconds = cooldown_seconds
-        self._invoke = invoke or (lambda: run_provider_cli(provider))
-        self._needs_nudge = needs_nudge
+        self._options = options
+        self._invoke = invoke or (
+            lambda chosen: run_provider_cli(provider, chosen.model, chosen.effort)
+        )
         self._on_refreshed = on_refreshed
         self._clock = clock
         self._start_background = start_background
@@ -177,11 +293,6 @@ class SessionNudger:
         self._last_attempt_at: float | None = None
         self._running = False
         self._consecutive_failures = 0
-
-    @property
-    def enabled(self) -> bool:
-        """Return whether nudging is currently switched on."""
-        return self._enabled
 
     @property
     def exhausted(self) -> bool:
@@ -192,63 +303,44 @@ class SessionNudger:
         """
         return self._consecutive_failures >= self._max_consecutive_failures
 
-    def set_enabled(self, enabled: bool) -> None:
-        """Switch nudging on or off while the poll loop is running.
-
-        The cooldown is deliberately left untouched, so flipping the tray toggle
-        cannot be used to bypass it.
-        """
-        self._enabled = enabled
-
-    def set_cooldown_seconds(self, seconds: float) -> None:
-        """Change the shortest gap between nudges while the poll loop is running.
-
-        The last attempt is deliberately kept, so shortening the cooldown lets
-        the pending wait end early rather than starting it over.
-        """
-        self._cooldown_seconds = seconds
-
     # ENTRY POINT
     def maybe_nudge(self, data: ProviderUsageData) -> bool:
         """Start a background CLI refresh if this fetch warrants one, else do nothing.
 
         NUDGING RULES:
-        1. Nudge only when the setting is enabled
-        2. Nudge when session expired / 5 hour limit has not started.
-        3. Nudge every 15 mins - in a separate not blocking thread
-        4. Give up after 3 consecutive failures — dead credentials report
+        1. Nudge only for a reason the user has switched on: an expired token,
+           or a 5-hour window that has not started.
+        2. Nudge at most once per the provider's own cooldown, in a separate
+           non-blocking thread.
+        3. Give up after 3 consecutive failures — dead credentials report
            `token_expired` forever and no prompt can fix them, so retrying is
            just a doomed subprocess every cooldown until the app restarts.
         """
-        if self._nothing_left_to_fix(data):
+        reason = nudge_reason(data)
+        if data.fetch_error is None and reason is None:
             # Whatever was broken has resolved, so past failures are stale.
+            # Re-arming on any successful fetch would be wrong: a missing CLI
+            # fails while fetches keep succeeding, and that would loop forever.
             self._consecutive_failures = 0
 
-        if not self._enabled or self._running or not self._needs_nudge(data):
+        if reason is None or self._running:
             return False
-        if self.exhausted or self._within_cooldown():
+        options = self._options()
+        if not options.allows(reason):
+            return False
+        if self.exhausted or self._within_cooldown(options.cooldown_seconds):
             return False
 
         self._last_attempt_at = self._clock()
         self._running = True
-        self._start_background(self._nudge)
+        self._start_background(lambda: self._nudge(options))
         return True
 
-    def _nothing_left_to_fix(self, data: ProviderUsageData) -> bool:
-        """Return whether a healthy fetch shows there is nothing to nudge about.
-
-        This is what re-arms the breaker. Re-arming on any successful fetch would
-        be wrong: a missing CLI fails while fetches keep succeeding, and that
-        would loop forever. Requiring live usage means the underlying problem is
-        genuinely gone.
-        """
-        return data.fetch_error is None and not self._needs_nudge(data)
-
-    def _within_cooldown(self) -> bool:
+    def _within_cooldown(self, cooldown_seconds: float) -> bool:
         """Return whether the previous attempt is still too recent to repeat."""
         if self._last_attempt_at is None:
             return False
-        return self._clock() - self._last_attempt_at < self._cooldown_seconds
+        return self._clock() - self._last_attempt_at < cooldown_seconds
 
     def _record_failure(self) -> None:
         """Count one failed attempt and say so when it trips the breaker."""
@@ -260,10 +352,10 @@ class SessionNudger:
                 self._consecutive_failures,
             )
 
-    def _nudge(self) -> None:
+    def _nudge(self, options: RefreshOptions) -> None:
         """Run one CLI refresh and announce it, always reopening the gate after."""
         try:
-            if self._invoke():
+            if self._invoke(options).succeeded:
                 self._consecutive_failures = 0
                 self._on_refreshed()
             else:
@@ -273,3 +365,86 @@ class SessionNudger:
             self._record_failure()
         finally:
             self._running = False
+
+
+# What the Run now button has done most recently.
+ManualRunPhase = Literal["idle", "copied", "running", "finished"]
+
+
+@dataclass(frozen=True)
+class ManualRunState:
+    """What the last manual action on a provider's command was, for display.
+
+    ``command`` is the line that was copied or run. ``reply`` is set only once
+    a run has finished.
+    """
+
+    phase: ManualRunPhase
+    command: str = ""
+    reply: CliReply | None = None
+
+
+class ManualRun:
+    """Runs a provider's nudge on request, one run at a time, and remembers the last one.
+
+    This is the settings window's Run now button. It ignores the cooldown and
+    the switches, because the user asked for it, but a success still asks the
+    poll loop for fresh numbers, as an automatic nudge does.
+    """
+
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        invoke: Callable[[str, str], CliReply] | None = None,
+        on_refreshed: Callable[[], None] = lambda: None,
+        start_background: Callable[[Callable[[], None]], None] = _start_daemon_thread,
+    ) -> None:
+        self.provider = provider
+        self._invoke = invoke or (
+            lambda model, effort: run_provider_cli(provider, model, effort)
+        )
+        self._on_refreshed = on_refreshed
+        self._start_background = start_background
+        self._lock = threading.Lock()
+        self._state = ManualRunState(phase="idle")
+
+    @property
+    def state(self) -> ManualRunState:
+        """Return what the last copy or run did."""
+        return self._state
+
+    def note_copied(self, command: str) -> None:
+        """Remember that the command was copied, unless a run is still going."""
+        with self._lock:
+            if self._state.phase != "running":
+                self._state = ManualRunState(phase="copied", command=command)
+
+    def start(self, model: str, effort: str, finished: Callable[[], None]) -> bool:
+        """Start one run in the background; False if one is already running.
+
+        ``finished`` is called on the background thread once the run is over.
+        """
+        model = model.strip()
+        with self._lock:
+            if self._state.phase == "running":
+                return False
+            command = command_line(self.provider, model, effort)
+            self._state = ManualRunState(phase="running", command=command)
+        self._start_background(lambda: self._run(model, effort, command, finished))
+        return True
+
+    def _run(
+        self, model: str, effort: str, command: str, finished: Callable[[], None]
+    ) -> None:
+        """Run the CLI, keep its reply, and tell the caller; never raise."""
+        try:
+            reply = self._invoke(model, effort)
+        except Exception as exc:
+            log.exception("manual %s run failed", self.provider.cli_executable)
+            reply = CliReply(succeeded=False, detail=f"The run failed: {exc!r}")
+        with self._lock:
+            self._state = ManualRunState(phase="finished", command=command, reply=reply)
+        if reply.succeeded:
+            self._on_refreshed()
+        finished()

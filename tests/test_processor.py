@@ -6,10 +6,12 @@ from typing import get_args
 
 import pytest
 
+from claudemonitor.cli_refresher import ManualRunState
 from claudemonitor.config import Config, ThresholdsConfig
 from claudemonitor.models import (
     CLAUDE,
     CODEX,
+    CliReply,
     DisplayState,
     FetchError,
     LabelSegment,
@@ -17,13 +19,14 @@ from claudemonitor.models import (
     ProviderUsageData,
     UsageWindow,
 )
+from claudemonitor.processor import manual_run_text
 from claudemonitor.processor import (
     _ERROR_DISPLAY,
     _WORDING,
     _display_for,
-    LOADING_MENU_STATUS,
     LOADING_TASKBAR_TEXT,
-    LOADING_TOOLTIP,
+    NO_PROVIDER_MENU_STATUS,
+    NO_PROVIDER_TOOLTIP,
     loading_label,
     taskbar_label,
     tray_status,
@@ -963,14 +966,13 @@ class TestTaskbarLabelCombining:
         assert label.segments == [LabelSegment(provider=CLAUDE, text="87%")]
         assert label.tooltip == "Claude usage"
 
-    def test_no_providers_falls_back_to_the_loading_label(self):
-        # An empty label would collapse the native window to nothing; showing
-        # the loading text keeps it measurable until a provider reports in.
+    def test_no_providers_means_an_empty_label(self):
+        # Every provider is switched off. The companion hides an empty label
+        # rather than drawing a placeholder nobody is waiting for.
         label = taskbar_label([])
 
-        assert label.segments == [
-            LabelSegment(provider=CLAUDE, text=LOADING_TASKBAR_TEXT)
-        ]
+        assert label.segments == []
+        assert label.tooltip == NO_PROVIDER_TOOLTIP
 
 
 class TestLoadingLabel:
@@ -1096,15 +1098,18 @@ class TestTrayStatusMenu:
         assert status.status_lines == ["Codex — Updated 1s ago"]
 
 
-class TestTrayStatusBeforeTheFirstFetch:
-    """Nothing to show yet must still produce a usable icon and menu."""
+class TestTrayStatusWithNoProvider:
+    """Every provider switched off still leaves an icon to reach Settings from."""
 
-    def test_no_providers_shows_the_loading_placeholder(self):
+    def test_no_providers_says_so_on_a_grey_icon(self):
         status = tray_status([])
 
         assert status.icon_color == "grey"
-        assert status.tooltip == LOADING_TOOLTIP
-        assert status.status_lines == [LOADING_MENU_STATUS]
+        assert status.tooltip == NO_PROVIDER_TOOLTIP
+        assert status.status_lines == [NO_PROVIDER_MENU_STATUS]
+
+    def test_the_tooltip_says_where_to_turn_one_on(self):
+        assert "Settings" in NO_PROVIDER_TOOLTIP
 
 
 class TestTrayText:
@@ -1185,3 +1190,96 @@ class TestTrayText:
         )
 
         assert state.tray_text == "80% (3h 0m) · week 64%"
+
+
+_COMMAND = 'claude -p --system-prompt "Reply briefly." hi'
+
+
+def _finished(**reply_fields) -> ManualRunState:
+    """A finished run of _COMMAND that answered with the given fields."""
+    fields = {"succeeded": True, "duration_seconds": 6.28}
+    fields.update(reply_fields)
+    return ManualRunState(phase="finished", command=_COMMAND, reply=CliReply(**fields))
+
+
+class TestTheManualRunText:
+    """What the box under Run now says, for every state a run can be in."""
+
+    def test_before_anything_has_run_there_is_nothing_to_show(self):
+        # An empty text is what hides the Last run box.
+        assert manual_run_text(CLAUDE, ManualRunState(phase="idle")) == ""
+
+    def test_a_copied_command_is_shown(self):
+        text = manual_run_text(CLAUDE, ManualRunState(phase="copied", command=_COMMAND))
+
+        assert text == f"Command copied to the clipboard:\n{_COMMAND}"
+
+    def test_a_run_in_progress_shows_its_command(self):
+        text = manual_run_text(CLAUDE, ManualRunState(phase="running", command=_COMMAND))
+
+        assert text == f"Running…\n{_COMMAND}"
+
+    def test_a_success_shows_the_reply_the_tokens_the_cost_and_the_command(self):
+        state = _finished(
+            reply_text="NONE", input_tokens=1883, output_tokens=5, cost_usd=0.005188
+        )
+
+        assert manual_run_text(CLAUDE, state).split("\n") == [
+            "Succeeded in 6.3 s.",
+            "Reply: NONE",
+            "Tokens: 1,883 in, 5 out",
+            "Cost: $0.0052",
+            "",
+            "Command:",
+            _COMMAND,
+        ]
+
+    def test_a_cost_the_cli_did_not_report_names_the_cli(self):
+        state = _finished(reply_text="Hi", input_tokens=1883, output_tokens=5)
+
+        assert "Cost: not reported by the Codex CLI" in manual_run_text(CODEX, state)
+
+    def test_tokens_the_cli_did_not_report_say_so(self):
+        state = _finished(reply_text="Hi")
+
+        assert "Tokens: not reported" in manual_run_text(CLAUDE, state)
+
+    def test_one_missing_count_is_named_unknown(self):
+        state = _finished(reply_text="Hi", input_tokens=600)
+
+        assert "Tokens: 600 in, unknown out" in manual_run_text(CLAUDE, state)
+
+    def test_an_empty_reply_says_so(self):
+        assert "Reply: (empty)" in manual_run_text(CLAUDE, _finished())
+
+    def test_a_reply_on_several_lines_is_kept_on_one(self):
+        state = _finished(reply_text="Hi.\nHow can I help?")
+
+        assert "Reply: Hi. How can I help?" in manual_run_text(CLAUDE, state)
+
+    def test_a_failure_shows_why_and_the_command(self):
+        state = _finished(succeeded=False, detail="Not logged in", duration_seconds=3.05)
+
+        assert manual_run_text(CLAUDE, state).split("\n") == [
+            "Failed after 3.0 s.",
+            "Not logged in",
+            "",
+            "Command:",
+            _COMMAND,
+        ]
+
+    def test_a_failure_before_the_cli_started_has_no_duration(self):
+        state = _finished(
+            succeeded=False,
+            detail="The claude CLI was not found on PATH.",
+            duration_seconds=None,
+        )
+
+        assert manual_run_text(CLAUDE, state).startswith(
+            "Failed.\nThe claude CLI was not found on PATH."
+        )
+
+    def test_a_success_without_a_duration_leaves_it_out(self):
+        state = _finished(reply_text="Hi", duration_seconds=None)
+
+        assert manual_run_text(CLAUDE, state).startswith("Succeeded.\n")

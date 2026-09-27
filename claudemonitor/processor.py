@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+from .cli_refresher import ManualRunState
 from .config import Config
 from .models import (
-    CLAUDE,
+    CliReply,
     DisplayState,
     FetchError,
     LabelSegment,
@@ -24,7 +25,8 @@ from .models import (
 # spell out "Claude" — see win32_taskbar_window._draw_icon.
 LOADING_TASKBAR_TEXT = "loading..."
 LOADING_TOOLTIP = "Claude Monitor — loading…"
-LOADING_MENU_STATUS = "Loading…"
+NO_PROVIDER_TOOLTIP = "Claude Monitor — no provider tracked. Turn one on in Settings."
+NO_PROVIDER_MENU_STATUS = "No provider tracked"
 
 # Ascending order of how much the user needs to look at the tray icon. One icon
 # now serves every provider, so the most severe colour is the one it takes:
@@ -420,11 +422,8 @@ def taskbar_label(states: list[DisplayState]) -> TaskbarLabel:
     The tooltip stacks the full per-provider detail, separated by a blank line.
     """
     if not states:
-        # An empty label has no width, which would collapse the native window.
-        return TaskbarLabel(
-            segments=[LabelSegment(provider=CLAUDE, text=LOADING_TASKBAR_TEXT)],
-            tooltip=LOADING_TOOLTIP,
-        )
+        # Every provider is switched off. The companion hides an empty label.
+        return TaskbarLabel(segments=[], tooltip=NO_PROVIDER_TOOLTIP)
     return TaskbarLabel(
         segments=[
             LabelSegment(provider=state.provider, text=state.taskbar_text)
@@ -442,10 +441,11 @@ def tray_status(states: list[DisplayState]) -> TrayState:
     no name beside it belongs to nobody.
     """
     if not states:
+        # The icon stays, because Settings is where a provider is turned on.
         return TrayState(
             icon_color="grey",
-            tooltip=LOADING_TOOLTIP,
-            status_lines=[LOADING_MENU_STATUS],
+            tooltip=NO_PROVIDER_TOOLTIP,
+            status_lines=[NO_PROVIDER_MENU_STATUS],
         )
     return TrayState(
         icon_color=max(states, key=_color_severity).icon_color,
@@ -474,3 +474,63 @@ def loading_label(providers: list[Provider]) -> TaskbarLabel:
         ],
         tooltip=LOADING_TOOLTIP,
     )
+
+
+# ------------------------------------------------------------- manual CLI run
+# What the box under the settings window's Run now button says. It is written
+# here with every other sentence the user reads.
+
+
+def manual_run_text(provider: Provider, state: ManualRunState) -> str:
+    """Describe the last copy or run of one provider's command, one fact a line."""
+    if state.phase == "copied":
+        return f"Command copied to the clipboard:\n{state.command}"
+    if state.phase == "running":
+        return f"Running…\n{state.command}"
+    if state.phase == "finished" and state.reply is not None:
+        return "\n".join([*_run_result_lines(provider, state.reply), "", "Command:", state.command])
+    # Nothing to say yet: an empty text is what hides the Last run box.
+    return ""
+
+
+def _run_result_lines(provider: Provider, reply: CliReply) -> list[str]:
+    """Say how a finished run went: its reply, tokens, and cost, or why it failed."""
+    if not reply.succeeded:
+        return [_outcome("Failed after", reply.duration_seconds), reply.detail]
+    return [
+        _outcome("Succeeded in", reply.duration_seconds),
+        f"Reply: {_one_line(reply.reply_text) or '(empty)'}",
+        f"Tokens: {_token_text(reply.input_tokens, reply.output_tokens)}",
+        f"Cost: {_cost_text(provider, reply.cost_usd)}",
+    ]
+
+
+def _outcome(words: str, seconds: float | None) -> str:
+    """Write "Succeeded in 6.3 s.", or only "Succeeded." when the time is unknown."""
+    if seconds is None:
+        return f"{words.split()[0]}."
+    return f"{words} {seconds:.1f} s."
+
+
+def _one_line(text: str) -> str:
+    """Join a reply that spans several lines into one."""
+    return " ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _token_text(input_tokens: int | None, output_tokens: int | None) -> str:
+    """Write the two token counts, naming whichever the CLI did not report."""
+    if input_tokens is None and output_tokens is None:
+        return "not reported"
+    return f"{_count(input_tokens)} in, {_count(output_tokens)} out"
+
+
+def _count(tokens: int | None) -> str:
+    """Write one token count with thousands separators."""
+    return "unknown" if tokens is None else f"{tokens:,}"
+
+
+def _cost_text(provider: Provider, cost_usd: float | None) -> str:
+    """Write the cost the CLI reported. Codex never reports one."""
+    if cost_usd is None:
+        return f"not reported by the {provider.label} CLI"
+    return f"${cost_usd:.4f}"

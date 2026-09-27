@@ -55,6 +55,7 @@ WS_CAPTION = 0x00C00000
 WS_SYSMENU = 0x00080000
 WS_VISIBLE = 0x10000000
 WS_TABSTOP = 0x00010000
+WS_VSCROLL = 0x00200000
 WS_GROUP = 0x00020000
 WS_EX_DLGMODALFRAME = 0x00000001
 CW_USEDEFAULT = -2147483648  # 0x80000000 as a signed int: "you choose".
@@ -82,12 +83,35 @@ BN_CLICKED = 0  # The WM_COMMAND notification a button press arrives as.
 STATIC_CLASS = "STATIC"
 SS_LEFT = 0x00000000
 
-# The edit class holds a number; ES_NUMBER keeps letters out of it entirely.
+# The edit class holds a number or a model name; ES_NUMBER keeps letters out
+# of a number box entirely.
 EDIT_CLASS = "EDIT"
 ES_LEFT = 0x00000000
 ES_NUMBER = 0x00002000
 ES_AUTOHSCROLL = 0x00000080
+# A read-only box of several lines shows the last manual CLI run.
+ES_MULTILINE = 0x00000004
+ES_AUTOVSCROLL = 0x00000040
+ES_READONLY = 0x00000800
 EN_CHANGE = 0x0300  # The notification sent after the text has changed.
+EM_SETCUEBANNER = 0x1501  # Grey text an empty box shows, saying what empty means.
+
+# The combo box holds an effort level. A drop-down list cannot be typed into.
+COMBOBOX_CLASS = "COMBOBOX"
+CBS_DROPDOWNLIST = 0x0003
+CB_ADDSTRING = 0x0143
+CB_GETCURSEL = 0x0147
+CB_SETCURSEL = 0x014E
+CBN_SELCHANGE = 1  # The notification sent after the user picks an entry.
+
+# The list box down the left of the Providers tab, one entry per provider.
+LISTBOX_CLASS = "LISTBOX"
+LBS_NOTIFY = 0x0001  # Tell the parent when the selection changes.
+LBS_NOINTEGRALHEIGHT = 0x0100  # Keep the height it is given, not a whole number of rows.
+LB_ADDSTRING = 0x0180
+LB_SETCURSEL = 0x0186
+LB_GETCURSEL = 0x0188
+LBN_SELCHANGE = 1  # The notification sent after the user picks an entry.
 
 # The tab strip across the top of the settings dialog.
 TAB_CONTROL_CLASS = "SysTabControl32"
@@ -128,6 +152,7 @@ WM_NOTIFY = 0x004E  # How a common control, such as the tab strip, reports.
 WM_CTLCOLOREDIT = 0x0133
 WM_CTLCOLORSTATIC = 0x0138
 WM_CTLCOLORBTN = 0x0135
+WM_CTLCOLORLISTBOX = 0x0134  # The open list of a combo box.
 
 # Screen metrics used to centre the window on the primary display.
 SM_CXSCREEN = 0
@@ -137,6 +162,8 @@ SM_CYSCREEN = 1
 # controls take their dark glyphs from the same visual style File Explorer uses.
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 DARK_MODE_CONTROL_THEME = "DarkMode_Explorer"
+# A combo box ignores the Explorer style; this one gives it a dark closed box.
+DARK_MODE_COMBOBOX_THEME = "DarkMode_CFD"
 DARK_THEME_BACKGROUND = 0x00202020  # Near-black COLORREF in BGR byte order.
 LIGHT_THEME_BACKGROUND = 0x00F0F0F0  # The standard dialog grey.
 # A tab page is lighter than the dialog around it, and a text box lighter
@@ -173,6 +200,12 @@ TTS_NOPREFIX = 0x0002
 TTF_IDISHWND = 0x0001
 TTF_TRACK = 0x0020
 WM_USER = 0x0400
+# The first message number an application may give a meaning of its own.
+WM_APP = 0x8000
+
+# The clipboard format for UTF-16 text, and the memory Windows can take it in.
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
 TTM_SETMAXTIPWIDTH = WM_USER + 24
 TTM_SETTIPBKCOLOR = WM_USER + 19
 TTM_SETTIPTEXTCOLOR = WM_USER + 20
@@ -197,6 +230,9 @@ DEFAULT_GUI_FONT = 17  # Windows stock font identifier for standard UI text.
 # a per-pixel alpha window does not have. Grey anti-aliasing composites onto any
 # background correctly, so the label asks for it in place of the default.
 ANTIALIASED_QUALITY = 4
+# Asks for a fixed-width face: the Last run box shows a command line.
+FIXED_PITCH = 1
+FF_MODERN = 0x30
 
 # Taskbar text must contrast with the theme the user actually runs; near-white
 # glyphs are invisible on a Windows 11 light-mode taskbar.
@@ -533,6 +569,10 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
         wintypes.BOOL,
     ),
     "PostQuitMessage": ((ctypes.c_int,), None),
+    "OpenClipboard": ((wintypes.HWND,), wintypes.BOOL),
+    "EmptyClipboard": ((), wintypes.BOOL),
+    "SetClipboardData": ((wintypes.UINT, wintypes.HANDLE), wintypes.HANDLE),
+    "CloseClipboard": ((), wintypes.BOOL),
     "SetParent": ((wintypes.HWND, wintypes.HWND), wintypes.HWND),
     "GetWindow": ((wintypes.HWND, wintypes.UINT), wintypes.HWND),
     "IsWindowVisible": ((wintypes.HWND,), wintypes.BOOL),
@@ -707,6 +747,10 @@ UXTHEME_SIGNATURES: dict[str, tuple[tuple, object]] = {
 
 KERNEL32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     "GetModuleHandleW": ((wintypes.LPCWSTR,), wintypes.HMODULE),
+    "GlobalAlloc": ((wintypes.UINT, ctypes.c_size_t), wintypes.HGLOBAL),
+    "GlobalLock": ((wintypes.HGLOBAL,), wintypes.LPVOID),
+    "GlobalUnlock": ((wintypes.HGLOBAL,), wintypes.BOOL),
+    "GlobalFree": ((wintypes.HGLOBAL,), wintypes.HGLOBAL),
 }
 
 DWMAPI_SIGNATURES: dict[str, tuple[tuple, object]] = {

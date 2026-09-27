@@ -16,11 +16,16 @@ from pathlib import Path
 from claudemonitor.models import CLAUDE, CODEX
 from claudemonitor.settings import (
     ProviderFields,
+    SettingChoice,
+    SettingCommand,
     SettingLink,
     SettingNumber,
+    SettingOutput,
+    SettingText,
     SettingToggle,
     SettingsGroup,
     SettingsModel,
+    SettingsSection,
     SettingsTab,
     build_settings,
 )
@@ -34,16 +39,34 @@ from claudemonitor.win32_bindings import (
     BS_AUTOCHECKBOX,
     BS_GROUPBOX,
     BUTTON_CLASS,
+    CBN_SELCHANGE,
+    CBS_DROPDOWNLIST,
+    CB_ADDSTRING,
+    CB_GETCURSEL,
+    CB_SETCURSEL,
+    COMBOBOX_CLASS,
+    DARK_MODE_COMBOBOX_THEME,
     DARK_THEME_PAGE_BACKGROUND,
     EDIT_CLASS,
     EN_CHANGE,
+    ES_MULTILINE,
+    ES_NUMBER,
+    ES_READONLY,
+    EM_SETCUEBANNER,
     HWND_BOTTOM,
     IDCANCEL,
     IDOK,
     LIGHT_THEME_BACKGROUND,
     LIGHT_THEME_PAGE_BACKGROUND,
     LIGHT_THEME_FIELD_BACKGROUND,
+    LBN_SELCHANGE,
+    LBS_NOTIFY,
+    LB_ADDSTRING,
+    LB_GETCURSEL,
+    LB_SETCURSEL,
+    LISTBOX_CLASS,
     NMHDR,
+    SETTINGS_CLASS_NAME,
     STATIC_CLASS,
     SW_HIDE,
     SW_SHOW,
@@ -54,15 +77,21 @@ from claudemonitor.win32_bindings import (
     WM_CLOSE,
     WM_COMMAND,
     WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX,
     WM_CTLCOLORSTATIC,
     WM_ERASEBKGND,
     WM_NOTIFY,
     WM_SETFONT,
+    WS_VSCROLL,
 )
 from claudemonitor.win32_settings_window import (
     _APPLY_ID,
+    _FIRST_ADD_ID,
     _FIRST_EDITOR_ID,
     _FIRST_FIELD_ID,
+    _FIRST_LIST_ID,
+    _WM_OUTPUT_CHANGED,
+    _active_windows,
     Win32SettingsWindow,
 )
 
@@ -103,20 +132,54 @@ def _number(value: int = 60, minimum: int = 10, maximum: int = 600):
     return number, state
 
 
+def _text(value: str = "haiku"):
+    """Build a text setting over a mutable value, plus the value to assert on."""
+    state = {"value": value}
+    text = SettingText(
+        value=lambda: state["value"], write=lambda new: state.update(value=new)
+    )
+    return text, state
+
+
+_EFFORTS = (("", "Default"), ("low", "low"), ("high", "high"))
+
+
+def _choice(value: str = ""):
+    """Build a drop-down setting over a mutable value, plus the value itself."""
+    state = {"value": value}
+    choice = SettingChoice(
+        value=lambda: state["value"],
+        write=lambda new: state.update(value=new),
+        choices=_EFFORTS,
+    )
+    return choice, state
+
+
+def _provider_fields(provider) -> ProviderFields:
+    """One provider's tab, over harmless values."""
+    return ProviderFields(
+        provider=provider,
+        tracking=_switch()[0],
+        renew_token=_switch()[0],
+        wake_session=_switch()[0],
+        cooldown=_number(900, 60, 86400)[0],
+        model=_text()[0],
+        effort=_choice()[0],
+        copy_command=SettingCommand(act=lambda model, effort, changed: None),
+        run_command=SettingCommand(act=lambda model, effort, changed: None),
+        last_run=SettingOutput(text=lambda: ""),  # Nothing has run yet.
+    )
+
+
 def _production_model(**overrides) -> SettingsModel:
-    """Build the real three-tab model, so the tests bind to what ships."""
+    """Build the real model, so the tests bind to what ships."""
     fields = {
         "taskbar": _switch()[0],
-        "providers": [
-            ProviderFields(provider=CLAUDE),
-            ProviderFields(provider=CODEX, tracking=_switch()[0]),
-        ],
-        "session_refresh": _switch()[0],
+        "providers": [_provider_fields(CLAUDE), _provider_fields(CODEX)],
         "startup": _switch()[0],
         "poll_interval": _number()[0],
         "amber_threshold": _number(50, 1, 99)[0],
         "red_threshold": _number(20, 1, 99)[0],
-        "refresh_cooldown": _number(900, 60, 86400)[0],
         "log_dir": Path("."),
         "open_url": lambda url: None,
         "open_folder": lambda path: None,
@@ -191,12 +254,14 @@ class _FakeUser32(_FakeDll):
         self.enabled: dict[int, bool] = {}
         self.shown: dict[int, int] = {}
         self.classes: dict[int, str] = {}
+        self.parents: dict[int, int | None] = {}
 
     def CreateWindowExW(self, style, class_name, text, *rest):
         self.calls.append(("CreateWindowExW", style, class_name, text, *rest))
         self._next_handle += 1
         self.text[self._next_handle] = text or ""
         self.classes[self._next_handle] = class_name
+        self.parents[self._next_handle] = rest[5]
         return self._next_handle
 
     def SendMessageW(self, handle, message, wparam, lparam):
@@ -340,7 +405,10 @@ class TestWhatTheWindowCreates:
         window._create()
 
         model = window._model
-        expected = sum(len(tab.groups) for tab in model.tabs)
+        expected = sum(
+            len(tab.groups) + sum(len(section.groups) for section in tab.sections)
+            for tab in model.tabs
+        )
         assert len(_created_with_style(window, BUTTON_CLASS, BS_GROUPBOX)) == expected
 
     def test_one_checkbox_is_created_per_switch(self):
@@ -348,14 +416,16 @@ class TestWhatTheWindowCreates:
         window._create()
 
         checkboxes = _created_with_style(window, BUTTON_CLASS, BS_AUTOCHECKBOX)
-        assert len(checkboxes) == 4
+        assert len(checkboxes) == 8
 
     def test_one_box_and_one_spinner_are_created_per_number(self):
         window = _window()
         window._create()
 
-        assert len(_created(window, EDIT_CLASS)) == 4
-        assert len(_created(window, UPDOWN_CLASS)) == 4
+        # Five numbers, each with arrows, and one model box and one read-only
+        # last-run box per provider.
+        assert len(_created(window, EDIT_CLASS)) == 9
+        assert len(_created(window, UPDOWN_CLASS)) == 5
 
     def test_a_number_box_opens_showing_the_stored_value(self):
         field, _state = _number_field(value=45)
@@ -381,7 +451,7 @@ class TestWhatTheWindowCreates:
             if call[2] in (BUTTON_CLASS, EDIT_CLASS, UPDOWN_CLASS, STATIC_CLASS)
         }
 
-        assert set(window._page_handles) <= parents
+        assert {window._page_handles[0], window._page_handles[2]} <= parents
 
     def test_the_dialog_buttons_belong_to_the_frame(self):
         window = _window()
@@ -514,6 +584,247 @@ class TestWhichPageIsShown:
         _switch_to_tab(window, 9)
 
         assert window._user32.shown == shown_before
+
+
+def _sectioned(*sections, add_section=None) -> SettingsModel:
+    """One tab whose groups are split into sections picked from a side list."""
+    return SettingsModel(
+        tabs=[SettingsTab(title="Providers", sections=list(sections), add_section=add_section)]
+    )
+
+
+def _section(title: str, *fields) -> SettingsSection:
+    """One side-list entry holding a single group of the given fields."""
+    return SettingsSection(
+        title=title, groups=[SettingsGroup(title="Tracking", fields=list(fields))]
+    )
+
+
+def _pick_section(window, index: int, notification: int = LBN_SELCHANGE) -> None:
+    """Pick one entry in the side list, the way Windows reports it to the page."""
+    window._user32.results["SendMessageW"] = (
+        lambda handle, message, wparam, lparam: index if message == LB_GETCURSEL else 1
+    )
+    window._window_proc(
+        window._page_handles[0], WM_COMMAND, (notification << 16) | _FIRST_LIST_ID, 0
+    )
+    del window._user32.results["SendMessageW"]
+
+
+class TestTheProviderList:
+    """The Providers tab: a list on the left, the picked provider on the right."""
+
+    def _window(self, *, add_section=None):
+        claude, claude_state = _toggle_field(key="claude_tracking", label="Track Claude")
+        codex, codex_state = _toggle_field(key="codex_tracking", label="Track Codex")
+        window = _window(
+            _sectioned(
+                _section("Claude", claude), _section("Codex", codex), add_section=add_section
+            )
+        )
+        window._create()
+        return window, claude_state, codex_state
+
+    def test_the_production_providers_page_gets_one_list(self):
+        window = _window()
+        window._create()
+
+        (listbox,) = _created(window, LISTBOX_CLASS)
+        assert listbox[9] == window._page_handles[1]
+
+    def test_the_list_tells_the_page_when_the_pick_changes(self):
+        window, _claude, _codex = self._window()
+
+        (listbox,) = _created(window, LISTBOX_CLASS)
+        assert listbox[4] & LBS_NOTIFY
+
+    def test_every_section_is_an_entry_in_the_list(self):
+        window, _claude, _codex = self._window()
+
+        added = [
+            call for call in window._user32.named("SendMessageW") if call[2] == LB_ADDSTRING
+        ]
+        assert len(added) == 2
+
+    def test_the_first_entry_starts_picked(self):
+        window, _claude, _codex = self._window()
+        (list_handle,) = window._user32.handles_of_class(LISTBOX_CLASS)
+
+        picked = [
+            call[3]
+            for call in window._user32.named("SendMessageW")
+            if call[1] == list_handle and call[2] == LB_SETCURSEL
+        ]
+        assert picked == [0]
+
+    def test_each_section_is_a_window_on_the_page(self):
+        # A section is a window for the same reason a page is: hidden loose
+        # controls leave the last section printed through the next one.
+        window, _claude, _codex = self._window()
+        sections = window._side_lists[0].sections
+
+        assert len(sections) == 2
+        assert all(window._user32.classes[handle] == SETTINGS_CLASS_NAME for handle in sections)
+        assert all(window._user32.parents[handle] == window._page_handles[0] for handle in sections)
+
+    def test_a_section_s_controls_belong_to_that_section(self):
+        window, _claude, _codex = self._window()
+        claude_section, codex_section = window._side_lists[0].sections
+        parent_of = {
+            call[3]: call[9] for call in window._user32.named("CreateWindowExW")
+        }
+
+        assert parent_of["Track Claude"] == claude_section
+        assert parent_of["Track Codex"] == codex_section
+
+    def test_only_the_first_section_is_visible_at_first(self):
+        window, _claude, _codex = self._window()
+        claude_section, codex_section = window._side_lists[0].sections
+
+        assert window._user32.shown[claude_section] == SW_SHOW
+        assert window._user32.shown[codex_section] == SW_HIDE
+
+    def test_picking_an_entry_shows_its_section_and_hides_the_other(self):
+        window, _claude, _codex = self._window()
+        claude_section, codex_section = window._side_lists[0].sections
+
+        _pick_section(window, 1)
+
+        assert window._user32.shown[codex_section] == SW_SHOW
+        assert window._user32.shown[claude_section] == SW_HIDE
+
+    def test_a_pick_the_list_does_not_have_is_ignored(self):
+        # LB_GETCURSEL answers -1 when nothing is picked.
+        window, _claude, _codex = self._window()
+        shown_before = dict(window._user32.shown)
+
+        _pick_section(window, -1)
+
+        assert window._user32.shown == shown_before
+
+    def test_other_notifications_from_the_list_change_nothing(self):
+        window, _claude, _codex = self._window()
+        shown_before = dict(window._user32.shown)
+
+        _pick_section(window, 1, notification=4)  # LBN_SETFOCUS
+
+        assert window._user32.shown == shown_before
+
+    def test_a_click_in_a_section_reaches_the_dialog(self):
+        window, _claude, codex_state = self._window()
+        _codex_section = window._side_lists[0].sections[1]
+        window._user32.checked[window._controls["codex_tracking"].label] = BST_UNCHECKED
+
+        window._window_proc(
+            _codex_section,
+            WM_COMMAND,
+            _FIRST_FIELD_ID + _field_index(window, "codex_tracking"),
+            0,
+        )
+        _command(window, IDOK)
+
+        assert codex_state["on"] is False
+
+    def test_a_section_paints_the_page_colour(self):
+        window, _claude, _codex = self._window()
+        section = window._side_lists[0].sections[0]
+
+        assert window._window_proc(section, WM_ERASEBKGND, 500, 0) == 1
+        assert ("FillRect", 500, ANY_RECT, window._page_brush) in _fills(window)
+
+    def test_the_list_is_given_the_text_field_colour(self):
+        window, _claude, _codex = self._window()
+
+        window._window_proc(window._page_handles[0], WM_CTLCOLORLISTBOX, 700, 0)
+
+        assert ("SetBkColor", 700, LIGHT_THEME_FIELD_BACKGROUND) in window._gdi32.calls
+
+    def test_a_hidden_section_s_edit_is_still_written_on_ok(self):
+        # Picking another provider hides a section; it must not drop its edits.
+        window, claude_state, _codex = self._window()
+        window._user32.checked[window._controls["claude_tracking"].label] = BST_UNCHECKED
+        _command(window, _FIRST_FIELD_ID + _field_index(window, "claude_tracking"))
+
+        _pick_section(window, 1)
+        _command(window, IDOK)
+
+        assert claude_state["on"] is False
+
+    def test_section_windows_are_forgotten_once_the_window_closes(self):
+        window, _claude, _codex = self._window()
+        sections = list(window._side_lists[0].sections)
+
+        window.show()
+
+        assert not any(handle in _active_windows for handle in sections)
+
+    def test_there_is_no_add_button_without_an_add_action(self):
+        window, _claude, _codex = self._window()
+
+        assert "Add provider…" not in [call[3] for call in _created(window, BUTTON_CLASS)]
+
+    def test_the_production_window_offers_no_add_button_yet(self):
+        window = _window()
+        window._create()
+
+        assert "Add provider…" not in [call[3] for call in _created(window, BUTTON_CLASS)]
+
+    def test_an_add_action_gets_a_button_on_the_page(self):
+        add = SettingLink(key="add_provider", label="Add provider…", open=lambda: None)
+        window, _claude, _codex = self._window(add_section=add)
+
+        (button,) = [call for call in _created(window, BUTTON_CLASS) if call[3] == "Add provider…"]
+        assert button[9] == window._page_handles[0]
+        assert button[10] == _FIRST_ADD_ID
+
+    def test_the_add_button_runs_its_action(self):
+        opened: list[str] = []
+        add = SettingLink(key="add_provider", label="Add provider…", open=lambda: opened.append("add"))
+        window, _claude, _codex = self._window(add_section=add)
+
+        window._window_proc(window._page_handles[0], WM_COMMAND, _FIRST_ADD_ID, 0)
+
+        assert opened == ["add"]
+
+    def test_an_add_action_that_fails_is_logged_not_raised(self, caplog):
+        def refuse():
+            raise OSError("no picker yet")
+
+        add = SettingLink(key="add_provider", label="Add provider…", open=refuse)
+        window, _claude, _codex = self._window(add_section=add)
+
+        with caplog.at_level(logging.ERROR):
+            window._window_proc(window._page_handles[0], WM_COMMAND, _FIRST_ADD_ID, 0)
+
+        assert "Add provider" in caplog.text
+
+
+class TestChangingAProviderEndToEnd:
+    """From a pick in the list to the setting written, through the real model."""
+
+    def test_a_codex_model_typed_in_its_section_is_written_on_ok(self):
+        codex_model, codex_state = _text("")
+        providers = [
+            _provider_fields(CLAUDE),
+            replace(_provider_fields(CODEX), model=codex_model),
+        ]
+        window = _window(_production_model(providers=providers))
+        window._create()
+
+        _switch_to_tab(window, 1)
+        window._user32.results["SendMessageW"] = (
+            lambda handle, message, wparam, lparam: 1 if message == LB_GETCURSEL else 1
+        )
+        window._window_proc(
+            window._page_handles[1], WM_COMMAND, (LBN_SELCHANGE << 16) | _FIRST_LIST_ID, 0
+        )
+        del window._user32.results["SendMessageW"]
+        window._user32.text[window._controls["codex_model"].editor] = "gpt-5-mini"
+        _command(window, _FIRST_EDITOR_ID + _field_index(window, "codex_model"), EN_CHANGE)
+        _command(window, IDOK)
+
+        assert codex_state["value"] == "gpt-5-mini"
+        assert window._user32.shown[window._side_lists[0].sections[1]] == SW_SHOW
 
 
 class TestNothingIsWrittenUntilApplied:
@@ -684,6 +995,188 @@ class TestTypingANumber:
         _command(window, _APPLY_ID)
 
         assert window._pending.is_dirty() is False
+
+
+def _field_index(window, key: str) -> int:
+    """Return the position a field was created under, which routes its commands."""
+    return [field.key for field in window._model.fields()].index(key)
+
+
+class TestTypingAModel:
+    """A model name is free text: whatever the provider's CLI will accept."""
+
+    def _window(self, value: str = "haiku"):
+        field, state = _text(value)
+        window = _window(_one_tab(replace(field, key="claude_model", label="Model")))
+        window._create()
+        return window, state
+
+    def _type(self, window, text: str) -> None:
+        window._user32.text[window._controls["claude_model"].editor] = text
+        _command(window, _FIRST_EDITOR_ID + _field_index(window, "claude_model"), EN_CHANGE)
+
+    def test_the_box_opens_showing_the_stored_model(self):
+        window, _state = self._window("haiku")
+
+        assert window._user32.text[window._controls["claude_model"].editor] == "haiku"
+
+    def test_the_box_accepts_letters_as_well_as_digits(self):
+        window, _state = self._window()
+
+        (editor,) = _created(window, EDIT_CLASS)
+        assert not editor[4] & ES_NUMBER
+
+    def test_a_placeholder_is_shown_in_an_empty_box(self):
+        field = SettingText(
+            key="codex_model",
+            label="Model",
+            value=lambda: "",
+            write=lambda _: None,
+            placeholder="Codex CLI default",
+        )
+        window = _window(_one_tab(field))
+        window._create()
+        editor = window._controls["codex_model"].editor
+
+        cues = [
+            call
+            for call in window._user32.named("SendMessageW")
+            if call[1] == editor and call[2] == EM_SETCUEBANNER
+        ]
+        assert len(cues) == 1
+        assert cues[0][3] == 1  # Shown even while the box has the focus.
+
+    def test_a_box_without_a_placeholder_sets_none(self):
+        window, _state = self._window()
+
+        assert not [
+            call for call in window._user32.named("SendMessageW") if call[2] == EM_SETCUEBANNER
+        ]
+
+    def test_a_typed_model_is_written_on_ok(self):
+        window, state = self._window("haiku")
+
+        self._type(window, "sonnet")
+        _command(window, IDOK)
+
+        assert state["value"] == "sonnet"
+
+    def test_a_typed_model_is_not_written_on_cancel(self):
+        window, state = self._window("haiku")
+
+        self._type(window, "sonnet")
+        _command(window, IDCANCEL)
+
+        assert state["value"] == "haiku"
+
+    def test_an_emptied_box_is_written_as_empty(self):
+        # Empty means "the CLI's own default", which is a real choice.
+        window, state = self._window("haiku")
+
+        self._type(window, "")
+        _command(window, IDOK)
+
+        assert state["value"] == ""
+
+    def test_applying_puts_the_stored_model_back_in_the_box(self):
+        # The setting trims what it is given; the box must show what it kept.
+        state = {"value": "haiku"}
+        field = SettingText(
+            key="claude_model",
+            label="Model",
+            value=lambda: state["value"],
+            write=lambda new: state.update(value=new.strip()),
+        )
+        window = _window(_one_tab(field))
+        window._create()
+        self._type(window, "  sonnet  ")
+
+        _command(window, _APPLY_ID)
+
+        assert window._user32.text[window._controls["claude_model"].editor] == "sonnet"
+
+
+class TestPickingAnEffort:
+    """An effort is picked from the provider's own list, never typed."""
+
+    def _window(self, value: str = "", *, light: bool = True):
+        field, state = _choice(value)
+        window = _window(
+            _one_tab(replace(field, key="claude_effort", label="Reasoning effort")),
+            light=light,
+        )
+        window._create()
+        return window, state
+
+    def _pick(self, window, index: int, notification: int = CBN_SELCHANGE) -> None:
+        window._user32.results["SendMessageW"] = (
+            lambda handle, message, wparam, lparam: index if message == CB_GETCURSEL else 1
+        )
+        _command(window, _FIRST_FIELD_ID + _field_index(window, "claude_effort"), notification)
+
+    def test_one_drop_down_list_is_created(self):
+        window, _state = self._window()
+
+        (combo,) = _created(window, COMBOBOX_CLASS)
+        assert combo[4] & 0x0F == CBS_DROPDOWNLIST
+
+    def test_every_level_is_added_to_the_list(self):
+        window, _state = self._window()
+
+        added = [
+            call for call in window._user32.named("SendMessageW") if call[2] == CB_ADDSTRING
+        ]
+        assert len(added) == len(_EFFORTS)
+
+    def test_the_stored_level_is_selected(self):
+        window, _state = self._window("high")
+
+        selections = [
+            call[3] for call in window._user32.named("SendMessageW") if call[2] == CB_SETCURSEL
+        ]
+        assert selections == [2]
+
+    def test_a_stored_level_the_list_lacks_is_still_shown(self):
+        # A hand-edited config may hold a level this version does not list.
+        window, _state = self._window("ultra")
+
+        added = [call for call in window._user32.named("SendMessageW") if call[2] == CB_ADDSTRING]
+        selections = [
+            call[3] for call in window._user32.named("SendMessageW") if call[2] == CB_SETCURSEL
+        ]
+        assert len(added) == len(_EFFORTS) + 1
+        assert selections == [len(_EFFORTS)]
+
+    def test_a_picked_level_is_written_on_ok(self):
+        window, state = self._window("")
+
+        self._pick(window, 1)
+        _command(window, IDOK)
+
+        assert state["value"] == "low"
+
+    def test_other_notifications_from_the_list_change_nothing(self):
+        window, state = self._window("")
+
+        self._pick(window, 2, notification=3)  # CBN_SETFOCUS
+        _command(window, IDOK)
+
+        assert state["value"] == ""
+
+    def test_the_list_is_given_the_dark_combo_box_theme_in_dark_mode(self):
+        window, _state = self._window(light=False)
+        (combo_handle,) = window._user32.handles_of_class(COMBOBOX_CLASS)
+
+        assert ("SetWindowTheme", combo_handle, DARK_MODE_COMBOBOX_THEME, None) in (
+            window._uxtheme.calls
+        )
+
+    def test_the_open_list_is_given_the_text_field_colour(self):
+        window, _state = self._window()
+
+        window._window_proc(window._page_handles[0], WM_CTLCOLORLISTBOX, 700, 0)
+
+        assert ("SetBkColor", 700, LIGHT_THEME_FIELD_BACKGROUND) in window._gdi32.calls
 
 
 class TestColours:
@@ -965,3 +1458,275 @@ class TestTheDarkTabStrip:
 
         selections = [call[2] for call in window._gdi32.named("SelectObject")]
         assert selections == [42, 77]
+
+
+class TestTheCommandButtons:
+    """Copy command and Run now act on the model and effort shown, applied or not."""
+
+    def _window(self, act=None):
+        given: list[tuple[str, str]] = []
+        model_text, _ = _text("haiku")
+        effort_choice, _ = _choice("low")
+        command = SettingCommand(
+            key="claude_run_command",
+            label="Run now",
+            model_key="claude_model",
+            effort_key="claude_effort",
+            act=act or (lambda model, effort, changed: given.append((model, effort))),
+        )
+        window = _window(
+            _one_tab(
+                replace(model_text, key="claude_model", label="Model"),
+                replace(effort_choice, key="claude_effort", label="Reasoning effort"),
+                command,
+            )
+        )
+        window._create()
+        return window, given
+
+    def _click(self, window) -> None:
+        _command(window, _FIRST_FIELD_ID + _field_index(window, "claude_run_command"))
+
+    def test_a_command_is_a_push_button_with_its_label(self):
+        window, _given = self._window()
+
+        assert any(call[3] == "Run now" for call in _created(window, BUTTON_CLASS))
+
+    def test_a_click_acts_on_the_stored_model_and_effort(self):
+        window, given = self._window()
+
+        self._click(window)
+
+        assert given == [("haiku", "low")]
+
+    def test_a_click_acts_on_a_model_typed_but_not_yet_applied(self):
+        window, given = self._window()
+        window._user32.text[window._controls["claude_model"].editor] = "sonnet"
+        _command(window, _FIRST_EDITOR_ID + _field_index(window, "claude_model"), EN_CHANGE)
+
+        self._click(window)
+
+        assert given == [("sonnet", "low")]
+
+    def test_a_click_leaves_nothing_to_apply(self):
+        window, _given = self._window()
+
+        self._click(window)
+
+        assert window._pending.is_dirty() is False
+
+    def test_an_action_that_fails_is_logged_not_raised(self, caplog):
+        def refuse(model, effort, changed):
+            raise RuntimeError("no CLI")
+
+        window, _given = self._window(act=refuse)
+
+        with caplog.at_level(logging.ERROR):
+            self._click(window)
+
+        assert "Run now" in caplog.text
+
+    def test_a_changed_output_is_announced_to_the_window_thread(self):
+        # The run finishes on a thread of its own, and only the thread that made
+        # a control may safely write to it, so the change is posted, not drawn.
+        window, _given = self._window(act=lambda model, effort, changed: changed())
+
+        self._click(window)
+
+        assert ("PostMessageW", window._handle, _WM_OUTPUT_CHANGED, 0, 0) in (
+            window._user32.calls
+        )
+
+    def test_a_change_announced_after_the_window_closed_is_dropped(self):
+        announced: list[object] = []
+        window, _given = self._window(
+            act=lambda model, effort, changed: announced.append(changed)
+        )
+        self._click(window)
+        window._handle = None
+
+        announced[0]()
+
+        assert window._user32.named("PostMessageW") == []
+
+
+class TestTheOutputBox:
+    """A read-only box of several lines that the application writes into."""
+
+    def _window(self, text=lambda: "Succeeded.\nReply: Hi"):
+        output = SettingOutput(key="claude_last_run", text=text)
+        window = _window(_one_tab(output))
+        window._create()
+        return window
+
+    def _box(self, window):
+        return window._controls["claude_last_run"].label
+
+    def test_it_is_a_multi_line_read_only_box_that_scrolls(self):
+        window = self._window()
+
+        ((_name, _ex, _class, _text, style, *_rest),) = _created(window, EDIT_CLASS)
+        assert style & ES_MULTILINE
+        assert style & ES_READONLY
+        assert style & WS_VSCROLL
+
+    def test_it_opens_showing_its_text_with_windows_line_breaks(self):
+        window = self._window()
+
+        assert window._user32.text[self._box(window)] == "Succeeded.\r\nReply: Hi"
+
+    def test_the_window_rereads_every_box_when_told_the_text_changed(self):
+        lines = ["Running…"]
+        window = self._window(text=lambda: lines[0])
+        lines[0] = "Succeeded in 6.3 s."
+
+        window._window_proc(window._handle, _WM_OUTPUT_CHANGED, 0, 0)
+
+        assert window._user32.text[self._box(window)] == "Succeeded in 6.3 s."
+
+    def test_text_that_cannot_be_read_leaves_the_box_empty(self, caplog):
+        def broken():
+            raise RuntimeError("no state")
+
+        with caplog.at_level(logging.ERROR):
+            window = self._window(text=broken)
+
+        assert window._user32.text[self._box(window)] == ""
+        assert "claude_last_run" in caplog.text
+
+    def test_applying_does_not_touch_the_box(self):
+        window = self._window()
+        before = len(window._user32.named("SetWindowTextW"))
+
+        _command(window, _APPLY_ID)
+
+        assert len(window._user32.named("SetWindowTextW")) == before
+
+    def test_the_production_window_has_one_box_per_provider(self):
+        window = _window()
+        window._create()
+
+        boxes = [
+            call for call in _created(window, EDIT_CLASS) if call[4] & ES_READONLY
+        ]
+        assert len(boxes) == 2
+
+
+def _output_window(*extra_fields, text=lambda: ""):
+    """A window whose one group holds a Last run box, plus any other fields given.
+
+    The dialog font and the monospace font get handles of their own, so a test
+    can tell which control was given which.
+    """
+    output = SettingOutput(key="claude_last_run", text=text)
+    window = _window(_one_tab(*extra_fields, output, group="Last run"))
+    fonts = iter([501, 502])
+    window._gdi32.results["CreateFontIndirectW"] = lambda *args: next(fonts)
+    window._create()
+    return window
+
+
+def _group_handles(window) -> list[int]:
+    """The Last run caption and its group box.
+
+    The fake hands out handles in creation order from 101, so each creation
+    call's position gives the handle it returned.
+    """
+    created = dict(enumerate(window._user32.named("CreateWindowExW"), start=101))
+    caption = next(
+        handle
+        for handle, call in created.items()
+        if call[2] == STATIC_CLASS and call[3] == "Last run"
+    )
+    box = next(
+        handle
+        for handle, call in created.items()
+        if call[2] == BUTTON_CLASS and call[4] & 0x0F == BS_GROUPBOX
+    )
+    return [caption, box]
+
+
+class TestHidingAnEmptyOutput:
+    """The Last run box, its border, and its caption appear only once there is a run."""
+
+    def _box(self, window) -> int:
+        return window._controls["claude_last_run"].label
+
+    def test_an_empty_box_is_hidden(self):
+        window = _output_window()
+
+        assert window._user32.shown[self._box(window)] == SW_HIDE
+
+    def test_a_group_of_empty_boxes_is_hidden_with_its_caption(self):
+        window = _output_window()
+
+        assert all(window._user32.shown[handle] == SW_HIDE for handle in _group_handles(window))
+
+    def test_a_box_with_text_is_shown(self):
+        window = _output_window(text=lambda: "Running…")
+
+        assert window._user32.shown.get(self._box(window), SW_SHOW) == SW_SHOW
+        assert all(
+            window._user32.shown.get(handle, SW_SHOW) == SW_SHOW
+            for handle in _group_handles(window)
+        )
+
+    def test_the_group_appears_once_there_is_something_to_show(self):
+        lines = [""]
+        window = _output_window(text=lambda: lines[0])
+        lines[0] = "Command copied to the clipboard:\nclaude -p hi"
+
+        window._window_proc(window._handle, _WM_OUTPUT_CHANGED, 0, 0)
+
+        assert window._user32.shown[self._box(window)] == SW_SHOW
+        assert all(window._user32.shown[handle] == SW_SHOW for handle in _group_handles(window))
+
+    def test_a_group_that_also_holds_a_setting_stays_visible(self):
+        toggle, _state = _toggle_field()
+        window = _output_window(toggle)
+
+        assert window._user32.shown[self._box(window)] == SW_HIDE
+        assert all(
+            window._user32.shown.get(handle, SW_SHOW) == SW_SHOW
+            for handle in _group_handles(window)
+        )
+
+    def test_the_production_window_hides_both_last_run_groups_at_first(self):
+        window = _window(_production_model())
+        window._create()
+
+        boxes = [window._controls[f"{key}_last_run"].label for key in ("claude", "codex")]
+        assert [window._user32.shown[box] for box in boxes] == [SW_HIDE, SW_HIDE]
+
+
+class TestTheOutputFont:
+    """The Last run box shows a command line, which reads best in a fixed-width face."""
+
+    def _fonts_given(self, window, handle: int) -> list[int]:
+        return [
+            call[3]
+            for call in window._user32.named("SendMessageW")
+            if call[1] == handle and call[2] == WM_SETFONT
+        ]
+
+    def test_the_box_is_given_the_monospace_font(self):
+        window = _output_window(text=lambda: "Running…")
+
+        assert self._fonts_given(window, window._controls["claude_last_run"].label)[-1] == 502
+
+    def test_other_controls_keep_the_dialog_font(self):
+        toggle, _state = _toggle_field()
+        window = _output_window(toggle)
+
+        assert self._fonts_given(window, window._controls["taskbar"].label) == [501]
+
+    def test_the_monospace_font_is_released_with_the_others(self):
+        output = SettingOutput(key="claude_last_run", text=lambda: "")
+        window = _window(_one_tab(output))
+        fonts = iter([501, 502])
+        window._gdi32.results["CreateFontIndirectW"] = lambda *args: next(fonts)
+
+        window.show()
+
+        deleted = [call[1] for call in window._gdi32.named("DeleteObject")]
+        assert 501 in deleted and 502 in deleted
