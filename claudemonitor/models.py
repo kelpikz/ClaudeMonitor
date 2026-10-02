@@ -96,6 +96,20 @@ def _codex_cli_reply(returncode: int, stdout: str, stderr: str) -> "CliReply":
     return codex_fetcher.read_cli_reply(returncode, stdout, stderr)
 
 
+def _claude_default_model() -> str:
+    """Name the model Claude's CLI uses when given none; deferred for the same reason."""
+    from . import fetcher
+
+    return fetcher.default_model()
+
+
+def _codex_default_model() -> str:
+    """Name the model Codex's CLI uses when given none; deferred for the same reason."""
+    from . import codex_fetcher
+
+    return codex_fetcher.default_model()
+
+
 @dataclass(frozen=True)
 class CliReply:
     """What one run of a provider's CLI answered.
@@ -147,6 +161,9 @@ class Provider:
     read_cli_reply: Callable[[int, str, str], CliReply]
     fetch: Callable[[], "ProviderUsageData"]
     settings: ProviderSettings
+    # The model the CLI uses when the nudge names none, or "" if it cannot be
+    # known. Read from the CLI's own config each time, since that can change.
+    default_model: Callable[[], str] = lambda: ""
     effort_levels: tuple[str, ...] = EFFORT_LEVELS
 
 
@@ -157,6 +174,7 @@ CLAUDE = Provider(
     cli_executable="claude",
     cli_arguments=_claude_cli_arguments,
     read_cli_reply=_claude_cli_reply,
+    default_model=_claude_default_model,
     fetch=_claude_usage,
     settings=CLAUDE_SETTINGS,
 )
@@ -168,6 +186,7 @@ CODEX = Provider(
     cli_executable="codex",
     cli_arguments=_codex_cli_arguments,
     read_cli_reply=_codex_cli_reply,
+    default_model=_codex_default_model,
     fetch=_codex_usage,
     settings=CODEX_SETTINGS,
 )

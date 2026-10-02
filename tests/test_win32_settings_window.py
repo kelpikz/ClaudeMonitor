@@ -1027,12 +1027,13 @@ class TestTypingAModel:
         assert not editor[4] & ES_NUMBER
 
     def test_a_placeholder_is_shown_in_an_empty_box(self):
+        asked: list[str] = []
         field = SettingText(
             key="codex_model",
             label="Model",
             value=lambda: "",
             write=lambda _: None,
-            placeholder="Codex CLI default",
+            placeholder=lambda: asked.append("asked") or "gpt-6.1-sol (default)",
         )
         window = _window(_one_tab(field))
         window._create()
@@ -1045,6 +1046,8 @@ class TestTypingAModel:
         ]
         assert len(cues) == 1
         assert cues[0][3] == 1  # Shown even while the box has the focus.
+        # Read when the window opens, so a changed CLI config shows at once.
+        assert asked == ["asked"]
 
     def test_a_box_without_a_placeholder_sets_none(self):
         window, _state = self._window()
@@ -1730,3 +1733,70 @@ class TestTheOutputFont:
 
         deleted = [call[1] for call in window._gdi32.named("DeleteObject")]
         assert 501 in deleted and 502 in deleted
+
+
+class TestTheWindowIcon:
+    """The title bar and the taskbar show the app's own tile, not Python's.
+
+    The window class names no icon, so without these Windows drew a blank
+    caption icon and the taskbar fell back to python.exe's under `uv run dev`.
+    """
+
+    _WM_SETICON = 0x0080
+    _ICON_SMALL = 0
+    _ICON_BIG = 1
+
+    def _window(self, *, icons=(501, 502), metrics=None):
+        window = _window()
+        handed_out = iter(icons)
+        sizes = metrics or {11: 32, 49: 16}  # SM_CXICON, SM_CXSMICON
+        window._user32.results["CreateIconFromResourceEx"] = lambda *args: next(handed_out)
+        window._user32.results["GetSystemMetrics"] = lambda index: sizes.get(index, 0)
+        return window
+
+    def _icons_set(self, window) -> dict[int, int]:
+        return {
+            call[3]: call[4]
+            for call in window._user32.named("SendMessageW")
+            if call[1] == window._handle and call[2] == self._WM_SETICON
+        }
+
+    def _sizes_asked(self, window) -> list[tuple[int, int]]:
+        return [(call[5], call[6]) for call in window._user32.named("CreateIconFromResourceEx")]
+
+    def test_the_big_and_the_small_icon_are_both_set(self):
+        window = self._window()
+        window._create()
+
+        assert self._icons_set(window) == {self._ICON_BIG: 501, self._ICON_SMALL: 502}
+
+    def test_each_is_drawn_at_the_size_windows_asks_for(self):
+        window = self._window(metrics={11: 40, 49: 20})
+        window._create()
+
+        assert self._sizes_asked(window) == [(40, 40), (20, 20)]
+
+    def test_a_size_windows_does_not_give_falls_back_to_the_usual_one(self):
+        window = self._window(metrics={})
+        window._create()
+
+        assert self._sizes_asked(window) == [(32, 32), (16, 16)]
+
+    def test_the_icons_are_freed_when_the_window_closes(self):
+        window = self._window()
+
+        window.show()
+
+        assert [call[1] for call in window._user32.named("DestroyIcon")] == [501, 502]
+
+    def test_an_icon_windows_cannot_make_is_skipped(self, caplog):
+        window = self._window(icons=(0, 502))
+
+        with caplog.at_level(logging.WARNING):
+            window.show()
+
+        assert self._icon_numbers_freed(window) == [502]
+        assert "icon" in caplog.text
+
+    def _icon_numbers_freed(self, window) -> list[int]:
+        return [call[1] for call in window._user32.named("DestroyIcon")]

@@ -225,6 +225,23 @@ def _overrides(*settings: str) -> tuple[str, ...]:
     return tuple(part for setting in settings for part in ("-c", setting))
 
 
+def default_model() -> str:
+    """Name the model `codex exec` uses when the nudge names none, or "".
+
+    That is the ``model`` in the user's config.toml, unless the profile it
+    selects has a model of its own.
+    """
+    config = _read_config()
+    model = config.get("model")
+    profiles = config.get("profiles")
+    profile_name = config.get("profile")
+    if isinstance(profiles, dict) and isinstance(profile_name, str):
+        profile = profiles.get(profile_name)
+        if isinstance(profile, dict) and "model" in profile:
+            model = profile["model"]
+    return model if isinstance(model, str) else ""
+
+
 def _configured_mcp_servers() -> tuple[str, ...]:
     """Name every MCP server the user's Codex config starts.
 
@@ -232,14 +249,18 @@ def _configured_mcp_servers() -> tuple[str, ...]:
     A name that would need quotes is skipped, and an unreadable config names
     none: the nudge then costs a few hundred tokens more, but it still runs.
     """
-    try:
-        config = tomllib.loads(_config_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ()
-    servers = config.get("mcp_servers")
+    servers = _read_config().get("mcp_servers")
     if not isinstance(servers, dict):
         return ()
     return tuple(name for name in servers if _BARE_KEY.match(name))
+
+
+def _read_config() -> dict:
+    """Read the user's Codex config; a missing or broken file reads as empty."""
+    try:
+        return tomllib.loads(_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def _config_path() -> Path:

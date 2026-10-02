@@ -10,6 +10,7 @@ Everything else — the request, the timeout, and every way it can fail — is i
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,6 +85,16 @@ def _endpoint() -> UsageEndpoint:
 def fetch() -> ProviderUsageData:
     """Return current Claude usage, encoding every failure as data."""
     return fetch_usage(_endpoint, named=PROVIDER_NAME)
+
+
+def default_model() -> str:
+    """Name the model Claude Code uses when the nudge names none, or "".
+
+    The nudge runs with ``--setting-sources=``, so the model in
+    ~/.claude/settings.json is not used. ANTHROPIC_MODEL still is. Without it,
+    Claude Code picks the model itself and there is nothing to read.
+    """
+    return os.environ.get("ANTHROPIC_MODEL", "").strip()
 
 
 def cli_arguments(model: str, effort: str) -> tuple[str, ...]:

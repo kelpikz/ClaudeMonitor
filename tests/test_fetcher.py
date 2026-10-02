@@ -237,3 +237,24 @@ def test_the_endpoint_is_built_from_the_credentials(monkeypatch):
     assert endpoint.url == "https://api.anthropic.com/api/oauth/usage"
     assert endpoint.headers["Authorization"] == "Bearer tok"
     assert endpoint.expires_at == expires_at
+
+
+class TestTheDefaultModel:
+    """The nudge runs with --setting-sources=, so ~/.claude/settings.json is not
+    read and its model is not used. Only ANTHROPIC_MODEL still reaches Claude
+    Code; without it, the model is chosen by Claude Code and cannot be known."""
+
+    def test_anthropic_model_is_the_default(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+
+        assert fetcher.default_model() == "claude-sonnet-5"
+
+    def test_without_it_the_default_cannot_be_named(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+
+        assert fetcher.default_model() == ""
+
+    def test_a_blank_value_names_none(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_MODEL", "  ")
+
+        assert fetcher.default_model() == ""

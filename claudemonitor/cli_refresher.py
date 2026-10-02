@@ -36,6 +36,8 @@ COMMAND_TIMEOUT_SECONDS = 120
 _KILLED_TREE_WAIT_SECONDS = 5
 DEFAULT_COOLDOWN_SECONDS = 900  # 15 mins
 MAX_CONSECUTIVE_FAILURES = 3
+# How long a woken window is left alone: the length of one window.
+WOKEN_WINDOW_SECONDS = 5 * 60 * 60
 
 # What both CLIs are given in place of their own long system prompt. The
 # default one, with its tool definitions, was most of the tokens a nudge cost.
@@ -340,8 +342,10 @@ class SessionNudger:
         self._max_consecutive_failures = max_consecutive_failures
         self._last_attempt_at: float | None = None
         self._consecutive_failures = 0
-        # Set when a run succeeded and no fetch has judged it yet.
+        # Set when a token renewal succeeded and no fetch has judged it yet.
         self._awaiting_confirmation = False
+        # When the last successful wake finished; its window is left alone.
+        self._woken_at: float | None = None
 
     @property
     def exhausted(self) -> bool:
@@ -364,10 +368,14 @@ class SessionNudger:
         3. Give up after 3 consecutive failures — dead credentials report
            `token_expired` forever and no prompt can fix them, so retrying is
            just a doomed subprocess every cooldown until the app restarts.
-        4. A run counts as a success only if the next fetch no longer needs
-           one. Codex can stay at 0% after a nudge, and a 403 that is not about
-           the token stays a 403; without this, each would run every cooldown.
-        5. Never run while this provider's CLI is already running, whether
+        4. A token renewal counts as a success only if the next fetch no
+           longer shows an expired token. A 403 that is not about the token
+           stays a 403; without this, it would run every cooldown.
+        5. After a successful wake, leave the window alone for five hours. A
+           lean nudge uses less than 1%, so the API still shows 0% after it.
+           Counting that 0% as a failure tripped the breaker, and an idle
+           window was then never woken again.
+        6. Never run while this provider's CLI is already running, whether
            from here or from Run now.
         """
         reason = nudge_reason(data)
@@ -380,6 +388,8 @@ class SessionNudger:
 
         if reason is None:
             return False
+        if reason == "idle_window" and self._window_recently_woken():
+            return False
         options = self._options()
         if not options.allows(reason):
             return False
@@ -389,8 +399,14 @@ class SessionNudger:
             return False
 
         self._last_attempt_at = self._clock()
-        self._start_background(lambda: self._nudge(options))
+        self._start_background(lambda: self._nudge(options, reason))
         return True
+
+    def _window_recently_woken(self) -> bool:
+        """Return whether a successful wake started the window now in progress."""
+        if self._woken_at is None:
+            return False
+        return self._clock() - self._woken_at < WOKEN_WINDOW_SECONDS
 
     def _judge_last_run(self, data: ProviderUsageData, reason: NudgeReason | None) -> None:
         """Count a successful run as a failure if this fetch still needs one.
@@ -417,6 +433,19 @@ class SessionNudger:
             return False
         return self._clock() - self._last_attempt_at < cooldown_seconds
 
+    def _record_success(self, reason: NudgeReason) -> None:
+        """Note a run the CLI answered.
+
+        A wake has started the window, and the clock for leaving it alone starts
+        now, when the run ends: the window started while the run was going.
+        A renewal is judged by the next fetch, which clears the failure count.
+        """
+        if reason == "idle_window":
+            self._woken_at = self._clock()
+            self._consecutive_failures = 0
+        else:
+            self._awaiting_confirmation = True
+
     def _record_failure(self) -> None:
         """Count one failed attempt and say so when it trips the breaker."""
         self._consecutive_failures += 1
@@ -427,12 +456,11 @@ class SessionNudger:
                 self._consecutive_failures,
             )
 
-    def _nudge(self, options: RefreshOptions) -> None:
+    def _nudge(self, options: RefreshOptions, reason: NudgeReason) -> None:
         """Run one CLI refresh and announce it, always letting go of the CLI after."""
         try:
             if self._invoke(options).succeeded:
-                # The failure count is cleared by the fetch that confirms it.
-                self._awaiting_confirmation = True
+                self._record_success(reason)
                 self._on_refreshed()
             else:
                 self._record_failure()

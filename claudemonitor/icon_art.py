@@ -12,6 +12,7 @@ pulling in pystray or any Windows state.
 from __future__ import annotations
 
 import functools
+import io
 import math
 from pathlib import Path
 
@@ -51,6 +52,9 @@ CLAUDE_GLYPH_COLOR = (217, 119, 87)
 
 Color = tuple[int, int, int]
 
+# The application's own icon: the exe's, and the settings window's.
+APPLICATION_ICON_COLOR: Color = (46, 160, 67)
+
 
 def tile_icon(
     color: Color,
@@ -66,6 +70,18 @@ def tile_icon(
     scale = size * _SUPERSAMPLE
     body = _knock_out(_rounded_mask(scale), glyph_mask(glyph, scale))
     return _painted(color, _downscaled(body, size))
+
+
+def application_icon(size: int) -> Image.Image:
+    """Return the application's icon at one size: the green tile."""
+    return tile_icon(APPLICATION_ICON_COLOR, size=size)
+
+
+def application_icon_png(size: int) -> bytes:
+    """Return the application's icon at one size as PNG bytes, which Windows reads."""
+    buffer = io.BytesIO()
+    application_icon(size).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def glyph_mask(glyph: str, size: int) -> Image.Image:

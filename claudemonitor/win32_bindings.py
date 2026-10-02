@@ -158,6 +158,15 @@ WM_CTLCOLORLISTBOX = 0x0134  # The open list of a combo box.
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
 
+# The window's own icon: big for the taskbar and Alt+Tab, small for the title bar.
+WM_SETICON = 0x0080
+ICON_SMALL = 0
+ICON_BIG = 1
+SM_CXICON = 11
+SM_CXSMICON = 49
+# The format version CreateIconFromResourceEx expects; it also reads PNG data.
+ICON_RESOURCE_VERSION = 0x00030000
+
 # Dark mode. The title bar is Desktop Window Manager's to paint, and the
 # controls take their dark glyphs from the same visual style File Explorer uses.
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -656,6 +665,20 @@ USER32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     # Register the custom class and paint its contents.
     "RegisterClassExW": ((ctypes.POINTER(WNDCLASSEXW),), wintypes.ATOM),
     "LoadCursorW": ((wintypes.HINSTANCE, wintypes.LPCWSTR), wintypes.HANDLE),
+    # Make the window's icon from PNG bytes, and give it back when it closes.
+    "CreateIconFromResourceEx": (
+        (
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ),
+        wintypes.HICON,
+    ),
+    "DestroyIcon": ((wintypes.HICON,), wintypes.BOOL),
     "DefWindowProcW": (
         (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM),
         ctypes.c_ssize_t,

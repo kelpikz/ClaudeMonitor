@@ -596,6 +596,26 @@ def _provider_display(poller: "ProviderPoller", now: datetime) -> DisplayState:
         return processor.internal_error_state(now, poller.provider)
 
 
+# The identity Windows groups this process's taskbar buttons under.
+APPLICATION_ID = "ClaudeMonitor.ClaudeMonitor"
+
+
+def set_application_identity(shell32=None) -> None:
+    """Give this process a taskbar identity of its own.
+
+    Without one, Windows groups the settings window under the executable that
+    runs it — python.exe under `uv run dev` — and shows that file's icon in
+    place of the window's own.
+    """
+    if shell32 is None:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = (ctypes.c_wchar_p,)
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+    result = shell32.SetCurrentProcessExplicitAppUserModelID(APPLICATION_ID)
+    if result != 0:
+        log.warning("Windows refused the taskbar identity (HRESULT %#x)", result & 0xFFFFFFFF)
+
+
 def _acquire_single_instance(name: str = "ClaudeMonitor.SingleInstance") -> bool:
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW(None, False, name)
@@ -625,6 +645,8 @@ def main() -> None:
         sys.exit(0)
 
     log.info("ClaudeMonitor starting")
+    # Before any window, so each one is grouped under it from the start.
+    set_application_identity()
 
     _repair_startup_registration(autostart.repair_if_enabled)
 

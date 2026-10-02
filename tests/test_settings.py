@@ -422,9 +422,41 @@ class TestTheRefreshFields:
 
         assert state["value"] == "sonnet"
 
-    def test_an_empty_model_box_says_the_cli_chooses(self):
-        assert _field(_settings(), "codex_model").placeholder == "Codex CLI default"
-        assert _field(_settings(), "claude_model").placeholder == "Claude CLI default"
+    def _with_default(self, provider, default_model):
+        """Build the settings with one provider's CLI default replaced."""
+        other = CODEX if provider is CLAUDE else CLAUDE
+        return _settings(
+            providers=[
+                _provider_fields(replace(provider, default_model=default_model)),
+                _provider_fields(other),
+            ]
+        )
+
+    def test_an_empty_model_box_names_the_model_the_cli_will_use(self):
+        model = self._with_default(CODEX, lambda: "gpt-6.1-sol")
+
+        assert _field(model, "codex_model").placeholder() == "gpt-6.1-sol (default)"
+
+    def test_a_default_that_cannot_be_named_says_the_cli_chooses(self):
+        model = self._with_default(CLAUDE, lambda: "")
+
+        assert _field(model, "claude_model").placeholder() == "Claude CLI default"
+
+    def test_the_default_is_read_again_each_time(self):
+        # The window is built once at startup, but the CLI's config can change.
+        defaults = iter(["gpt-6-sol", "gpt-6.1-sol"])
+        box = _field(self._with_default(CODEX, lambda: next(defaults)), "codex_model")
+
+        assert box.placeholder() == "gpt-6-sol (default)"
+        assert box.placeholder() == "gpt-6.1-sol (default)"
+
+    def test_a_default_that_cannot_be_read_says_the_cli_chooses(self):
+        def unreadable():
+            raise OSError("config.toml is locked")
+
+        box = _field(self._with_default(CODEX, unreadable), "codex_model")
+
+        assert box.placeholder() == "Codex CLI default"
 
     def test_the_effort_list_offers_the_provider_s_own_levels(self):
         effort = _field(_settings(), "codex_effort")

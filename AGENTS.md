@@ -17,7 +17,8 @@ claudemonitor/
                             those states into one TrayState and one TaskbarLabel; owns all formatting,
                             including the one row per FetchError that every surface reads
   tray.py                 — drives the one pystray icon; init() must be called before apply()
-  icon_art.py             — pure Pillow drawing of the tray status tiles (no pystray, no Windows state)
+  icon_art.py             — pure Pillow drawing of the tray status tiles and the application icon
+                            (the exe's and the settings window's; no pystray, no Windows state)
   label_art.py            — pure Pillow composition of the taskbar label's bitmap: which mark a
                             provider gets, the room around a stacked row, and the bytes Windows reads
   models.py               — shared cross-layer types: Provider (and the CLAUDE/CODEX constants),
@@ -129,9 +130,12 @@ Each of those two reasons has its own switch per provider (`renew_token`, `wake_
 provider has its own cooldown, model, and effort. A `SessionNudger` reads them from the running
 config on every poll through a `RefreshOptions` callable, so nothing has to push a change into it.
 Each run is logged: the tokens it used, or the CLI's own reason when it failed.
-A run counts as a success only when the next fetch no longer needs one; otherwise it counts
-toward the three-failure breaker. Codex can stay at 0% after a nudge, and a 403 that is not about
-the token stays a 403, and each of those used to run the CLI every cooldown for ever. One
+A token renewal counts as a success only when the next fetch no longer shows an expired token;
+otherwise it counts toward the three-failure breaker, because a 403 that is not about the token
+stays a 403. A successful wake is different: a lean nudge uses less than 1%, so both providers
+still show 0% after it. The window has started all the same, so the nudger leaves it alone for
+five hours (`WOKEN_WINDOW_SECONDS`, counted from the end of the run). Judging a wake by the next
+fetch tripped the breaker after three wakes, and an idle window was then never woken again. One
 `threading.Lock` per provider (`main.create_cli_runners`) is shared by its `SessionNudger` and its
 `ManualRun`, so the same CLI never runs twice at once: OpenAI rotates the refresh token, and the
 run that loses can sign the user out. The CLI runs through `cli_refresher.run_cli_process`, which
@@ -238,7 +242,7 @@ tested without a desktop.
 The window is a tabbed dialog — General, Providers, Taskbar — of captioned group boxes, with
 OK / Cancel / Apply along the bottom. The Providers tab has a list of providers on the left. The
 selected provider's section is on the right: Tracking and Auto-refresh (two switches, cooldown, a
-model text box with a "CLI default" placeholder, an effort drop-down, Copy command and Run now on one
+model text box whose grey text names the model an empty box leaves the CLI to use (`Provider.default_model`, read each time the window opens: Codex's `config.toml` `model` or its profile's; Claude only `ANTHROPIC_MODEL`, because `--setting-sources=` skips `settings.json`; "<Provider> CLI default" when unknown), an effort drop-down, Copy command and Run now on one
 row), and Last run (hidden until there is a run). Buttons that follow each other share a row
 (`settings_layout._rows`). A tab gets this layout by
 holding `sections` in place of `groups`. `SettingsTab.add_section` puts an "Add provider…" button

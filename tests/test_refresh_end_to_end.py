@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import threading
 from dataclasses import replace
@@ -241,19 +242,37 @@ class TestWhenTheRunFails:
         assert len(app.cli.commands) == 3
 
 
-class TestARunThatFixesNothing:
-    """A CLI that answers every time, and a fetch that never changes. Without a
-    limit, each poll past the cooldown would spend another run for ever."""
+class TestAWindowThatStaysAtZero:
+    """A lean nudge uses less than 1% of the window, so the API still shows 0%
+    after it. The window has started, so it is not woken again, and the 0% is
+    not a failure: three of those used to trip the breaker, and after that an
+    idle window was never woken again."""
 
-    def test_a_window_that_stays_at_zero_stops_after_three_runs(self, monkeypatch):
+    def test_is_woken_once_and_then_left_alone(self, monkeypatch):
         config = Config(codex=CodexConfig(cooldown_seconds=0))
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
 
         for _ in range(10):
             app.poll(_Response(200, _codex_body(0.0)))
 
-        assert len(app.cli.commands) == 3
-        assert app.nudger.exhausted is True
+        assert len(app.cli.commands) == 1
+        assert app.nudger.exhausted is False
+
+    def test_does_not_log_the_wake_as_a_failure(self, monkeypatch, caplog):
+        config = Config(codex=CodexConfig(cooldown_seconds=0))
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                app.poll(_Response(200, _codex_body(0.0)))
+
+        assert "still shows" not in caplog.text
+        assert "giving up" not in caplog.text
+
+
+class TestARunThatFixesNothing:
+    """A CLI that answers every time, and a fetch that never changes. Without a
+    limit, each poll past the cooldown would spend another run for ever."""
 
     def test_a_refusal_that_is_not_about_the_token_stops_after_three_runs(
         self, monkeypatch
@@ -274,7 +293,8 @@ class TestARunThatFixesNothing:
             app.poll(_Response(200, _codex_body(0.0)))
             app.poll(_Response(200, _codex_body(3.0)))
 
-        assert len(app.cli.commands) == 5
+        # One wake starts the window; the later 0% readings fall inside it.
+        assert len(app.cli.commands) == 1
         assert app.nudger.exhausted is False
 
 
@@ -347,7 +367,8 @@ class TestWhatTheUserChoosesInSettings:
         self, monkeypatch
     ):
         clock = [0.0]
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
+        # A failed run, because a successful wake leaves the window alone.
+        app = _CodexApp(monkeypatch, _Cli(returncode=1, stdout=_CODEX_REJECTED))
         app.nudger._clock = lambda: clock[0]
         app.poll(_Response(200, _codex_body(0.0)))
         clock[0] = 120.0
@@ -358,6 +379,48 @@ class TestWhatTheUserChoosesInSettings:
         app.poll(_Response(200, _codex_body(0.0)))
 
         assert len(app.cli.commands) == 2
+
+
+class TestTheModelAnEmptyBoxUses:
+    """From the model in Codex's own config.toml to the grey text in the empty
+    Model box: the user sees which model a nudge will ask for, before it runs."""
+
+    def _codex_config(self, text: str) -> None:
+        # conftest points CODEX_HOME at an empty folder of this test's own.
+        (Path(os.environ["CODEX_HOME"]) / "config.toml").write_text(text, encoding="utf-8")
+
+    def test_the_box_names_the_model_in_the_codex_config(self, monkeypatch):
+        self._codex_config('model = "gpt-6.1-sol"\n')
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
+
+        assert app.field("codex_model").placeholder() == "gpt-6.1-sol (default)"
+
+    def test_a_config_changed_after_start_is_shown(self, monkeypatch):
+        self._codex_config('model = "gpt-6-sol"\n')
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
+        self._codex_config('model = "gpt-6.1-sol"\n')
+
+        assert app.field("codex_model").placeholder() == "gpt-6.1-sol (default)"
+
+    def test_without_a_config_the_box_says_the_cli_chooses(self, monkeypatch):
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
+
+        assert app.field("codex_model").placeholder() == "Codex CLI default"
+
+    def test_a_broken_config_says_the_cli_chooses(self, monkeypatch):
+        self._codex_config("model = = nonsense\n")
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
+
+        assert app.field("codex_model").placeholder() == "Codex CLI default"
+
+    def test_the_named_default_is_the_one_the_run_leaves_to_the_cli(self, monkeypatch):
+        # An empty box adds no -m, so the CLI really does use the model shown.
+        self._codex_config('model = "gpt-6.1-sol"\n')
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
+
+        app.click("codex_run_command")
+
+        assert "-m" not in app.cli.commands[0]
 
 
 class TestAnExpiredClaudeToken:

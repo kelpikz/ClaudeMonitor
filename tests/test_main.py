@@ -1256,3 +1256,34 @@ class _NullWindow:
 
     def close(self) -> None:
         """Nothing to close."""
+
+
+class TestTheApplicationIdentity:
+    """Windows groups a taskbar button by the process's identity. Under
+    `uv run dev` that is python.exe, whose icon then stands for the settings
+    window; an identity of our own lets the window's own icon show."""
+
+    class _Shell32:
+        def __init__(self, result: int = 0):
+            self.result = result
+            self.names: list[str] = []
+
+        def SetCurrentProcessExplicitAppUserModelID(self, name):
+            self.names.append(name)
+            return self.result
+
+    def test_the_process_is_given_its_own_identity(self):
+        shell32 = self._Shell32()
+
+        main.set_application_identity(shell32)
+
+        assert shell32.names == [main.APPLICATION_ID]
+        assert main.APPLICATION_ID == "ClaudeMonitor.ClaudeMonitor"
+
+    def test_a_refusal_is_logged_not_raised(self, caplog):
+        shell32 = self._Shell32(result=-2147024809)  # E_INVALIDARG
+
+        with caplog.at_level(logging.WARNING):
+            main.set_application_identity(shell32)
+
+        assert "identity" in caplog.text

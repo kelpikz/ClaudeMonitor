@@ -86,15 +86,16 @@ class SettingNumber:
 class SettingText:
     """One free-text setting: a labelled box the user types into.
 
-    ``placeholder`` is the grey text the box shows while it is empty, because
+    ``placeholder`` gives the grey text the box shows while it is empty, because
     an empty box means something (the CLI's own default) and looks like nothing.
+    It is read each time the window opens, so it can name a default that changed.
     """
 
     value: Callable[[], str]
     write: Callable[[str], None]
     key: str = ""
     label: str = ""
-    placeholder: str = ""
+    placeholder: Callable[[], str] = lambda: ""
 
 
 @dataclass(frozen=True)
@@ -386,7 +387,7 @@ def _provider_section(
                         entry.model,
                         key=f"{key}_model",
                         label="Model",
-                        placeholder=f"{provider.label} CLI default",
+                        placeholder=lambda: _default_model_text(provider),
                     ),
                     replace(
                         entry.effort,
@@ -407,6 +408,22 @@ def _provider_section(
             ),
         ],
     )
+
+
+def _default_model_text(provider: Provider) -> str:
+    """Name the model an empty Model box leaves the CLI to use.
+
+    When the CLI's config does not name one, or cannot be read, the CLI picks
+    the model itself, and the box says only that.
+    """
+    try:
+        model = provider.default_model()
+    except Exception:
+        log.warning("unable to read the %s CLI's default model", provider.label, exc_info=True)
+        model = ""
+    if model:
+        return f"{model} (default)"
+    return f"{provider.label} CLI default"
 
 
 def _command(key: str, name: str, label: str, command: SettingCommand) -> SettingCommand:

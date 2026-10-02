@@ -371,3 +371,54 @@ def test_the_endpoint_is_built_from_the_credentials(monkeypatch):
     assert endpoint.headers["Authorization"] == "Bearer tok"
     assert endpoint.headers["ChatGPT-Account-Id"] == "acct"
     assert endpoint.expires_at is None
+
+
+class TestTheDefaultModel:
+    """The model `codex exec` uses when the nudge names none: the one in the
+    user's own config.toml. The settings window shows it in the empty box."""
+
+    def _config(self, monkeypatch, tmp_path, text: str) -> None:
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        (tmp_path / "config.toml").write_text(text, encoding="utf-8")
+
+    def test_the_model_in_the_config_is_the_default(self, monkeypatch, tmp_path):
+        self._config(monkeypatch, tmp_path, 'model = "gpt-6.1-sol"\n')
+
+        assert codex_fetcher.default_model() == "gpt-6.1-sol"
+
+    def test_the_chosen_profile_s_model_wins(self, monkeypatch, tmp_path):
+        self._config(
+            monkeypatch,
+            tmp_path,
+            'model = "gpt-6.1-sol"\nprofile = "fast"\n\n[profiles.fast]\nmodel = "gpt-6-luna"\n',
+        )
+
+        assert codex_fetcher.default_model() == "gpt-6-luna"
+
+    def test_a_profile_without_a_model_keeps_the_top_level_one(self, monkeypatch, tmp_path):
+        self._config(
+            monkeypatch,
+            tmp_path,
+            'model = "gpt-6.1-sol"\nprofile = "fast"\n\n[profiles.fast]\nmodel_reasoning_effort = "low"\n',
+        )
+
+        assert codex_fetcher.default_model() == "gpt-6.1-sol"
+
+    def test_a_config_without_a_model_names_none(self, monkeypatch, tmp_path):
+        self._config(monkeypatch, tmp_path, 'model_reasoning_effort = "high"\n')
+
+        assert codex_fetcher.default_model() == ""
+
+    def test_a_missing_config_names_none(self):
+        # conftest points CODEX_HOME at an empty folder.
+        assert codex_fetcher.default_model() == ""
+
+    def test_a_config_that_is_not_toml_names_none(self, monkeypatch, tmp_path):
+        self._config(monkeypatch, tmp_path, "model = = nonsense\n")
+
+        assert codex_fetcher.default_model() == ""
+
+    def test_a_model_that_is_not_text_names_none(self, monkeypatch, tmp_path):
+        self._config(monkeypatch, tmp_path, "model = 5\n")
+
+        assert codex_fetcher.default_model() == ""

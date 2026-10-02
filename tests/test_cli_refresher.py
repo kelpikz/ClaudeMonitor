@@ -214,7 +214,7 @@ class TestSessionNudgeEndToEnd:
         assert nudger.maybe_nudge(usage(fetch_error="token_expired")) is True
         assert refreshed == []
 
-    def test_repeated_unstarted_polls_only_nudge_once_per_cooldown(self):
+    def test_repeated_expired_polls_only_nudge_once_per_cooldown(self):
         runner = _RecordingRunner()
         elapsed = [0.0]
         nudger = SessionNudger(
@@ -227,11 +227,12 @@ class TestSessionNudgeEndToEnd:
             clock=lambda: elapsed[0],
         )
 
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        expired = usage(fetch_error="token_expired")
+        assert nudger.maybe_nudge(expired) is True
         elapsed[0] = 899.0
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+        assert nudger.maybe_nudge(expired) is False
         elapsed[0] = 900.0
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert nudger.maybe_nudge(expired) is True
         assert len(runner.calls) == 2
 
 
@@ -353,7 +354,8 @@ class TestTheCooldownIsLive:
     """Each provider's cooldown is its own and can change while the app runs."""
 
     def _nudger(self, cooldown: list[float], elapsed: list[float]):
-        invoke, seen = _answers()
+        # A failed run, because a successful wake leaves the window alone.
+        invoke, seen = _answers(succeeded=False)
         nudger = SessionNudger(
             CLAUDE,
             options=lambda: RefreshOptions(cooldown_seconds=cooldown[0]),
@@ -704,11 +706,12 @@ class TestConcurrentNudges:
             clock=lambda: elapsed[0],
         )
 
-        nudger.maybe_nudge(usage(utilization=0.0))
+        expired = usage(fetch_error="token_expired")
+        nudger.maybe_nudge(expired)
         pending[0]()
         elapsed[0] = 61.0
 
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert nudger.maybe_nudge(expired) is True
 
 
 class TestTheCommandToCopy:
@@ -862,21 +865,117 @@ class TestAManualRun:
         assert ManualRun(CODEX).provider is CODEX
 
 
-class TestARunTheNextFetchDoesNotConfirm:
-    """A CLI that answers has not always fixed anything. Codex can stay at 0%
-    after a lean nudge, and a 403 that is not about the token stays a 403. A
-    run the next fetch does not confirm counts as a failure, so the breaker
-    stops the runs rather than spending usage every cooldown for ever."""
+class TestAWokenWindowIsLeftAlone:
+    """A lean nudge uses less than 1% of a window, so the API goes on showing
+    0% after it. The window has started all the same. After a successful wake
+    the window is left alone until it has had time to end, and the 0% is not
+    held against the run. Counting it as a failure tripped the breaker after
+    three wakes, and an idle window was then never woken again."""
 
-    def test_an_idle_window_that_stays_idle_stops_after_three_runs(self):
-        invoke, attempts = _answers(succeeded=True)
-        nudger = _nudger(invoke)
+    FIVE_HOURS = 5 * 60 * 60
 
-        for _ in range(10):
+    def _nudger(self, elapsed: list[float], succeeded: bool = True):
+        invoke, attempts = _answers(succeeded=succeeded)
+        nudger = _nudger(
+            invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
+        )
+        return nudger, attempts
+
+    def test_a_window_still_at_zero_is_not_woken_again_inside_five_hours(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
+
+        nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+        for minute in range(1, 300):
+            elapsed[0] = minute * 60.0
             nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
 
-        assert len(attempts) == 3
-        assert nudger.exhausted is True
+        assert len(attempts) == 1
+
+    def test_the_next_window_is_woken_once_five_hours_have_passed(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = self.FIVE_HOURS
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert len(attempts) == 2
+
+    def test_the_five_hours_count_from_the_end_of_the_run(self):
+        # The window starts when the request lands, which is during the run.
+        # Counting from its start would wake the old window seconds before it
+        # ends, and then leave the new one idle for five hours.
+        elapsed = [0.0]
+
+        def slow_invoke(_options):
+            elapsed[0] += 30.0
+            return CliReply(succeeded=True)
+
+        nudger = _nudger(
+            slow_invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
+        )
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = self.FIVE_HOURS + 29.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+
+    def test_wakes_that_stay_at_zero_never_trip_the_breaker(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
+
+        for window in range(10):
+            elapsed[0] = window * self.FIVE_HOURS
+            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+            elapsed[0] += 60.0
+            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+
+        assert len(attempts) == 10
+        assert nudger.exhausted is False
+
+    def test_a_failed_wake_is_tried_again_after_the_cooldown(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed, succeeded=False)
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = 60.0
+
+        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
+        assert len(attempts) == 2
+
+    def test_a_successful_wake_clears_earlier_failures(self):
+        outcomes = iter([False, False, True])
+        elapsed = [0.0]
+
+        def invoke(_options):
+            return CliReply(succeeded=next(outcomes))
+
+        nudger = _nudger(
+            invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
+        )
+        for attempt in range(3):
+            elapsed[0] = attempt * 60.0
+            nudger.maybe_nudge(usage(utilization=0.0))
+
+        assert nudger._consecutive_failures == 0
+
+    def test_an_expired_token_is_renewed_even_inside_the_five_hours(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = 60.0
+
+        assert nudger.maybe_nudge(usage(fetch_error="token_expired")) is True
+        assert len(attempts) == 2
+
+
+class TestARenewalTheNextFetchDoesNotConfirm:
+    """A CLI that answers has not always renewed the token: a 403 that is not
+    about the token stays a 403. A renewal the next fetch does not confirm
+    counts as a failure, so the breaker stops the runs rather than spending
+    usage every cooldown for ever."""
 
     def test_a_token_that_stays_expired_stops_after_three_runs(self):
         invoke, attempts = _answers(succeeded=True)
@@ -893,7 +992,7 @@ class TestARunTheNextFetchDoesNotConfirm:
         nudger = _nudger(invoke)
 
         for _ in range(5):
-            nudger.maybe_nudge(usage(utilization=0.0))
+            nudger.maybe_nudge(usage(fetch_error="token_expired"))
             nudger.maybe_nudge(usage(utilization=4.0, resets_at=NOW))
 
         assert len(attempts) == 5
@@ -903,7 +1002,7 @@ class TestARunTheNextFetchDoesNotConfirm:
         invoke, _attempts = _answers(succeeded=True)
         nudger = _nudger(invoke, max_consecutive_failures=1)
 
-        nudger.maybe_nudge(usage(utilization=0.0))
+        nudger.maybe_nudge(usage(fetch_error="token_expired"))
         nudger.maybe_nudge(usage(fetch_error="offline"))
         nudger.maybe_nudge(usage(utilization=4.0, resets_at=NOW))
 
@@ -916,10 +1015,10 @@ class TestARunTheNextFetchDoesNotConfirm:
             invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
         )
 
-        nudger.maybe_nudge(usage(utilization=0.0))
-        # Polls inside the cooldown see the same idle window again and again.
+        nudger.maybe_nudge(usage(fetch_error="token_expired"))
+        # Polls inside the cooldown see the same expired token again and again.
         for _ in range(5):
-            nudger.maybe_nudge(usage(utilization=0.0))
+            nudger.maybe_nudge(usage(fetch_error="token_expired"))
 
         assert len(attempts) == 1
         assert nudger.exhausted is False

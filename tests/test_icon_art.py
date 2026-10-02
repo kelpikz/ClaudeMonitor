@@ -189,3 +189,32 @@ class TestLabelGlyphs:
         # the theme exactly as the usage text next to it does.
         assert CODEX_DARK_THEME_COLOR == rgb_from_colorref(DARK_THEME_FOREGROUND)
         assert CODEX_LIGHT_THEME_COLOR == rgb_from_colorref(LIGHT_THEME_FOREGROUND)
+
+
+class TestTheApplicationIcon:
+    """The one drawing the exe and the settings window both show."""
+
+    def test_it_is_the_green_tile(self):
+        from claudemonitor.icon_art import APPLICATION_ICON_COLOR, application_icon
+
+        assert application_icon(32).tobytes() == (
+            tile_icon(APPLICATION_ICON_COLOR, size=32).tobytes()
+        )
+
+    def test_it_is_drawn_at_the_size_asked_for(self):
+        from claudemonitor.icon_art import application_icon
+
+        image = application_icon(20)
+
+        assert image.size == (20, 20)
+        assert image.mode == "RGBA"
+
+    def test_its_png_is_the_same_picture(self):
+        import io
+
+        from claudemonitor.icon_art import application_icon, application_icon_png
+
+        decoded = Image.open(io.BytesIO(application_icon_png(24)))
+
+        assert decoded.format == "PNG"
+        assert decoded.convert("RGBA").tobytes() == application_icon(24).tobytes()
