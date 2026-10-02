@@ -776,6 +776,10 @@ KERNEL32_SIGNATURES: dict[str, tuple[tuple, object]] = {
     "GlobalFree": ((wintypes.HGLOBAL,), wintypes.HGLOBAL),
 }
 
+SHELL32_SIGNATURES: dict[str, tuple[tuple, object]] = {
+    "SetCurrentProcessExplicitAppUserModelID": ((wintypes.LPCWSTR,), ctypes.c_long),  # HRESULT
+}
+
 DWMAPI_SIGNATURES: dict[str, tuple[tuple, object]] = {
     "DwmSetWindowAttribute": (
         (wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD),

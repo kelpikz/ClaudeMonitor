@@ -39,6 +39,7 @@ claudemonitor/
   win32_dpi.py            — this process's DPI awareness, and what a 96-DPI constant is worth on it
   win32_text.py           — the system UI font and text measurement, shared by both windows
   win32_clipboard.py      — puts text on the clipboard (the settings window's Copy command button)
+  win32_icon.py           — makes a window's big and small icons from PNG bytes, and frees them
   win32_bindings.py       — Windows constants, C structs, and function signature tables (no behavior)
 
 tests/          — pytest suite (run via uv run pytest)
@@ -132,10 +133,14 @@ config on every poll through a `RefreshOptions` callable, so nothing has to push
 Each run is logged: the tokens it used, or the CLI's own reason when it failed.
 A token renewal counts as a success only when the next fetch no longer shows an expired token;
 otherwise it counts toward the three-failure breaker, because a 403 that is not about the token
-stays a 403. A successful wake is different: a lean nudge uses less than 1%, so both providers
-still show 0% after it. The window has started all the same, so the nudger leaves it alone for
-five hours (`WOKEN_WINDOW_SECONDS`, counted from the end of the run). Judging a wake by the next
-fetch tripped the breaker after three wakes, and an idle window was then never woken again. One
+stays a 403. Any other reason on that fetch (often 0%, because the renewal is itself a lean
+request) is not held against it. Every successful run, renewal or wake, starts the window. A lean
+nudge uses less than 1%, so both providers still show 0% after it, but the fetch shows a reset
+time still to come (`cli_refresher.future_reset_time`). The nudger leaves the window alone until
+that time. A fetch with usage above 0% is proof too. If, one cooldown after the run, a fetch shows
+neither, the run did not start the window (an API key, another account), and that counts toward
+the breaker. Judging a wake by the 0% alone tripped the breaker after three wakes. A fixed
+five-hour hold could not see a wake that started nothing, so it ran every five hours for ever. One
 `threading.Lock` per provider (`main.create_cli_runners`) is shared by its `SessionNudger` and its
 `ManualRun`, so the same CLI never runs twice at once: OpenAI rotates the refresh token, and the
 run that loses can sign the user out. The CLI runs through `cli_refresher.run_cli_process`, which

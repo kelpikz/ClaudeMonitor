@@ -40,10 +40,14 @@ from .settings import (
 )
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 from .win32_settings_window import create_settings_window
+from .win32_bindings import SHELL32_SIGNATURES, apply_signatures
 from .win32_dpi import enable_per_monitor_dpi_awareness
 
 _ERROR_ALREADY_EXISTS = 183
 log = logging.getLogger(__name__)
+
+# The identity Windows groups this process's taskbar buttons under.
+APPLICATION_ID = "ClaudeMonitor.ClaudeMonitor"
 
 _POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
 _POLL_INTERVAL_BACKOFF_FACTOR = 2
@@ -596,10 +600,6 @@ def _provider_display(poller: "ProviderPoller", now: datetime) -> DisplayState:
         return processor.internal_error_state(now, poller.provider)
 
 
-# The identity Windows groups this process's taskbar buttons under.
-APPLICATION_ID = "ClaudeMonitor.ClaudeMonitor"
-
-
 def set_application_identity(shell32=None) -> None:
     """Give this process a taskbar identity of its own.
 
@@ -609,8 +609,7 @@ def set_application_identity(shell32=None) -> None:
     """
     if shell32 is None:
         shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = (ctypes.c_wchar_p,)
-        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+        apply_signatures(shell32, SHELL32_SIGNATURES)
     result = shell32.SetCurrentProcessExplicitAppUserModelID(APPLICATION_ID)
     if result != 0:
         log.warning("Windows refused the taskbar identity (HRESULT %#x)", result & 0xFFFFFFFF)

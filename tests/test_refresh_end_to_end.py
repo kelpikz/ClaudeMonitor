@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +39,9 @@ def no_config_file(monkeypatch):
     monkeypatch.setattr(ConfigSetting, "save", lambda self, value: None)
 
 
-def _codex_body(used_percent: float | None) -> dict:
+def _codex_body(used_percent: float | None, reset_at: int | None = None) -> dict:
     """Build a body shaped like GET /backend-api/wham/usage."""
-    window = {"used_percent": used_percent, "limit_window_seconds": 18000, "reset_at": None}
+    window = {"used_percent": used_percent, "limit_window_seconds": 18000, "reset_at": reset_at}
     return {
         "plan_type": "plus",
         "rate_limit": {
@@ -242,18 +243,24 @@ class TestWhenTheRunFails:
         assert len(app.cli.commands) == 3
 
 
+def _in_five_hours() -> int:
+    """Return the Unix time a window started now ends at."""
+    return int(time.time()) + 5 * 60 * 60
+
+
 class TestAWindowThatStaysAtZero:
     """A lean nudge uses less than 1% of the window, so the API still shows 0%
-    after it. The window has started, so it is not woken again, and the 0% is
-    not a failure: three of those used to trip the breaker, and after that an
-    idle window was never woken again."""
+    after it. The window has started, and the fetch shows its reset time, so it
+    is not woken again and the 0% is not a failure: three of those used to trip
+    the breaker, and after that an idle window was never woken again."""
 
     def test_is_woken_once_and_then_left_alone(self, monkeypatch):
         config = Config(codex=CodexConfig(cooldown_seconds=0))
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
 
-        for _ in range(10):
-            app.poll(_Response(200, _codex_body(0.0)))
+        app.poll(_Response(200, _codex_body(0.0)))
+        for _ in range(9):
+            app.poll(_Response(200, _codex_body(0.0, reset_at=_in_five_hours())))
 
         assert len(app.cli.commands) == 1
         assert app.nudger.exhausted is False
@@ -263,11 +270,47 @@ class TestAWindowThatStaysAtZero:
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
 
         with caplog.at_level(logging.WARNING):
-            for _ in range(3):
-                app.poll(_Response(200, _codex_body(0.0)))
+            app.poll(_Response(200, _codex_body(0.0)))
+            for _ in range(2):
+                app.poll(_Response(200, _codex_body(0.0, reset_at=_in_five_hours())))
 
         assert "still shows" not in caplog.text
         assert "giving up" not in caplog.text
+
+
+class TestAWakeThatStartsNoWindow:
+    """A CLI that answers, but for another account: the window this app reads
+    never starts, and the fetch never shows a reset time."""
+
+    def test_stops_after_three_runs(self, monkeypatch, caplog):
+        config = Config(codex=CodexConfig(cooldown_seconds=0))
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(10):
+                app.poll(_Response(200, _codex_body(0.0)))
+
+        assert len(app.cli.commands) == 3
+        assert app.nudger.exhausted is True
+        assert "shows no reset time" in caplog.text
+
+
+class TestARenewalThatAlsoStartsTheWindow:
+    """The renewal is itself a lean request, so the fetch after it shows the
+    window at 0%. That is not an expired token, so the renewal is a success."""
+
+    def test_is_not_a_failure_and_is_not_followed_by_a_wake(self, monkeypatch, caplog):
+        config = Config(codex=CodexConfig(cooldown_seconds=0))
+        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
+
+        with caplog.at_level(logging.WARNING):
+            app.poll(_Response(401, {}))
+            for _ in range(5):
+                app.poll(_Response(200, _codex_body(0.0, reset_at=_in_five_hours())))
+
+        assert len(app.cli.commands) == 1
+        assert app.nudger.exhausted is False
+        assert "still shows" not in caplog.text
 
 
 class TestARunThatFixesNothing:
@@ -290,8 +333,8 @@ class TestARunThatFixesNothing:
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
 
         for _ in range(5):
-            app.poll(_Response(200, _codex_body(0.0)))
-            app.poll(_Response(200, _codex_body(3.0)))
+            app.poll(_Response(200, _codex_body(0.0, reset_at=_in_five_hours())))
+            app.poll(_Response(200, _codex_body(3.0, reset_at=_in_five_hours())))
 
         # One wake starts the window; the later 0% readings fall inside it.
         assert len(app.cli.commands) == 1

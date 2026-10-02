@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -36,8 +37,6 @@ COMMAND_TIMEOUT_SECONDS = 120
 _KILLED_TREE_WAIT_SECONDS = 5
 DEFAULT_COOLDOWN_SECONDS = 900  # 15 mins
 MAX_CONSECUTIVE_FAILURES = 3
-# How long a woken window is left alone: the length of one window.
-WOKEN_WINDOW_SECONDS = 5 * 60 * 60
 
 # What both CLIs are given in place of their own long system prompt. The
 # default one, with its tool definitions, was most of the tokens a nudge cost.
@@ -92,6 +91,14 @@ def nudge_reason(data: ProviderUsageData) -> NudgeReason | None:
     if data.five_hour is None or data.five_hour.utilization > 0.0:
         return None
     return "idle_window"
+
+
+def future_reset_time(data: ProviderUsageData) -> datetime | None:
+    """Return the five-hour window's reset time, if it is after this fetch."""
+    window = data.five_hour
+    if window is None or window.resets_at is None:
+        return None
+    return window.resets_at if window.resets_at > data.fetched_at else None
 
 
 def last_output_line(text: str) -> str:
@@ -344,8 +351,11 @@ class SessionNudger:
         self._consecutive_failures = 0
         # Set when a token renewal succeeded and no fetch has judged it yet.
         self._awaiting_confirmation = False
-        # When the last successful wake finished; its window is left alone.
+        # When the last successful run finished; every run starts the window.
         self._woken_at: float | None = None
+        # The reset time a fetch showed after that run: the window is left
+        # alone until then.
+        self._window_ends_at: datetime | None = None
 
     @property
     def exhausted(self) -> bool:
@@ -371,10 +381,11 @@ class SessionNudger:
         4. A token renewal counts as a success only if the next fetch no
            longer shows an expired token. A 403 that is not about the token
            stays a 403; without this, it would run every cooldown.
-        5. After a successful wake, leave the window alone for five hours. A
-           lean nudge uses less than 1%, so the API still shows 0% after it.
-           Counting that 0% as a failure tripped the breaker, and an idle
-           window was then never woken again.
+        5. Every successful run starts the window. A lean nudge uses less than
+           1%, so the API still shows 0% after it, but the fetch shows a reset
+           time. Leave the window alone until that time. A fetch that shows
+           no future reset time one cooldown after the run means the run did
+           not start the window, and that counts as a failure.
         6. Never run while this provider's CLI is already running, whether
            from here or from Run now.
         """
@@ -385,12 +396,13 @@ class SessionNudger:
             # fails while fetches keep succeeding, and that would loop forever.
             self._consecutive_failures = 0
         self._judge_last_run(data, reason)
+        options = self._options()
+        self._judge_last_wake(data, options.cooldown_seconds)
 
         if reason is None:
             return False
-        if reason == "idle_window" and self._window_recently_woken():
+        if reason == "idle_window" and self._window_left_alone(data.fetched_at):
             return False
-        options = self._options()
         if not options.allows(reason):
             return False
         if self.exhausted or self._within_cooldown(options.cooldown_seconds):
@@ -402,22 +414,34 @@ class SessionNudger:
         self._start_background(lambda: self._nudge(options, reason))
         return True
 
-    def _window_recently_woken(self) -> bool:
-        """Return whether a successful wake started the window now in progress."""
+    def _window_left_alone(self, now: datetime) -> bool:
+        """Return whether the last successful run started a window that has not ended.
+
+        Until a fetch shows the window's reset time, the run is trusted:
+        `_judge_last_wake` ends that trust after one cooldown.
+        """
         if self._woken_at is None:
             return False
-        return self._clock() - self._woken_at < WOKEN_WINDOW_SECONDS
+        if self._window_ends_at is None or now < self._window_ends_at:
+            return True
+        self._woken_at = None
+        self._window_ends_at = None
+        return False
 
     def _judge_last_run(self, data: ProviderUsageData, reason: NudgeReason | None) -> None:
-        """Count a successful run as a failure if this fetch still needs one.
+        """Count a renewal as a failure if this fetch still shows an expired token.
 
-        A fetch that failed for another reason says nothing either way, so the
-        judgement waits for the next one.
+        Any other reason is not about the token: the renewal is itself a lean
+        request, so the next fetch often shows an idle window. A fetch that
+        failed for another reason says nothing either way, so the judgement
+        waits for the next one.
         """
         if not self._awaiting_confirmation:
             return
-        if reason is not None:
+        if reason == "token_expired":
             self._awaiting_confirmation = False
+            # A run that did not renew the token did not start the window either.
+            self._woken_at = None
             log.warning(
                 "the %s CLI answered, but the next fetch still shows %s",
                 self.provider.cli_executable,
@@ -426,6 +450,36 @@ class SessionNudger:
             self._record_failure()
         elif data.fetch_error is None:
             self._awaiting_confirmation = False
+            self._consecutive_failures = 0
+
+    def _judge_last_wake(self, data: ProviderUsageData, grace_seconds: float) -> None:
+        """Prove that the last successful run started the window, or count a failure.
+
+        A reset time still to come is the proof, and so is any usage: a window
+        in use needs no wake, and its usage falls to 0% only in the next one.
+        The API shows a new window only after a short delay, so a fetch with
+        neither counts against the run only once `grace_seconds` have passed
+        since it ended.
+        """
+        if self._woken_at is None or self._window_ends_at is not None:
+            return
+        window_end = future_reset_time(data)
+        if window_end is not None:
+            self._window_ends_at = window_end
+            self._consecutive_failures = 0
+            return
+        if data.five_hour is not None and data.five_hour.utilization > 0.0:
+            self._woken_at = None
+            self._consecutive_failures = 0
+            return
+        if data.fetch_error is not None or self._clock() - self._woken_at < grace_seconds:
+            return
+        self._woken_at = None
+        log.warning(
+            "the %s CLI answered, but the window shows no reset time",
+            self.provider.cli_executable,
+        )
+        self._record_failure()
 
     def _within_cooldown(self, cooldown_seconds: float) -> bool:
         """Return whether the previous attempt is still too recent to repeat."""
@@ -436,14 +490,13 @@ class SessionNudger:
     def _record_success(self, reason: NudgeReason) -> None:
         """Note a run the CLI answered.
 
-        A wake has started the window, and the clock for leaving it alone starts
-        now, when the run ends: the window started while the run was going.
-        A renewal is judged by the next fetch, which clears the failure count.
+        Every run starts the window, so a fetch must now show its reset time.
+        The wait for it starts when the run ends. A renewal is also judged by
+        the next fetch, which must no longer show an expired token.
         """
-        if reason == "idle_window":
-            self._woken_at = self._clock()
-            self._consecutive_failures = 0
-        else:
+        self._woken_at = self._clock()
+        self._window_ends_at = None
+        if reason == "token_expired":
             self._awaiting_confirmation = True
 
     def _record_failure(self) -> None:

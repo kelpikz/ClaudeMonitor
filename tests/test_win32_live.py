@@ -25,6 +25,7 @@ from claudemonitor.taskbar_companion import companion_slot
 from claudemonitor.win32_bindings import (
     IDC_ARROW,
     NONCLIENTMETRICSW,
+    SHELL32_SIGNATURES,
     SPI_GETNONCLIENTMETRICS,
     USER_DEFAULT_SCREEN_DPI,
     USER32_SIGNATURES,
@@ -56,6 +57,11 @@ def native() -> Win32TaskbarWindow:
 
 class TestSignaturesAcceptTheValuesWePass:
     """A declared argument type that rejects our own constant is a broken binding."""
+
+    def test_every_shell32_function_we_declare_is_exported(self):
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+        assert apply_signatures(shell32, SHELL32_SIGNATURES) == []
 
     def test_the_arrow_cursor_loads_through_the_declared_signature(self):
         user32 = ctypes.WinDLL("user32", use_last_error=True)

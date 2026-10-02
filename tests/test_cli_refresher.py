@@ -19,6 +19,7 @@ from claudemonitor.cli_refresher import (
     RefreshOptions,
     SessionNudger,
     command_line,
+    future_reset_time,
     nudge_reason,
     run_provider_cli,
 )
@@ -45,6 +46,7 @@ def usage(
     utilization: float | None = None,
     resets_at: datetime | None = None,
     fetch_error: str | None = None,
+    fetched_at: datetime = NOW,
 ) -> ProviderUsageData:
     """Build one fetch result, with a 5h window only when a utilization is given."""
     five_hour = (
@@ -52,7 +54,9 @@ def usage(
         if utilization is not None
         else None
     )
-    return ProviderUsageData(five_hour=five_hour, fetch_error=fetch_error, fetched_at=NOW)
+    return ProviderUsageData(
+        five_hour=five_hour, fetch_error=fetch_error, fetched_at=fetched_at
+    )
 
 
 class _CompletedProcess:
@@ -265,6 +269,22 @@ class TestNudgeReason:
     def test_no_provider_specific_predicate_survives(self):
         # Two predicates meant two behaviours to keep in step, and they drifted.
         assert not hasattr(cli_refresher, "needs_codex_nudge")
+
+
+class TestFutureResetTime:
+    def test_a_reset_time_after_the_fetch_is_returned(self):
+        window_end = NOW + timedelta(hours=5)
+
+        assert future_reset_time(usage(utilization=0.0, resets_at=window_end)) == window_end
+
+    def test_a_reset_time_at_or_before_the_fetch_is_not(self):
+        assert future_reset_time(usage(utilization=0.0, resets_at=NOW)) is None
+
+    def test_a_window_with_no_reset_time_has_none(self):
+        assert future_reset_time(usage(utilization=0.0)) is None
+
+    def test_a_fetch_with_no_window_has_none(self):
+        assert future_reset_time(usage(fetch_error="offline")) is None
 
 
 class TestRefreshOptions:
@@ -865,71 +885,132 @@ class TestAManualRun:
         assert ManualRun(CODEX).provider is CODEX
 
 
-class TestAWokenWindowIsLeftAlone:
+class TestAWokenWindowIsLeftAloneUntilItEnds:
     """A lean nudge uses less than 1% of a window, so the API goes on showing
-    0% after it. The window has started all the same. After a successful wake
-    the window is left alone until it has had time to end, and the 0% is not
-    held against the run. Counting it as a failure tripped the breaker after
-    three wakes, and an idle window was then never woken again."""
+    0% after it. The window has started all the same, and the fetch says so with
+    a reset time. The window is left alone until that time. A wake after which
+    the fetch shows no reset time did not start the window, so it counts toward
+    the breaker: a CLI signed in to another account would otherwise run every
+    five hours for ever."""
 
-    FIVE_HOURS = 5 * 60 * 60
-
-    def _nudger(self, elapsed: list[float], succeeded: bool = True):
+    def _nudger(self, elapsed: list[float], succeeded: bool = True, **kwargs):
         invoke, attempts = _answers(succeeded=succeeded)
         nudger = _nudger(
-            invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
+            invoke,
+            RefreshOptions(cooldown_seconds=60),
+            clock=lambda: elapsed[0],
+            **kwargs,
         )
         return nudger, attempts
 
-    def test_a_window_still_at_zero_is_not_woken_again_inside_five_hours(self):
+    def test_a_started_window_at_zero_is_not_woken_again_before_it_ends(self):
         elapsed = [0.0]
         nudger, attempts = self._nudger(elapsed)
 
-        nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+        nudger.maybe_nudge(usage(utilization=0.0))
         for minute in range(1, 300):
             elapsed[0] = minute * 60.0
-            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+            nudger.maybe_nudge(
+                usage(
+                    utilization=0.0,
+                    resets_at=NOW + timedelta(hours=5),
+                    fetched_at=NOW + timedelta(minutes=minute),
+                )
+            )
 
         assert len(attempts) == 1
+        assert nudger.exhausted is False
 
-    def test_the_next_window_is_woken_once_five_hours_have_passed(self):
+    def test_the_next_window_is_woken_once_the_reset_time_has_passed(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
+        window_end = NOW + timedelta(hours=5)
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = 60.0
+        nudger.maybe_nudge(usage(utilization=0.0, resets_at=window_end))
+        elapsed[0] = 5 * 60 * 60.0
+
+        woken = nudger.maybe_nudge(
+            usage(utilization=0.0, fetched_at=window_end + timedelta(seconds=1))
+        )
+
+        assert woken is True
+        assert len(attempts) == 2
+
+    def test_the_fetch_is_given_one_cooldown_to_show_the_reset_time(self):
+        # The API shows a new window only after a short delay.
         elapsed = [0.0]
         nudger, attempts = self._nudger(elapsed)
 
         nudger.maybe_nudge(usage(utilization=0.0))
-        elapsed[0] = self.FIVE_HOURS
+        elapsed[0] = 30.0
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = 50.0
+        nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW + timedelta(hours=5)))
+        elapsed[0] = 120.0
+        nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW + timedelta(hours=5)))
 
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-        assert len(attempts) == 2
+        assert len(attempts) == 1
+        assert nudger.exhausted is False
 
-    def test_the_five_hours_count_from_the_end_of_the_run(self):
-        # The window starts when the request lands, which is during the run.
-        # Counting from its start would wake the old window seconds before it
-        # ends, and then leave the new one idle for five hours.
+    def test_a_wake_that_shows_no_reset_time_stops_after_three_runs(self, caplog):
         elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
 
-        def slow_invoke(_options):
-            elapsed[0] += 30.0
-            return CliReply(succeeded=True)
+        with caplog.at_level(logging.WARNING):
+            for minute in range(10):
+                elapsed[0] = minute * 60.0
+                nudger.maybe_nudge(usage(utilization=0.0))
 
-        nudger = _nudger(
-            slow_invoke, RefreshOptions(cooldown_seconds=60), clock=lambda: elapsed[0]
-        )
+        assert len(attempts) == 3
+        assert nudger.exhausted is True
+        assert "shows no reset time" in caplog.text
+
+    def test_usage_above_zero_proves_the_wake(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed, max_consecutive_failures=1)
 
         nudger.maybe_nudge(usage(utilization=0.0))
-        elapsed[0] = self.FIVE_HOURS + 29.0
+        elapsed[0] = 30.0
+        nudger.maybe_nudge(usage(utilization=2.0))
+        for minute in range(2, 10):
+            elapsed[0] = minute * 60.0
+            nudger.maybe_nudge(usage(utilization=2.0))
 
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is False
+        assert len(attempts) == 1
+        assert nudger.exhausted is False
+
+    def test_a_reset_time_already_passed_does_not_prove_the_wake(self):
+        elapsed = [0.0]
+        nudger, attempts = self._nudger(elapsed)
+
+        nudger.maybe_nudge(usage(utilization=0.0))
+        elapsed[0] = 60.0
+
+        woken = nudger.maybe_nudge(
+            usage(utilization=0.0, resets_at=NOW - timedelta(minutes=1))
+        )
+
+        assert woken is True
+        assert len(attempts) == 2
 
     def test_wakes_that_stay_at_zero_never_trip_the_breaker(self):
         elapsed = [0.0]
         nudger, attempts = self._nudger(elapsed)
 
         for window in range(10):
-            elapsed[0] = window * self.FIVE_HOURS
-            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+            start = NOW + timedelta(hours=5 * window)
+            elapsed[0] = window * 5 * 60 * 60.0
+            nudger.maybe_nudge(usage(utilization=0.0, fetched_at=start))
             elapsed[0] += 60.0
-            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW))
+            nudger.maybe_nudge(
+                usage(
+                    utilization=0.0,
+                    resets_at=start + timedelta(hours=5),
+                    fetched_at=start + timedelta(minutes=1),
+                )
+            )
 
         assert len(attempts) == 10
         assert nudger.exhausted is False
@@ -944,8 +1025,8 @@ class TestAWokenWindowIsLeftAlone:
         assert nudger.maybe_nudge(usage(utilization=0.0)) is True
         assert len(attempts) == 2
 
-    def test_a_successful_wake_clears_earlier_failures(self):
-        outcomes = iter([False, False, True])
+    def test_a_proven_wake_clears_earlier_failures(self):
+        outcomes = iter([False, False, True, False, False])
         elapsed = [0.0]
 
         def invoke(_options):
@@ -957,10 +1038,18 @@ class TestAWokenWindowIsLeftAlone:
         for attempt in range(3):
             elapsed[0] = attempt * 60.0
             nudger.maybe_nudge(usage(utilization=0.0))
+        window_end = NOW + timedelta(hours=5)
+        nudger.maybe_nudge(usage(utilization=0.0, resets_at=window_end))
+        for attempt in range(2):
+            elapsed[0] = 6 * 60 * 60.0 + attempt * 60.0
+            nudger.maybe_nudge(
+                usage(utilization=0.0, fetched_at=window_end + timedelta(minutes=1))
+            )
 
-        assert nudger._consecutive_failures == 0
+        # Two failures after the proven wake, not four in all.
+        assert nudger.exhausted is False
 
-    def test_an_expired_token_is_renewed_even_inside_the_five_hours(self):
+    def test_an_expired_token_is_renewed_even_while_the_window_is_left_alone(self):
         elapsed = [0.0]
         nudger, attempts = self._nudger(elapsed)
 
@@ -1022,6 +1111,30 @@ class TestARenewalTheNextFetchDoesNotConfirm:
 
         assert len(attempts) == 1
         assert nudger.exhausted is False
+
+
+    def test_a_renewal_followed_by_a_window_at_zero_is_a_success(self, caplog):
+        # The renewal is itself a lean request, so the next fetch often shows
+        # 0%. That is an idle window, not an expired token.
+        invoke, _attempts = _answers(succeeded=True)
+        nudger = _nudger(invoke, max_consecutive_failures=1)
+
+        with caplog.at_level(logging.WARNING):
+            nudger.maybe_nudge(usage(fetch_error="token_expired"))
+            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW + timedelta(hours=5)))
+
+        assert nudger.exhausted is False
+        assert "still shows" not in caplog.text
+
+    def test_a_renewal_starts_the_window_so_it_is_not_woken_after(self):
+        invoke, attempts = _answers(succeeded=True)
+        nudger = _nudger(invoke)
+
+        nudger.maybe_nudge(usage(fetch_error="token_expired"))
+        for _ in range(5):
+            nudger.maybe_nudge(usage(utilization=0.0, resets_at=NOW + timedelta(hours=5)))
+
+        assert len(attempts) == 1
 
 
 class TestOneCliRunAtATimePerProvider:

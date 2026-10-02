@@ -71,7 +71,7 @@ from .settings import (
     WINDOW_TITLE,
     parse_number,
 )
-from . import icon_art, win32_text
+from . import icon_art, win32_icon, win32_text
 from .win32_bindings import (
     BM_GETCHECK,
     BM_SETCHECK,
@@ -132,13 +132,7 @@ from .win32_bindings import (
     NMHDR,
     PAINTSTRUCT,
     SETTINGS_CLASS_NAME,
-    ICON_BIG,
-    ICON_RESOURCE_VERSION,
-    ICON_SMALL,
-    SM_CXICON,
     SM_CXSCREEN,
-    SM_CXSMICON,
-    WM_SETICON,
     SM_CYSCREEN,
     SS_LEFT,
     STATIC_CLASS,
@@ -305,10 +299,6 @@ def _dispatch_tab_strip(hwnd: int, message: int, wparam: int, lparam: int) -> in
     return window._tab_strip_proc(hwnd, message, wparam, lparam)
 
 
-# The icon sizes at 96 DPI, for a Windows that will not say.
-_FALLBACK_BIG_ICON_SIZE = 32
-_FALLBACK_SMALL_ICON_SIZE = 16
-
 
 # ----------------------------------------------------------------------- window
 
@@ -455,23 +445,8 @@ class Win32SettingsWindow:
         The class names no icon, so without this Windows draws a blank one in
         the caption, and the taskbar shows python.exe's under `uv run dev`.
         """
-        for which, metric, fallback in (
-            (ICON_BIG, SM_CXICON, _FALLBACK_BIG_ICON_SIZE),
-            (ICON_SMALL, SM_CXSMICON, _FALLBACK_SMALL_ICON_SIZE),
-        ):
-            size = self._user32.GetSystemMetrics(metric) or fallback
-            icon = self._icon_from_png(icon_art.application_icon_png(size), size)
-            if not icon:
-                log.warning("Windows could not make the %spx settings window icon", size)
-                continue
-            self._icons.append(icon)
-            self._user32.SendMessageW(self._handle, WM_SETICON, which, icon)
-
-    def _icon_from_png(self, png: bytes, size: int) -> int:
-        """Ask Windows for an icon made from PNG bytes; 0 if it declines."""
-        data = (ctypes.c_ubyte * len(png)).from_buffer_copy(png)
-        return self._user32.CreateIconFromResourceEx(
-            data, len(png), True, ICON_RESOURCE_VERSION, size, size, 0
+        self._icons = win32_icon.set_window_icons(
+            self._user32, self._handle, icon_art.application_icon_png
         )
 
     def _stack_tab_behind_its_pages(self) -> None:
@@ -1584,8 +1559,7 @@ class Win32SettingsWindow:
         if self._monospace_font:
             self._delete_object(self._monospace_font)
         self._monospace_font = None
-        for icon in self._icons:
-            self._user32.DestroyIcon(icon)
+        win32_icon.destroy_icons(self._user32, self._icons)
         self._icons = []
         self._output_groups = []
         for brush in (
