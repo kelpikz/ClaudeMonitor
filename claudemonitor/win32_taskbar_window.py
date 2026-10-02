@@ -11,28 +11,31 @@ signatures — lives in ``win32_bindings`` so this file describes only behavior.
 from __future__ import annotations
 
 import ctypes
-import functools
 import logging
 import threading
 import time
 from ctypes import wintypes
-from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
-from .models import Rect
+from . import label_art, win32_text
+from .models import LabelSegment, Provider, Rect
+from .win32_dpi import scale_for_dpi
 from .win32_bindings import (
+    AC_SRC_ALPHA,
+    AC_SRC_OVER,
+    ANTIALIASED_QUALITY,
     BI_RGB,
     BITMAPINFO,
     BITMAPINFOHEADER,
+    BLENDFUNCTION,
     CLASS_NAME,
     COMCTL32_SIGNATURES,
     CS_HREDRAW,
     CS_VREDRAW,
     DEFAULT_GUI_FONT,
     DIB_RGB_COLORS,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     DPI_AWARENESS_UNAWARE,
     DT_SINGLELINE,
     DT_VCENTER,
@@ -47,14 +50,10 @@ from .win32_bindings import (
     IDC_ARROW,
     INITCOMMONCONTROLSEX,
     KERNEL32_SIGNATURES,
-    LWA_COLORKEY,
+    LABEL_BITS_PER_PIXEL,
     NONCLIENTMETRICSW,
-    PAINTSTRUCT,
     PM_REMOVE,
     SIZE,
-    SPI_GETNONCLIENTMETRICS,
-    SRCCOPY,
-    STRETCH_HALFTONE,
     SW_HIDE,
     SW_SHOWNOACTIVATE,
     SWP_FRAMECHANGED,
@@ -77,7 +76,7 @@ from .win32_bindings import (
     TTS_ALWAYSTIP,
     TTS_NOPREFIX,
     TRANSPARENT_BACKGROUND,
-    TRANSPARENT_COLORKEY,
+    ULW_ALPHA,
     USER_DEFAULT_SCREEN_DPI,
     USER32_SIGNATURES,
     UXTHEME_SIGNATURES,
@@ -95,6 +94,7 @@ from .win32_bindings import (
     WS_POPUP,
     apply_signatures,
     foreground_color_for_theme,
+    rgb_from_colorref,
     system_uses_light_theme,
 )
 
@@ -111,129 +111,53 @@ _PUMP_POLL_SECONDS = 0.05
 # call, which otherwise crashes with an access violation.
 _registered_wndproc_callbacks: list[object] = []
 
-# The Claude glyph replaces the literal word "Claude" in the label, so it is
-# drawn at the same square size as the tray's own status dot.
+# Each provider's glyph replaces its name in the label, so it is drawn at the
+# same square size as the tray's own status dot. The left inset also spaces
+# one provider's segment from the previous one.
 _ICON_SIZE = 16
 _ICON_LEFT_INSET = 6
 _ICON_TEXT_GAP = 6
 # Breathing room after the text so it does not touch the taskbar's own icons.
 _ICON_CONTENT_RIGHT_PADDING = 8
-_ICON_ASSET_PATH = Path(__file__).parent / "assets" / "claude_icon.png"
+
+# Above the first row and below the last. Windows' own notification icons sit
+# in the middle of the taskbar with room to spare, and a label pressed against
+# both edges reads as a misplaced window rather than as part of the shell.
+_STACK_VERTICAL_PADDING = 6
+
+# Above and below a mark inside its own row. Two providers halve the room each
+# one has, and a mark scaled only by the display filled its share completely.
+# Small enough that the mark still reads at a glance beside its own text.
+_GLYPH_BAND_PADDING = 2
+
+# GDI writes colour but never alpha, so the text is rasterised in white on a
+# cleared surface and the brightness that comes back is read as coverage. The
+# colour the user actually sees is applied afterwards, in label_art.
+_TEXT_COVERAGE_COLOR = 0x00FFFFFF
 _TOOLTIP_MAX_WIDTH = 600
 _TOOLTIP_TASKBAR_GAP = 4
 _TOOLTIP_BACKGROUND_COLOR = 0x002B2B2B
 _TOOLTIP_TEXT_COLOR = 0x00F5F5F5
 
 
-def scale_for_dpi(value: int, dpi: int) -> int:
-    """Convert a constant written for 96 DPI into pixels for a display at ``dpi``."""
-    # GetDpiForWindow answers 0 for a handle Windows no longer recognizes, and
-    # a zero scale factor would collapse the label to nothing.
-    if dpi <= 0:
-        return value
-    return round(value * dpi / USER_DEFAULT_SCREEN_DPI)
+def _segments_title(segments: list[LabelSegment]) -> str:
+    """Flatten the label into the one string Windows keeps as the title.
 
-
-def _user32_for_dpi() -> Any:
-    """Return a user32 handle with the DPI calls' argument types declared.
-
-    This runs before ``Win32TaskbarWindow`` exists, because awareness has to be
-    set before the process creates its first window — so it cannot borrow the
-    adapter's already-prepared DLL. Declaring the signatures matters here more
-    than anywhere else: without them ctypes passes the ``-4`` awareness context
-    as a 32-bit int, and the truncated value silently fails to match any
-    context Windows recognizes.
+    The custom paint ignores it, but Explorer and screen readers only ever
+    see this, so it has to name every provider rather than just the first.
     """
-    dll = ctypes.WinDLL("user32", use_last_error=True)
-    apply_signatures(dll, USER32_SIGNATURES)
-    return dll
-
-
-def enable_per_monitor_dpi_awareness(user32: Any | None = None) -> bool:
-    """Adopt the taskbar's DPI awareness, and report whether per-monitor was won.
-
-    Explorer's taskbar is per-monitor aware. While ClaudeMonitor was unaware,
-    Windows virtualized every coordinate crossing between the two, so a slot
-    requested as 180x48 was applied as 144x38 on a 125% display and the label
-    both mis-sized itself and kept its old scale after moving to a second
-    monitor. Must be called before any window is created.
-    """
-    dll = _user32_for_dpi() if user32 is None else user32
-
-    # SetProcessDpiAwarenessContext is Windows 10 1703 and later. It also fails
-    # when awareness was already established, which is not worth dying over in
-    # the first statement of the program.
-    try:
-        if dll.SetProcessDpiAwarenessContext(
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        ):
-            return True
-    except (AttributeError, OSError) as exc:
-        log.info("per-monitor DPI awareness unavailable (%s); trying system DPI", exc)
-
-    # Older builds offer only one process-wide, system-DPI setting. That still
-    # stops coordinates being virtualized on a single-monitor machine.
-    try:
-        dll.SetProcessDPIAware()
-    except (AttributeError, OSError) as exc:
-        log.warning("unable to declare any DPI awareness (%s)", exc)
-    return False
-
-
-def process_dpi_awareness(user32: Any | None = None) -> int:
-    """Return this process's DPI awareness using the same scale as a window's."""
-    dll = _user32_for_dpi() if user32 is None else user32
-    try:
-        # A thread with no explicit context reports the process default, so the
-        # current thread's context is the process's answer.
-        context = dll.GetThreadDpiAwarenessContext()
-        return dll.GetAwarenessFromDpiAwarenessContext(context)
-    except (AttributeError, OSError):
-        return DPI_AWARENESS_UNAWARE
-
-
-@functools.lru_cache(maxsize=1)
-def _load_claude_icon() -> Image.Image:
-    """Load the bundled Claude glyph once and reuse it for every paint."""
-    return Image.open(_ICON_ASSET_PATH).convert("RGBA")
-
-
-def _icon_bgr_bytes(image: Image.Image) -> bytes:
-    """Pack an RGBA image as the row-padded, top-down 24bpp BGR buffer
-    ``SetDIBitsToDevice`` expects.
-
-    Compositing onto opaque black before dropping the alpha channel means
-    every pixel outside the glyph becomes exactly the window's color-keyed
-    background, so it disappears rather than leaving a dark halo.
-    """
-    canvas = Image.new("RGBA", image.size, (0, 0, 0, 255))
-    opaque = Image.alpha_composite(canvas, image).convert("RGB")
-    red, green, blue = opaque.split()
-    bgr_rows = Image.merge("RGB", (blue, green, red)).tobytes()
-
-    width, _height = image.size
-    row_bytes = width * 3
-    padded_row_bytes = (row_bytes + 3) & ~3
-    if padded_row_bytes == row_bytes:
-        return bgr_rows
-
-    padding = b"\x00" * (padded_row_bytes - row_bytes)
-    rows = (
-        bgr_rows[offset : offset + row_bytes] + padding
-        for offset in range(0, len(bgr_rows), row_bytes)
-    )
-    return b"".join(rows)
+    return "  ".join(segment.text for segment in segments)
 
 
 def _bitmap_info_for(*, width: int, height: int) -> BITMAPINFO:
-    """Describe an uncompressed, top-down 24bpp DIB of the given size."""
+    """Describe the uncompressed, top-down 32bpp surface the label is drawn on."""
     info = BITMAPINFO()
     info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     info.bmiHeader.biWidth = width
-    # Negative height selects top-down row order, matching the PNG's own.
+    # Negative height selects top-down row order, matching Pillow's own.
     info.bmiHeader.biHeight = -height
     info.bmiHeader.biPlanes = 1
-    info.bmiHeader.biBitCount = 24
+    info.bmiHeader.biBitCount = LABEL_BITS_PER_PIXEL
     info.bmiHeader.biCompression = BI_RGB
     return info
 
@@ -284,7 +208,8 @@ class Win32TaskbarWindow:
         self._window_proc_callback = WNDPROC(self._window_proc)
 
         # DrawTextW reads this latest value whenever Windows sends WM_PAINT.
-        self._window_text = ""
+        # One entry per provider shown, drawn left to right.
+        self._segments: list[LabelSegment] = []
 
         # GDI objects are created once per process and shared by every window
         # this adapter registers, so recreating the label never leaks handles.
@@ -300,16 +225,10 @@ class Win32TaskbarWindow:
         # The label whose monitor decides the scale for every measurement. It
         # exists only between create_window and close_window.
         self._label_handle: int | None = None
-        self._background_brush: int | None = None
         self._uses_light_theme = system_uses_light_theme()
         self._foreground_color = foreground_color_for_theme(
             uses_light_theme=self._uses_light_theme
         )
-
-        # The icon's pixel buffer never changes at runtime, so it is packed
-        # once and reused for every WM_PAINT rather than re-composited each time.
-        self._icon_bytes: bytes | None = None
-        self._icon_info: BITMAPINFO | None = None
 
         # Each tooltip control and its backing Unicode buffer must stay alive
         # for as long as the associated taskbar label exists.
@@ -459,10 +378,9 @@ class Win32TaskbarWindow:
 
     def _register_class(self) -> None:
         """Teach Windows how to create and repaint this process's label windows."""
-        self._register_window_class(
-            class_name=CLASS_NAME,
-            background_brush=self._background_brush_handle(),
-        )
+        # No erasing brush: the label's pixels come from one finished bitmap, so
+        # anything Windows painted into the window itself would never be seen.
+        self._register_window_class(class_name=CLASS_NAME, background_brush=None)
 
     def _register_window_class(
         self,
@@ -509,16 +427,6 @@ class Win32TaskbarWindow:
         error = ctypes.get_last_error()
         if error != ERROR_CLASS_ALREADY_EXISTS:
             raise ctypes.WinError(error)
-
-    def _background_brush_handle(self) -> int:
-        """Return the black erasing brush, creating it once for this process.
-
-        After layered transparency is enabled, this same black becomes the
-        transparent color that reveals the taskbar behind the label.
-        """
-        if self._background_brush is None:
-            self._background_brush = self._gdi32.CreateSolidBrush(TRANSPARENT_COLORKEY)
-        return self._background_brush
 
     # --- Styles and placement -------------------------------------------
 
@@ -572,25 +480,19 @@ class Win32TaskbarWindow:
         if previous_value == 0 and ctypes.get_last_error() != 0:
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def set_colorkey_transparency(self, handle: int) -> None:
-        """Make the black background transparent, leaving only painted text."""
+    def enable_per_pixel_alpha(self, handle: int) -> None:
+        """Let the label carry an alpha value for every pixel it draws.
+
+        Nothing else is configured here on purpose. A layered window can either
+        treat one colour as a hole or read an alpha channel, never both, and
+        every soft edge in this label depends on the alpha channel: the marks
+        are thin enough to be almost entirely anti-aliased, and flattening them
+        onto a nominated colour ringed each one in it.
+        """
         # Read the existing extended flags so enabling layered rendering does
         # not erase TOOLWINDOW or NOACTIVATE behavior.
         extended_style = self._user32.GetWindowLongPtrW(handle, GWL_EXSTYLE)
-
-        # Layered-window support is required before SetLayeredWindowAttributes
-        # will accept a transparent color key.
         self._set_window_long(handle, GWL_EXSTYLE, extended_style | WS_EX_LAYERED)
-
-        # SetLayeredWindowAttributes makes every black pixel fully transparent.
-        # Alpha is zero because LWA_COLORKEY uses the color rather than alpha.
-        if not self._user32.SetLayeredWindowAttributes(
-            handle,
-            TRANSPARENT_COLORKEY,
-            0,
-            LWA_COLORKEY,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
 
     def move_window(self, handle: int, rect: Rect, *, topmost: bool) -> None:
         """Move and resize the label without activating or changing visibility."""
@@ -622,14 +524,14 @@ class Win32TaskbarWindow:
 
     # --- Text and painting ----------------------------------------------
 
-    def set_text(self, handle: int, text: str) -> None:
-        """Store replacement text and ask Windows to repaint the label."""
+    def set_segments(self, handle: int, segments: list[LabelSegment]) -> None:
+        """Store what to draw for each provider and ask Windows to repaint."""
         # Keep Python's paint source synchronized with the native window title.
-        self._window_text = text
+        self._segments = list(segments)
 
         # SetWindowTextW updates the native title. It does not guarantee our
         # custom WM_PAINT callback runs immediately, hence InvalidateRect below.
-        if not self._user32.SetWindowTextW(handle, text):
+        if not self._user32.SetWindowTextW(handle, _segments_title(self._segments)):
             raise ctypes.WinError(ctypes.get_last_error())
 
         self._request_repaint(handle)
@@ -719,8 +621,9 @@ class Win32TaskbarWindow:
 
     def _request_repaint(self, handle: int) -> None:
         """Mark the whole label dirty so the next paint redraws it completely."""
-        # The TRUE erase flag clears the old glyphs with the black background
-        # brush registered for this window class.
+        # Every paint replaces the label's bitmap outright, so there is nothing
+        # for Windows to erase first; the flag is passed for the same reason a
+        # window with no background brush still asks for a clean slate.
         self._user32.InvalidateRect(handle, None, True)
 
     def refresh_theme(self, handle: int) -> None:
@@ -766,33 +669,7 @@ class Win32TaskbarWindow:
 
     def _read_font_metrics(self, dpi: int) -> NONCLIENTMETRICSW | None:
         """Read the system UI font metrics as they apply at ``dpi``."""
-        metrics = NONCLIENTMETRICSW()
-        metrics.cbSize = ctypes.sizeof(NONCLIENTMETRICSW)
-
-        # SystemParametersInfoForDpi (Windows 10 1607) is the only variant that
-        # answers for a display other than the one Windows considers primary.
-        try:
-            queried = self._user32.SystemParametersInfoForDpi(
-                SPI_GETNONCLIENTMETRICS,
-                ctypes.sizeof(NONCLIENTMETRICSW),
-                ctypes.byref(metrics),
-                0,
-                dpi,
-            )
-        except (AttributeError, OSError):
-            queried = 0
-
-        # It refuses by returning zero rather than raising, and the stock font
-        # is a visibly different typeface, so an unexplained refusal is worth
-        # one more attempt at the system-wide metrics before giving that up.
-        if not queried:
-            queried = self._user32.SystemParametersInfoW(
-                SPI_GETNONCLIENTMETRICS,
-                ctypes.sizeof(NONCLIENTMETRICSW),
-                ctypes.byref(metrics),
-                0,
-            )
-        return metrics if queried else None
+        return win32_text.read_message_font_metrics(self._user32, dpi)
 
     def message_font(self, dpi: int | None = None) -> int | None:
         """Return the system UI font sized for the display the label is on.
@@ -808,6 +685,10 @@ class Win32TaskbarWindow:
 
         metrics = self._read_font_metrics(dpi)
         if metrics is not None:
+            # ClearType tints each letter's edge to suit one known background
+            # colour, which is exactly the assumption a per-pixel alpha window
+            # cannot make. Grey anti-aliasing composites over anything.
+            metrics.lfMessageFont.lfQuality = ANTIALIASED_QUALITY
             replacement = self._gdi32.CreateFontIndirectW(
                 ctypes.byref(metrics.lfMessageFont)
             )
@@ -840,25 +721,15 @@ class Win32TaskbarWindow:
         self._font_handle = None
 
     def measure_text_width(self, text: str) -> int:
-        """Return the pixel width the message font renders this text at.
+        """Return the pixel width the message font renders this text at."""
+        return win32_text.measure_text_width(self._gdi32, self.message_font(), text)
 
-        A memory device context needs no window of its own, so this can be
-        called before the label exists to size it to its very first text.
-        """
-        device_context = self._gdi32.CreateCompatibleDC(None)
-        try:
-            self._gdi32.SelectObject(device_context, self.message_font())
-            size = SIZE()
-            self._gdi32.GetTextExtentPoint32W(
-                device_context, text, len(text), ctypes.byref(size)
-            )
-            return size.cx
-        finally:
-            self._gdi32.DeleteDC(device_context)
+    def content_width_for(self, segments: list[LabelSegment]) -> int:
+        """Return the label width that fits every segment exactly, so short
+        strings never leave dead space before the notification area.
 
-    def content_width_for(self, text: str) -> int:
-        """Return the label width that fits the icon and this text exactly,
-        so short strings never leave dead space before the notification area.
+        The segments are stacked one per row, so the label is as wide as its
+        widest row rather than as wide as all of them put together.
 
         The text is measured with a font Windows already sized for this
         display, but the insets around it are plain constants and have to be
@@ -866,105 +737,253 @@ class Win32TaskbarWindow:
         """
         dpi = self.label_dpi()
         return (
-            scale_for_dpi(_ICON_LEFT_INSET, dpi)
-            + scale_for_dpi(_ICON_SIZE, dpi)
-            + scale_for_dpi(_ICON_TEXT_GAP, dpi)
-            + self.measure_text_width(text)
+            max((self._segment_width(segment, dpi) for segment in segments), default=0)
             + scale_for_dpi(_ICON_CONTENT_RIGHT_PADDING, dpi)
         )
 
-    def _icon_pixels(self) -> tuple[bytes, BITMAPINFO]:
-        """Return the cached BGR pixel buffer and DIB header for the Claude glyph."""
-        if self._icon_bytes is None or self._icon_info is None:
-            image = _load_claude_icon()
-            self._icon_bytes = _icon_bgr_bytes(image)
-            self._icon_info = _bitmap_info_for(width=image.width, height=image.height)
-        return self._icon_bytes, self._icon_info
+    def _segment_width(self, segment: LabelSegment, dpi: int) -> int:
+        """Return the width one provider's glyph and text occupy together.
 
-    def _draw_icon(
-        self, device_context: int, client_rect: wintypes.RECT, dpi: int
-    ) -> None:
-        """Blit the Claude glyph against the label's left edge, vertically centered.
-
-        The glyph is stretched rather than copied pixel for pixel, because a
-        fixed 16px square shrinks to a speck beside text that Windows has
-        already scaled up for a 125% or 150% display.
+        The left inset belongs to the segment rather than to the label, so
+        every row indents its glyph by the same amount.
         """
-        pixels, bitmap_info = self._icon_pixels()
-        source_size = _load_claude_icon().width
-        drawn_size = scale_for_dpi(_ICON_SIZE, dpi)
-        icon_top = client_rect.top + (
-            (client_rect.bottom - client_rect.top - drawn_size) // 2
+        return (
+            scale_for_dpi(_ICON_LEFT_INSET, dpi)
+            + scale_for_dpi(_ICON_SIZE, dpi)
+            + scale_for_dpi(_ICON_TEXT_GAP, dpi)
+            + self.measure_text_width(segment.text)
         )
 
-        # HALFTONE averages the source pixels instead of dropping them, which
-        # is what keeps the glyph from looking ragged at fractional scales.
-        self._gdi32.SetStretchBltMode(device_context, STRETCH_HALFTONE)
-        self._gdi32.StretchDIBits(
-            device_context,
-            client_rect.left + scale_for_dpi(_ICON_LEFT_INSET, dpi),
-            icon_top,
-            drawn_size,
-            drawn_size,
-            0,
-            0,
-            source_size,
-            source_size,
-            pixels,
-            ctypes.byref(bitmap_info),
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        )
+    def _foreground_rgb(self) -> tuple[int, int, int]:
+        """Return the text colour the active theme calls for, as Pillow wants it."""
+        return rgb_from_colorref(self._foreground_color)
 
-    def _paint_label(self, hwnd: int) -> None:
-        """Draw the Claude glyph and the current usage text in the label's
-        client area, the glyph anchored left and the text left-aligned beside it."""
-        # PAINTSTRUCT receives bookkeeping that must be passed back to EndPaint
-        # after drawing finishes.
-        paint = PAINTSTRUCT()
+    def _text_picture(self, coverage: Image.Image) -> Image.Image:
+        """Paint GDI's text coverage in the colour the active theme calls for."""
+        return label_art.text_layer(coverage, self._foreground_rgb())
 
-        # BeginPaint validates the dirty region and supplies a device
-        # context—the native drawing surface used by GDI.
-        device_context = self._user32.BeginPaint(hwnd, ctypes.byref(paint))
+    def _render_label(self, hwnd: int) -> None:
+        """Compose the label's picture and hand it to Windows to composite.
+
+        A per-pixel alpha window is not drawn through its own device context.
+        Windows is given one finished bitmap and blends it with whatever the
+        taskbar shows behind it, which is what lets a half-covered pixel be
+        half-covered rather than a guess at the colour underneath.
+        """
+        client_rect = wintypes.RECT()
+        self._user32.GetClientRect(hwnd, ctypes.byref(client_rect))
+        width = client_rect.right - client_rect.left
+        height = client_rect.bottom - client_rect.top
+
+        # A label is created 1x1 and only sized once the taskbar has been
+        # measured. Windows accepts no bitmap for an empty rectangle.
+        if width <= 0 or height <= 0:
+            return
+        self._push_layered_bitmap(hwnd, client_rect, width, height)
+
+    def _push_layered_bitmap(
+        self,
+        hwnd: int,
+        client_rect: wintypes.RECT,
+        width: int,
+        height: int,
+    ) -> None:
+        """Draw the label onto a fresh surface and give that surface to Windows.
+
+        Every handle taken here is released before returning. This runs once a
+        second for as long as the machine is on, so one left behind would
+        eventually exhaust the process's GDI quota.
+        """
+        screen_dc = self._user32.GetDC(None)
+        memory_dc = self._gdi32.CreateCompatibleDC(screen_dc)
+        surface = None
         try:
-            # GetClientRect returns the drawable interior using coordinates
-            # relative to the label's own top-left corner.
-            client_rect = wintypes.RECT()
-            self._user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-
-            # The black background is removed by color-key transparency,
-            # allowing the real taskbar to show through both the icon and text.
-            # One DPI reading drives the whole paint, so the glyph and the text
-            # cannot disagree about the scale midway through drawing.
-            dpi = self.label_dpi()
-
-            self._gdi32.SetBkMode(device_context, TRANSPARENT_BACKGROUND)
-            self._gdi32.SetTextColor(device_context, self._foreground_color)
-            self._gdi32.SelectObject(device_context, self.message_font(dpi))
-
-            self._draw_icon(device_context, client_rect, dpi)
-
-            # The text starts right after the icon rather than centering across
-            # the whole remaining width, which otherwise reads as a large gap
-            # between the glyph and short strings like "100% (not started)".
-            text_rect = wintypes.RECT(
-                client_rect.left
-                + scale_for_dpi(_ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP, dpi),
-                client_rect.top,
-                client_rect.right,
-                client_rect.bottom,
+            info = _bitmap_info_for(width=width, height=height)
+            pixels = ctypes.c_void_p()
+            surface = self._gdi32.CreateDIBSection(
+                memory_dc,
+                ctypes.byref(info),
+                DIB_RGB_COLORS,
+                ctypes.byref(pixels),
+                None,
+                0,
             )
-            self._user32.DrawTextW(
-                device_context,
-                self._window_text,
-                -1,
-                ctypes.byref(text_rect),
-                DT_VCENTER | DT_SINGLELINE,
+            if not surface or not pixels:
+                log.warning("Windows refused a %sx%s label surface", width, height)
+                return
+
+            previous = self._gdi32.SelectObject(memory_dc, surface)
+            picture = self._label_image(memory_dc, client_rect, pixels, width, height)
+            ctypes.memmove(
+                pixels,
+                label_art.premultiplied_bgra(picture),
+                width * height * 4,
             )
+            self._composite(hwnd, screen_dc, memory_dc, width, height)
+            self._gdi32.SelectObject(memory_dc, previous)
         finally:
-            # Every successful BeginPaint must be paired with EndPaint so
-            # Windows clears the dirty region and releases the drawing context.
-            self._user32.EndPaint(hwnd, ctypes.byref(paint))
+            if surface:
+                self._gdi32.DeleteObject(surface)
+            self._gdi32.DeleteDC(memory_dc)
+            self._user32.ReleaseDC(None, screen_dc)
+
+    def _label_image(
+        self,
+        memory_dc: int,
+        client_rect: wintypes.RECT,
+        pixels: ctypes.c_void_p,
+        width: int,
+        height: int,
+    ) -> Image.Image:
+        """Rasterise the text with GDI, then build the picture around it.
+
+        GDI is used for the text alone, so the label keeps the system UI font
+        and its measurements. It draws in white on a cleared surface, and the
+        brightness that comes back is read as how much of each pixel the letter
+        covers; the colour a user sees is applied to that coverage afterwards.
+        """
+        byte_count = width * height * 4
+        ctypes.memset(pixels, 0, byte_count)
+
+        # One DPI reading drives the whole paint, so the marks and the text
+        # cannot disagree about the scale midway through drawing.
+        dpi = self.label_dpi()
+        self._gdi32.SetBkMode(memory_dc, TRANSPARENT_BACKGROUND)
+        self._gdi32.SetTextColor(memory_dc, _TEXT_COVERAGE_COLOR)
+        self._gdi32.SelectObject(memory_dc, self.message_font(dpi))
+        glyphs = self._draw_segments(memory_dc, client_rect, dpi)
+
+        # GDI batches its drawing, so the text may not have reached the surface
+        # yet. Reading it back without flushing gives a label that occasionally
+        # shows its marks and nothing else.
+        self._gdi32.GdiFlush()
+
+        rendered = Image.frombuffer(
+            "RGBA",
+            (width, height),
+            ctypes.string_at(pixels, byte_count),
+            "raw",
+            "BGRA",
+            0,
+            1,
+        )
+        coverage = label_art.coverage_mask(rendered)
+        return label_art.compose_label(self._text_picture(coverage), glyphs)
+
+    def _composite(
+        self,
+        hwnd: int,
+        screen_dc: int,
+        memory_dc: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Ask Windows to blend the finished bitmap over whatever is behind it."""
+        size = SIZE(width, height)
+        origin = wintypes.POINT(0, 0)
+        # SourceConstantAlpha is full strength: the picture's own alpha channel
+        # is the only thing that should decide what shows through.
+        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+
+        # The window keeps the position and size SetWindowPos gave it, so no
+        # destination point is passed and only the content is replaced.
+        ctypes.set_last_error(0)
+        if not self._user32.UpdateLayeredWindow(
+            hwnd,
+            screen_dc,
+            None,
+            ctypes.byref(size),
+            memory_dc,
+            ctypes.byref(origin),
+            0,
+            ctypes.byref(blend),
+            ULW_ALPHA,
+        ):
+            log.warning(
+                "Windows refused the label bitmap (%s)", ctypes.get_last_error()
+            )
+
+    def _draw_segments(
+        self,
+        device_context: int,
+        client_rect: wintypes.RECT,
+        dpi: int,
+    ) -> list[tuple[Image.Image, tuple[int, int]]]:
+        """Give each segment a row of its own, and collect the marks to lay over.
+
+        Side by side, two providers made one long strip of numbers that pushed
+        the clock across the taskbar. Stacked, they read as two short lines and
+        the label costs the width of one.
+        """
+        bands = label_art.stacked_bands(
+            client_rect.bottom - client_rect.top,
+            len(self._segments),
+            scale_for_dpi(_STACK_VERTICAL_PADDING, dpi),
+        )
+        placements = []
+        for band, segment in zip(bands, self._segments):
+            placement = self._draw_segment(
+                device_context, client_rect, band, dpi, segment
+            )
+            if placement is not None:
+                placements.append(placement)
+        return placements
+
+    def _draw_segment(
+        self,
+        device_context: int,
+        client_rect: wintypes.RECT,
+        band: tuple[int, int],
+        dpi: int,
+        segment: LabelSegment,
+    ) -> tuple[Image.Image, tuple[int, int]] | None:
+        """Draw one provider's text and say where its mark belongs beside it."""
+        top, bottom = client_rect.top + band[0], client_rect.top + band[1]
+
+        # The text starts right after the mark rather than centering across the
+        # whole remaining width, which otherwise reads as a large gap between
+        # the mark and short strings like "100% (not started)".
+        text_rect = wintypes.RECT(
+            client_rect.left
+            + scale_for_dpi(_ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP, dpi),
+            top,
+            client_rect.right,
+            bottom,
+        )
+        self._user32.DrawTextW(
+            device_context,
+            segment.text,
+            -1,
+            ctypes.byref(text_rect),
+            DT_VCENTER | DT_SINGLELINE,
+        )
+        return self._placed_glyph(
+            segment.provider, client_rect.left, top, bottom, dpi
+        )
+
+    def _placed_glyph(
+        self,
+        provider: Provider,
+        left_edge: int,
+        top: int,
+        bottom: int,
+        dpi: int,
+    ) -> tuple[Image.Image, tuple[int, int]] | None:
+        """Return one provider's mark and where in its row it is centered."""
+        size = label_art.glyph_extent(
+            bottom - top,
+            scale_for_dpi(_ICON_SIZE, dpi),
+            scale_for_dpi(_GLYPH_BAND_PADDING, dpi),
+        )
+        if size <= 0:
+            return None
+        glyph = label_art.taskbar_glyph(
+            provider, size, uses_light_theme=self._uses_light_theme
+        )
+        return glyph, (
+            left_edge + scale_for_dpi(_ICON_LEFT_INSET, dpi),
+            top + ((bottom - top - size) // 2),
+        )
 
     def _poll_tooltip_hover(self) -> None:
         """Open the label tooltip while the cursor is inside its full rectangle."""
@@ -990,7 +1009,7 @@ class Win32TaskbarWindow:
                 continue
 
             # Tracking mode is designed for controls that supply their own
-            # hover detection. It also works in the color-keyed gaps where the
+            # hover detection. It also works in the transparent gaps where the
             # layered label itself never receives ordinary mouse messages.
             label_center = label_rect.left + (label_rect.width // 2)
             position = (
@@ -1068,7 +1087,11 @@ class Win32TaskbarWindow:
     def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
         """Route Windows messages, handling only painting and theme changes."""
         if message == WM_PAINT:
-            self._paint_label(hwnd)
+            self._render_label(hwnd)
+            # The window is not painted through its own device context, so it
+            # is marked clean here. Left invalid, Windows would ask again at
+            # once and the paint would repeat for as long as the label existed.
+            self._user32.ValidateRect(hwnd, None)
             return 0
 
         if message in (WM_SETTINGCHANGE, WM_THEMECHANGED):

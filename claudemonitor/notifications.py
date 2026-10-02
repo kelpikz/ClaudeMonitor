@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import AnthropicUsageData
+from .models import ProviderUsageData
 
 DEFAULT_THRESHOLDS: tuple[int, ...] = (50, 30, 10)
 
@@ -15,7 +15,7 @@ class UsageNotification:
     message: str
 
 
-def _remaining_percent(data: AnthropicUsageData) -> float | None:
+def _remaining_percent(data: ProviderUsageData) -> float | None:
     """Return the fresh 5h percentage remaining, or None when it is unavailable."""
     if data.fetch_error is not None or data.five_hour is None:
         return None
@@ -32,13 +32,22 @@ def _crossed_thresholds(
 
 
 class ThresholdNotifier:
-    """Tracks 5h remaining percentage and emits notifications on downward crossings."""
+    """Tracks 5h remaining percentage and emits notifications on downward crossings.
 
-    def __init__(self, thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS) -> None:
+    One notifier watches one provider, so the pop-up can name whose quota is
+    running out rather than leaving the user to guess.
+    """
+
+    def __init__(
+        self,
+        thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS,
+        provider_label: str = "Claude",
+    ) -> None:
         self._thresholds = thresholds
+        self._provider_label = provider_label
         self._previous_remaining: float | None = None
 
-    def check(self, data: AnthropicUsageData) -> list[UsageNotification]:
+    def check(self, data: ProviderUsageData) -> list[UsageNotification]:
         """Update state from fresh usage data and return any threshold notifications."""
         current = _remaining_percent(data)
         if current is None:
@@ -53,7 +62,7 @@ class ThresholdNotifier:
         rounded_remaining = f"{current:.0f}%"
         return [
             UsageNotification(
-                title=f"Claude usage below {threshold}%",
+                title=f"{self._provider_label} usage below {threshold}%",
                 message=f"5h usage has {rounded_remaining} remaining.",
             )
             for threshold in crossed

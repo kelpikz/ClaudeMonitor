@@ -1,16 +1,24 @@
+"""Drive the one tray icon that speaks for every provider at once.
+
+There used to be an icon per provider. Two icons meant two menus, and every
+app-wide setting had to be given to one of them and withheld from the other.
+One icon, coloured by whichever provider is worst off, replaces both — and the
+settings that once crowded its menu now live in the settings window.
+
+``init()`` must be called before ``apply()``: the status tiles are drawn once
+at startup so a poll only ever swaps an already-rendered image.
+"""
+
 from __future__ import annotations
 
-import os
 import threading
-import webbrowser
-from pathlib import Path
 from typing import Callable
 
 import pystray
 from PIL import Image
 
 from .icon_art import tile_icon
-from .models import DisplayState
+from .models import TrayState
 
 _COLORS: dict[str, tuple[int, int, int]] = {
     "green": (46, 160, 67),
@@ -19,71 +27,66 @@ _COLORS: dict[str, tuple[int, int, int]] = {
     "grey": (130, 130, 130),
 }
 
-_CONSOLE_URL = "https://console.anthropic.com/settings/usage"
-
 # Windows' NOTIFYICONDATAW.szTip is a 128-WCHAR buffer; pystray raises
 # ValueError above that, which would kill the poll thread. Cap below it (leaving
 # room for the ellipsis marker) so an over-long tooltip degrades instead of
 # crashing.
 _MAX_TOOLTIP_LEN = 127
 
+# One tile per status colour, keyed by colour name.
 _icons: dict[str, Image.Image] = {}
 _manual_refresh: threading.Event | None = None
 _shutdown_requested: threading.Event | None = None
-_log_dir: Path | None = None
 _taskbar_visible: Callable[[], bool] | None = None
 _toggle_taskbar: Callable[[], None] | None = None
 _taskbar_healthy: Callable[[], bool] | None = None
-_startup_enabled: Callable[[], bool] | None = None
-_toggle_startup: Callable[[], None] | None = None
-_session_refresh_enabled: Callable[[], bool] | None = None
-_toggle_session_refresh: Callable[[], None] | None = None
+_open_settings: Callable[[], None] | None = None
 
 _TASKBAR_MENU_LABEL = "Show taskbar usage"
 _TASKBAR_UNAVAILABLE_MENU_LABEL = "Show taskbar usage (unavailable — see log)"
-_SESSION_REFRESH_MENU_LABEL = "Auto-refresh Claude session"
+_SETTINGS_MENU_LABEL = "Settings…"
 
 
 def init(
     manual_refresh: threading.Event,
-    log_dir: Path,
     shutdown_requested: threading.Event | None = None,
     taskbar_visible: Callable[[], bool] | None = None,
     toggle_taskbar: Callable[[], None] | None = None,
     taskbar_healthy: Callable[[], bool] | None = None,
-    startup_enabled: Callable[[], bool] | None = None,
-    toggle_startup: Callable[[], None] | None = None,
-    session_refresh_enabled: Callable[[], bool] | None = None,
-    toggle_session_refresh: Callable[[], None] | None = None,
+    open_settings: Callable[[], None] | None = None,
 ) -> None:
     """Prepare tray dependencies, including the event that ends the poll loop."""
-    global _manual_refresh, _shutdown_requested, _log_dir
-    global _taskbar_visible, _toggle_taskbar, _taskbar_healthy
-    global _startup_enabled, _toggle_startup
-    global _session_refresh_enabled, _toggle_session_refresh
+    global _manual_refresh, _shutdown_requested
+    global _taskbar_visible, _toggle_taskbar, _taskbar_healthy, _open_settings
     _manual_refresh = manual_refresh
     _shutdown_requested = shutdown_requested
-    _log_dir = log_dir
     _taskbar_visible = taskbar_visible
     _toggle_taskbar = toggle_taskbar
     _taskbar_healthy = taskbar_healthy
-    _startup_enabled = startup_enabled
-    _toggle_startup = toggle_startup
-    _session_refresh_enabled = session_refresh_enabled
-    _toggle_session_refresh = toggle_session_refresh
+    _open_settings = open_settings
     _build_icons()
 
 
 def loading_icon() -> Image.Image:
+    """Return the grey placeholder tile shown before the first fetch lands."""
     if not _icons:
         raise RuntimeError("tray.init() must be called before loading_icon()")
     return _icons["grey"]
 
 
 def _build_icons() -> None:
-    """Render one status tile per color, once, so each poll only swaps images."""
+    """Render every status tile once, so a poll only swaps images."""
     for name, fill in _COLORS.items():
         _icons[name] = tile_icon(fill)
+
+
+def _tile(color: str) -> Image.Image:
+    """Return one rendered tile, falling back to grey for an unknown colour.
+
+    A colour nobody drew must not raise inside the poll loop; grey at least
+    says the reading cannot be trusted.
+    """
+    return _icons.get(color) or _icons["grey"]
 
 
 def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
@@ -94,10 +97,11 @@ def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
     return text[: limit - 1] + "…"
 
 
-def apply(icon: pystray.Icon, state: DisplayState) -> None:
-    icon.icon = _icons[state.icon_color]
+def apply(icon: pystray.Icon, state: TrayState) -> None:
+    """Show the combined state of every tracked provider on the tray icon."""
+    icon.icon = _tile(state.icon_color)
     icon.title = _truncate_tooltip(state.tooltip)
-    icon.menu = _build_menu(state.menu_status_label)
+    icon.menu = _build_menu(state.status_lines)
 
 
 def notify(icon: pystray.Icon, title: str, message: str) -> None:
@@ -105,26 +109,19 @@ def notify(icon: pystray.Icon, title: str, message: str) -> None:
     icon.notify(message, title=title)
 
 
-def _build_menu(status_label: str) -> pystray.Menu:
+def _build_menu(status_lines: list[str]) -> pystray.Menu:
+    """Build the menu: what every provider is doing, then the few live actions.
+
+    Only what a user reaches for mid-task stays here. Everything else — the
+    other switches, the log folder, the usage pages — is in the settings window,
+    because a menu that scrolls is a menu nobody reads.
+    """
     return pystray.Menu(
-        pystray.MenuItem(status_label, None, enabled=False),
+        *(pystray.MenuItem(line, None, enabled=False) for line in status_lines),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Refresh now", _on_refresh),
-        pystray.MenuItem("Open Anthropic console", _on_open_console),
-        pystray.MenuItem("Open log folder", _on_open_log_folder),
         _taskbar_menu_item(),
-        pystray.MenuItem(
-            _SESSION_REFRESH_MENU_LABEL,
-            _on_toggle_session_refresh,
-            checked=lambda item: bool(
-                _session_refresh_enabled and _session_refresh_enabled()
-            ),
-        ),
-        pystray.MenuItem(
-            "Start with Windows",
-            _on_toggle_startup,
-            checked=lambda item: bool(_startup_enabled and _startup_enabled()),
-        ),
+        pystray.MenuItem(_SETTINGS_MENU_LABEL, _on_open_settings),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _on_quit),
     )
@@ -157,33 +154,16 @@ def _on_refresh(icon: pystray.Icon, item: pystray.MenuItem) -> None:
         _manual_refresh.set()
 
 
-def _on_open_console(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    webbrowser.open(_CONSOLE_URL)
-
-
-def _on_open_log_folder(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    if _log_dir is not None:
-        os.startfile(str(_log_dir))
+def _on_open_settings(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    """Open the settings window, or raise the one already on screen."""
+    if _open_settings is not None:
+        _open_settings()
 
 
 def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
     """Toggle the companion and refresh the menu checkmark."""
     if _toggle_taskbar is not None:
         _toggle_taskbar()
-    icon.update_menu()
-
-
-def _on_toggle_session_refresh(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Toggle the Claude CLI session nudge and refresh the menu checkmark."""
-    if _toggle_session_refresh is not None:
-        _toggle_session_refresh()
-    icon.update_menu()
-
-
-def _on_toggle_startup(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Toggle Windows startup registration and refresh the menu checkmark."""
-    if _toggle_startup is not None:
-        _toggle_startup()
     icon.update_menu()
 
 

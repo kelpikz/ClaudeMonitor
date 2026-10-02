@@ -1,12 +1,20 @@
+"""Tests for the Claude usage fetcher.
+
+The end-to-end path here runs from "bytes the Anthropic endpoint returned" to
+"ProviderUsageData the processor can format". What is asserted is what is
+Claude's own: its credentials file, the URL it asks, and how its body maps onto
+the shared model. Every way the request itself can fail is one ladder shared
+with Codex, and is pinned in ``test_usage_request`` rather than twice over here.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import httpx
 import pytest
 
-from claudemonitor import fetcher
-from claudemonitor.models import AnthropicUsageData
+from claudemonitor import fetcher, usage_request
+from claudemonitor.models import ProviderUsageData
 
 
 class _FakeResponse:
@@ -26,10 +34,7 @@ class _FakeResponse:
         return self._json
 
     def raise_for_status(self):
-        # fetch() returns before this for the status codes it special-cases, so
-        # this only matters for codes we don't map explicitly.
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError("error", request=None, response=None)
+        return None
 
 
 @pytest.fixture
@@ -40,79 +45,97 @@ def fake_token(monkeypatch):
     )
 
 
+def _answers(monkeypatch, response) -> None:
+    """Make the one shared request return a canned response."""
+    monkeypatch.setattr(usage_request.httpx, "get", lambda *a, **k: response)
+
+
 def _fail_if_called(*args, **kwargs):
     raise AssertionError("fetch() must not hit the network with an expired token")
 
 
-def test_429_maps_to_rate_limited(fake_token, monkeypatch):
-    # The whole point of step 1: a 429 must be encoded as "rate_limited" so the
-    # processor can fall back to the last good data instead of going grey.
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(429))
+_USAGE_BODY = {
+    "five_hour": {"utilization": 30.0, "resets_at": "2026-06-20T14:00:00Z"},
+    "seven_day": {"utilization": 10.0, "resets_at": "2026-06-23T14:00:00Z"},
+}
+
+
+# --------------------------------------------------------------------------
+# End-to-end: response bytes -> ProviderUsageData
+# --------------------------------------------------------------------------
+
+
+def test_happy_path_maps_both_windows(fake_token, monkeypatch):
+    _answers(monkeypatch, _FakeResponse(200, _USAGE_BODY))
+
     data = fetcher.fetch()
-    assert isinstance(data, AnthropicUsageData)
-    assert data.fetch_error == "rate_limited"
-    assert data.status_code == 429
-    assert data.five_hour is None
-    assert data.seven_day is None
 
-
-def test_429_check_precedes_generic_http_error(fake_token, monkeypatch):
-    # 429 is >= 400, so without an explicit branch it would fall through to the
-    # generic "offline" mapping. Pin that it does not.
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(429))
-    assert fetcher.fetch().fetch_error == "rate_limited"
-
-
-def test_200_with_windows_has_no_error(fake_token, monkeypatch):
-    body = {
-        "five_hour": {"utilization": 30.0, "resets_at": "2026-06-20T14:00:00Z"},
-        "seven_day": {"utilization": 10.0, "resets_at": "2026-06-23T14:00:00Z"},
-    }
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200, body))
-    data = fetcher.fetch()
+    assert isinstance(data, ProviderUsageData)
     assert data.fetch_error is None
     assert data.status_code == 200
-    assert data.five_hour is not None and data.five_hour.utilization == 30.0
+    assert data.five_hour.utilization == 30.0
+    assert data.seven_day.utilization == 10.0
 
 
-def test_401_records_status_code(fake_token, monkeypatch):
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(401))
+def test_request_targets_the_usage_endpoint_with_auth_headers(fake_token, monkeypatch):
+    captured: dict = {}
+
+    def _capture(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers", {})
+        return _FakeResponse(200, _USAGE_BODY)
+
+    monkeypatch.setattr(usage_request.httpx, "get", _capture)
+
+    fetcher.fetch()
+
+    assert captured["url"] == "https://api.anthropic.com/api/oauth/usage"
+    assert captured["headers"]["Authorization"] == "Bearer test-token"
+    assert captured["headers"]["anthropic-beta"] == "oauth-2025-04-20"
+
+
+def test_a_body_with_no_windows_reports_neither(fake_token, monkeypatch):
+    _answers(monkeypatch, _FakeResponse(200, {}))
+
     data = fetcher.fetch()
+
+    assert data.fetch_error is None
+    assert data.five_hour is None and data.seven_day is None
+
+
+def test_a_refused_session_reaches_the_caller_as_an_expired_token(
+    fake_token, monkeypatch
+):
+    # One rung of the shared ladder, end to end, so the wiring is proven too.
+    _answers(monkeypatch, _FakeResponse(401))
+
+    data = fetcher.fetch()
+
     assert data.fetch_error == "token_expired"
     assert data.status_code == 401
 
 
-def test_429_captures_positive_retry_after_header(fake_token, monkeypatch):
-    response = _FakeResponse(429, headers={"retry-after": "224", "server": "cloudflare"})
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: response)
+def test_too_many_requests_keeps_its_retry_after(fake_token, monkeypatch):
+    _answers(monkeypatch, _FakeResponse(429, headers={"retry-after": "224"}))
+
     data = fetcher.fetch()
+
+    assert data.fetch_error == "rate_limited"
     assert data.retry_after_seconds == 224
 
 
-def test_429_ignores_zero_retry_after_header(fake_token, monkeypatch):
-    response = _FakeResponse(429, headers={"retry-after": "0", "server": "cloudflare"})
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: response)
+def test_wrongly_shaped_window_maps_to_bad_response(fake_token, monkeypatch):
+    _answers(monkeypatch, _FakeResponse(200, {"five_hour": {"utilization": "lots"}}))
+
     data = fetcher.fetch()
-    assert data.retry_after_seconds is None
+
+    assert data.fetch_error == "bad_response"
+    assert data.status_code == 200
 
 
-def test_429_without_retry_after_header_leaves_none(fake_token, monkeypatch):
-    response = _FakeResponse(429, headers={"server": "cloudflare"})
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: response)
-    data = fetcher.fetch()
-    assert data.retry_after_seconds is None
-
-
-def test_parse_retry_after_seconds_handles_variants():
-    class _Headered:
-        def __init__(self, headers):
-            self.headers = headers
-
-    assert fetcher._parse_retry_after_seconds(_Headered({"retry-after": "224"})) == 224
-    assert fetcher._parse_retry_after_seconds(_Headered({"retry-after": "0"})) is None
-    assert fetcher._parse_retry_after_seconds(_Headered({"retry-after": "-5"})) is None
-    assert fetcher._parse_retry_after_seconds(_Headered({"retry-after": "abc"})) is None
-    assert fetcher._parse_retry_after_seconds(_Headered({})) is None
+# --------------------------------------------------------------------------
+# End-to-end: credential problems
+# --------------------------------------------------------------------------
 
 
 def test_expired_token_skips_network_request(monkeypatch):
@@ -122,7 +145,7 @@ def test_expired_token_skips_network_request(monkeypatch):
         "_read_credentials",
         lambda: fetcher.Credentials("test-token", expired_at),
     )
-    monkeypatch.setattr(fetcher.httpx, "get", _fail_if_called)
+    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
 
     data = fetcher.fetch()
 
@@ -137,15 +160,27 @@ def test_unexpired_token_makes_network_request(monkeypatch):
         "_read_credentials",
         lambda: fetcher.Credentials("test-token", expires_at),
     )
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200))
+    _answers(monkeypatch, _FakeResponse(200, _USAGE_BODY))
 
     assert fetcher.fetch().status_code == 200
 
 
 def test_missing_expiry_still_makes_network_request(fake_token, monkeypatch):
-    monkeypatch.setattr(fetcher.httpx, "get", lambda *a, **k: _FakeResponse(200))
+    _answers(monkeypatch, _FakeResponse(200, _USAGE_BODY))
 
     assert fetcher.fetch().status_code == 200
+
+
+def test_a_missing_credentials_file_maps_to_no_credentials(monkeypatch, tmp_path):
+    monkeypatch.setattr(fetcher, "_CREDENTIALS_FILE", tmp_path / ".credentials.json")
+    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
+
+    assert fetcher.fetch().fetch_error == "no_credentials"
+
+
+# --------------------------------------------------------------------------
+# Units
+# --------------------------------------------------------------------------
 
 
 def test_credentials_parse_reads_token_and_expiry():
@@ -172,3 +207,54 @@ def test_credentials_parse_tolerates_missing_expiry():
 
     assert creds.access_token == "tok"
     assert creds.expires_at is None
+
+
+def test_usage_windows_reads_both_windows():
+    five_hour, seven_day = fetcher._usage_windows(_USAGE_BODY)
+
+    assert five_hour.utilization == 30.0
+    assert seven_day.utilization == 10.0
+
+
+def test_usage_windows_of_an_empty_body_is_a_pair_of_nothing():
+    assert fetcher._usage_windows({}) == (None, None)
+
+
+def test_usage_windows_raises_on_a_window_it_cannot_read():
+    # The shared request turns this into bad_response rather than a number.
+    with pytest.raises(Exception):
+        fetcher._usage_windows({"five_hour": {"utilization": "lots"}})
+
+
+def test_the_endpoint_is_built_from_the_credentials(monkeypatch):
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    monkeypatch.setattr(
+        fetcher, "_read_credentials", lambda: fetcher.Credentials("tok", expires_at)
+    )
+
+    endpoint = fetcher._endpoint()
+
+    assert endpoint.url == "https://api.anthropic.com/api/oauth/usage"
+    assert endpoint.headers["Authorization"] == "Bearer tok"
+    assert endpoint.expires_at == expires_at
+
+
+class TestTheDefaultModel:
+    """The nudge runs with --setting-sources=, so ~/.claude/settings.json is not
+    read and its model is not used. Only ANTHROPIC_MODEL still reaches Claude
+    Code; without it, the model is chosen by Claude Code and cannot be known."""
+
+    def test_anthropic_model_is_the_default(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+
+        assert fetcher.default_model() == "claude-sonnet-5"
+
+    def test_without_it_the_default_cannot_be_named(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+
+        assert fetcher.default_model() == ""
+
+    def test_a_blank_value_names_none(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_MODEL", "  ")
+
+        assert fetcher.default_model() == ""

@@ -3,10 +3,9 @@ from tempfile import TemporaryDirectory
 
 import PyInstaller.__main__
 
-from claudemonitor.icon_art import tile_icon
+from claudemonitor.icon_art import application_icon
 
 
-_APPLICATION_ICON_COLOR = (46, 160, 67)
 _APPLICATION_ICON_SIZES = [
     (16, 16),
     (24, 24),
@@ -30,7 +29,7 @@ _UNUSED_PILLOW_MODULES = (
 def _write_application_icon(path: Path) -> None:
     """Render the ClaudeMonitor artwork as a multi-size Windows icon."""
     largest_size = max(width for width, _height in _APPLICATION_ICON_SIZES)
-    tile_icon(_APPLICATION_ICON_COLOR, size=largest_size).save(
+    application_icon(largest_size).save(
         path,
         format="ICO",
         sizes=_APPLICATION_ICON_SIZES,
