@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 claudemonitor/
-  main.py                 — entry point; logging setup, single-instance mutex, poll loop, wires everything together
+  main.py                 — entry point; logging setup, single-instance mutex, wires everything together
+  poll_cycle.py           — the poll loop: one ProviderPoller per provider, and the PollCycle that polls
+                            the tracked ones and shows them; neither a fetch nor a display error ends it
   usage_request.py        — the one HTTP usage request both providers make, and the single ladder of
                             ways it fails; nothing raises across this boundary
   fetcher.py              — what is Claude's own: its credentials file, its URL, its body shape,
@@ -16,7 +18,7 @@ claudemonitor/
   processor.py            — pure functions: ProviderUsageData -> DisplayState, plus the combining of
                             those states into one TrayState and one TaskbarLabel; owns all formatting,
                             including the one row per FetchError that every surface reads
-  tray.py                 — drives the one pystray icon; init() must be called before apply()
+  tray.py                 — TrayPresenter drives the one pystray icon; it gets all its actions when built
   icon_art.py             — pure Pillow drawing of the tray status tiles and the application icon
                             (the exe's and the settings window's; no pystray, no Windows state)
   label_art.py            — pure Pillow composition of the taskbar label's bitmap: which mark a
