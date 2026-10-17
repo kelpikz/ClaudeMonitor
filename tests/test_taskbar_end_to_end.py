@@ -113,7 +113,7 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     # Freeze the clock so reset countdowns are deterministic.
     state = processor.getDataToDisplay(data, NOW, Config(), CLAUDE)
 
-    main._apply_display(_StubPresenter(), None, [state], companion)
+    main.TrayAndTaskbarDisplay(_StubPresenter(), None, companion).apply([state])
 
     companion._run()
     # Every response case below proves the tray's processed detail reaches the
@@ -246,7 +246,7 @@ class TestBothProvidersOnOneLabel:
 
         native = _RecordingNativeWindow()
         companion = TaskbarCompanion(native=native)
-        main._apply_display(_StubPresenter(), None, states, companion)
+        main.TrayAndTaskbarDisplay(_StubPresenter(), None, companion).apply(states)
         companion._run()
 
         label = processor.taskbar_label(states)

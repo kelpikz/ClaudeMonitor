@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from claudemonitor import cli_refresher, codex_fetcher, main, usage_request
+from claudemonitor import cli_refresher, codex_fetcher, main, poll_cycle, usage_request
 from claudemonitor.config import CodexConfig, Config, ConfigSetting
 from claudemonitor.models import CLAUDE, CODEX, ProviderUsageData
 from claudemonitor.settings import PendingSettings
@@ -136,7 +136,7 @@ class _CodexApp:
         self.nudger, self.manual_run = main.create_cli_runners(
             CODEX, self.config, self.woken, start_background=lambda work: work()
         )
-        self.poller = main.ProviderPoller(CODEX, self.config, self.nudger)
+        self.poller = poll_cycle.ProviderPoller(CODEX, self.config, self.nudger)
         self.clipboard: list[str] = []
         self.changes: list[str] = []
         self.settings = main.build_settings_model(
@@ -413,7 +413,7 @@ class TestAnExpiredClaudeToken:
         )
 
         with caplog.at_level(logging.INFO):
-            main.ProviderPoller(provider, config, nudger).poll()
+            poll_cycle.ProviderPoller(provider, config, nudger).poll()
 
         assert "claude CLI answered" in caplog.text
         assert "1003 tokens in, 4 out" in caplog.text

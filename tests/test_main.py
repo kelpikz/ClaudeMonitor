@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from pathlib import Path
 
-from claudemonitor import cli_refresher, codex_fetcher, main, usage_request
+from claudemonitor import cli_refresher, codex_fetcher, main, poll_cycle, usage_request
 from claudemonitor.cli_refresher import RefreshOptions
 from claudemonitor.config import (
     CLAUDE_SETTINGS,
@@ -42,13 +42,6 @@ def saved_settings(monkeypatch) -> list[tuple[ConfigSetting, object]]:
 def _saved_values(written, setting: ConfigSetting) -> list[object]:
     """Return what one setting was asked to write, in order."""
     return [value for saved, value in written if saved == setting]
-
-
-class _TrackedPoller:
-    """A poller that is only ever asked which provider it is for."""
-
-    def __init__(self, provider):
-        self.provider = provider
 
 
 class _FakeEvent:
@@ -155,7 +148,7 @@ class TestApplyDisplay:
         companion = _FakeCompanion()
         presenter = _RecordingPresenter()
 
-        main._apply_display(presenter, icon, states, companion)
+        main.TrayAndTaskbarDisplay(presenter, icon, companion).apply(states)
 
         return icon, companion, presenter.applied
 
@@ -369,71 +362,6 @@ def test_ctrl_c_requests_shutdown_wakes_poll_and_stops_tray_icon():
     assert icon.stop_calls == 1
 
 
-def test_poll_interval_doubles_after_rate_limit():
-    data = ProviderUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
-
-
-def test_poll_interval_backoff_is_capped():
-    data = ProviderUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-    )
-
-    assert main._next_poll_interval_seconds(400, data, baseline_seconds=60) == 600
-    assert main._next_poll_interval_seconds(600, data, baseline_seconds=60) == 600
-
-
-def test_poll_interval_honors_retry_after_on_rate_limit():
-    data = ProviderUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=224,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 224
-
-
-def test_poll_interval_retry_after_is_floored_at_baseline():
-    data = ProviderUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=30,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_decreases_by_five_seconds_after_success():
-    data = ProviderUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 85
-
-
-def test_poll_interval_clamps_to_baseline_when_less_than_step_above_it():
-    data = ProviderUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(63, data, baseline_seconds=60) == 60
-
-
-def test_poll_interval_stays_same_after_non_rate_limit_error():
-    data = ProviderUsageData(
-        fetch_error="token_expired",
-        fetched_at=NOW,
-        status_code=401,
-    )
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
-
-
 # ===========================================================================
 # Wiring the second provider.
 # ===========================================================================
@@ -447,7 +375,7 @@ class TestTrackingOneProvider:
 
         main._set_tracking(CODEX, config, lambda: None, False)
 
-        assert main._is_tracked(CODEX, config) is False
+        assert poll_cycle.is_tracked(CODEX, config) is False
         assert _saved_values(saved_settings, CODEX_SETTINGS.tracking) == [False]
 
     def test_switching_it_off_wakes_the_poll_loop(self, saved_settings):
@@ -459,101 +387,6 @@ class TestTrackingOneProvider:
         main._set_tracking(CODEX, Config(), woken.set, False)
 
         assert woken.is_set()
-
-
-class TestActiveProviders:
-    """The poll loop only works on providers the user is actually tracking."""
-
-    def test_only_claude_is_polled_by_default(self):
-        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
-
-        assert main._active_pollers([claude, codex], Config()) == [claude]
-
-    def test_both_providers_are_polled_when_codex_is_on(self):
-        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
-        config = Config(codex=CodexConfig(enabled=True))
-
-        assert main._active_pollers([claude, codex], config) == [claude, codex]
-
-    def test_claude_is_dropped_when_switched_off(self):
-        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
-
-        config = Config(codex=CodexConfig(enabled=True))
-        CLAUDE_SETTINGS.tracking.write(config, False)
-
-        assert main._active_pollers([claude, codex], config) == [codex]
-
-    def test_nothing_is_polled_when_both_are_switched_off(self):
-        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
-
-        config = Config()
-        CLAUDE_SETTINGS.tracking.write(config, False)
-        CODEX_SETTINGS.tracking.write(config, False)
-
-        assert main._active_pollers([claude, codex], config) == []
-
-
-class TestSharedPollInterval:
-    """One loop serves both providers, so the slower of the two sets the pace."""
-
-    def test_the_longer_interval_wins(self):
-        assert main._shared_poll_interval([60, 240]) == 240
-
-    def test_no_providers_falls_back_to_a_safe_default(self):
-        assert main._shared_poll_interval([]) > 0
-
-
-class TestProviderFailureIsolation:
-    """One provider misbehaving must never blank the other one's numbers."""
-
-    class _Poller:
-        def __init__(self, provider, *, raises: Exception | None = None):
-            self.provider = provider
-            self._raises = raises
-            self.polls = 0
-
-        def poll(self):
-            self.polls += 1
-            if self._raises is not None:
-                raise self._raises
-            return ["notification"]
-
-        def display(self, now):
-            if self._raises is not None:
-                raise self._raises
-            return main.processor.DisplayState(
-                provider=self.provider,
-                icon_color="green",
-                tooltip="fine",
-                menu_status_label="Updated 0s ago",
-                taskbar_text="80%",
-                tray_text="80%",
-            )
-
-    def test_a_failing_poll_returns_no_notifications(self, caplog):
-        poller = self._Poller(CODEX, raises=RuntimeError("boom"))
-
-        with caplog.at_level(logging.ERROR):
-            assert main._poll_provider(poller) == []
-
-        assert "Codex" in caplog.text
-
-    def test_a_failing_display_still_yields_a_state_for_that_provider(self, caplog):
-        poller = self._Poller(CODEX, raises=RuntimeError("boom"))
-
-        with caplog.at_level(logging.ERROR):
-            state = main._provider_display(poller, NOW)
-
-        assert state.provider is CODEX
-        assert state.icon_color == "grey"
-
-    def test_one_broken_provider_leaves_the_other_intact(self):
-        healthy = self._Poller(CLAUDE)
-        broken = self._Poller(CODEX, raises=RuntimeError("boom"))
-
-        states = [main._provider_display(p, NOW) for p in (healthy, broken)]
-
-        assert [s.icon_color for s in states] == ["green", "grey"]
 
 
 # ===========================================================================
@@ -646,7 +479,7 @@ class TestIdleCodexWindowWakesTheCli:
             threading.Event(),
             start_background=lambda work: work(),
         )
-        return main.ProviderPoller(CODEX, config, nudger), cli
+        return poll_cycle.ProviderPoller(CODEX, config, nudger), cli
 
     def _poll(self, monkeypatch, body: dict) -> list[list[str]]:
         """Run one production Codex poll over a canned body; return the argv run."""
@@ -737,7 +570,7 @@ class TestSettingsWiring:
         assert codex.is_on() is False
         codex.write(True)
 
-        assert main._is_tracked(CODEX, fields["config"]) is True
+        assert poll_cycle.is_tracked(CODEX, fields["config"]) is True
 
     def test_a_providers_switch_asks_for_a_fresh_poll(self):
         woken = threading.Event()
