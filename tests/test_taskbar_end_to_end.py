@@ -113,7 +113,7 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     companion = TaskbarCompanion(native=native)
     data = fetcher.fetch()
     # Freeze the clock so reset countdowns are deterministic.
-    state = processor.process(data, NOW, Config(), CLAUDE)
+    state = processor.getDataToDisplay(data, NOW, Config(), CLAUDE)
 
     monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
     main._apply_display({"claude": _StubIcon()}, [state], companion)
@@ -243,8 +243,8 @@ class TestBothProvidersOnOneLabel:
         codex_data = codex_fetcher.fetch()
 
         states = [
-            processor.process(claude_data, NOW, Config(), CLAUDE),
-            processor.process(codex_data, NOW, Config(), CODEX),
+            processor.getDataToDisplay(claude_data, NOW, Config(), CLAUDE),
+            processor.getDataToDisplay(codex_data, NOW, Config(), CODEX),
         ]
 
         native = _RecordingNativeWindow()

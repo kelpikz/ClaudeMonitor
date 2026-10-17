@@ -568,7 +568,7 @@ class ProviderPoller:
         nudge runs on its own thread, so the breaker can trip mid-wait and
         the tooltip should say so without waiting for the next fetch.
         """
-        return processor.process(
+        return processor.getDataToDisplay(
             self._latest,
             now,
             self._config,
