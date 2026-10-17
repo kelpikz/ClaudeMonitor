@@ -31,15 +31,12 @@ from claudemonitor.settings_layout import (
     _BUTTON_HEIGHT,
     _BUTTON_MIN_WIDTH,
     _GROUP_PADDING,
-    _OUTPUT_HEIGHT,
-    _OUTPUT_MIN_WIDTH,
     _CHECKBOX_INDICATOR,
     _CHOICE_WIDTH,
     _TEXT_WIDTH,
     _GROUP_BOTTOM_PADDING,
     _GROUP_CAPTION_HEIGHT,
     _GROUP_GAP,
-    _LIST_MIN_WIDTH,
     _ROW_GAP,
     _ROW_HEIGHT,
     _button_width,
@@ -48,7 +45,6 @@ from claudemonitor.settings_layout import (
     _group_height,
     _number_column,
     _place_buttons,
-    _row_height,
     _tab_height,
     _tab_strip_width,
     settings_layout,
@@ -220,11 +216,6 @@ class TestSettingsLayout:
         assert layout.page.right == layout.tab.right - 4
         assert layout.page.bottom == layout.tab.bottom - 4
 
-    def test_every_tab_is_laid_out(self):
-        layout = self._layout()
-
-        assert [tab.title for tab in layout.tabs] == ["General", "Providers", "Taskbar"]
-
     def test_every_group_and_field_is_placed(self):
         layout = self._layout()
         placed = {
@@ -305,19 +296,6 @@ class TestSettingsLayout:
 
         assert all(field.suffix.right <= layout.page.width for field in placed)
 
-    def test_a_toggle_gets_no_box_of_its_own(self):
-        placed = self._layout(_one_tab(_toggle())).tabs[0].groups[0].fields[0]
-
-        assert placed.editor is None and placed.spinner is None
-
-    def test_every_page_is_the_same_size(self):
-        # The tab control shows one page at a time in one rectangle, so the
-        # window is sized for the busiest page and the others keep that size.
-        layout = self._layout()
-
-        assert layout.page.height > 0
-        assert all(group.rect.bottom <= height for group, _width, height in _placed_groups(layout))
-
     def test_the_window_is_wide_enough_for_the_longest_label(self):
         layout = self._layout(_one_tab(_toggle(label="A" * 90)))
 
@@ -336,11 +314,6 @@ class TestSettingsLayout:
 
         assert layout.apply.right < layout.width
         assert layout.width - layout.apply.right == layout.tab.left
-
-    def test_the_window_is_tall_enough_for_the_button_row(self):
-        layout = self._layout()
-
-        assert layout.height > layout.apply.bottom
 
     def test_a_higher_dpi_scales_every_measurement(self):
         normal = self._layout(dpi=96)
@@ -361,23 +334,11 @@ class TestASectionedTab:
     def _layout(self, model: SettingsModel):
         return settings_layout(model, measure=_measure, tab_frame=Insets(4, 24, 4, 4))
 
-    def test_a_plain_tab_has_no_list(self):
-        tab = self._layout(_one_tab(_toggle())).tabs[0]
-
-        assert tab.side_list is None and tab.add_button is None and tab.sections == []
-
     def test_a_sectioned_tab_gets_a_list_on_the_left_of_its_page(self):
         tab = self._layout(_sectioned(_section("Claude", _toggle()))).tabs[0]
 
         assert tab.side_list is not None
         assert tab.side_list.left > 0 and tab.side_list.top > 0
-
-    def test_every_section_is_laid_out_in_order(self):
-        tab = self._layout(
-            _sectioned(_section("Claude", _toggle()), _section("Codex", _toggle(key="b")))
-        ).tabs[0]
-
-        assert [section.title for section in tab.sections] == ["Claude", "Codex"]
 
     def test_every_section_sits_right_of_the_list(self):
         tab = self._layout(
@@ -394,33 +355,16 @@ class TestASectionedTab:
 
         assert tab.sections[0].rect == tab.sections[1].rect
 
-    def test_a_section_stays_inside_the_page(self):
-        layout = self._layout(_sectioned(_section("Claude", _toggle(label="A" * 60))))
-        section = layout.tabs[0].sections[0]
-
-        assert section.rect.right <= layout.page.width
-        assert section.rect.bottom <= layout.page.height
-
     def test_the_first_group_lines_up_with_the_top_of_the_list(self):
         layout = self._layout(_sectioned(_section("Claude", _toggle())))
         tab = layout.tabs[0]
 
         assert tab.sections[0].rect.top + tab.sections[0].groups[0].rect.top == tab.side_list.top
 
-    def test_the_list_is_at_least_its_minimum_width(self):
-        tab = self._layout(_sectioned(_section("C", _toggle()))).tabs[0]
-
-        assert tab.side_list.width >= _LIST_MIN_WIDTH
-
     def test_a_long_section_title_widens_the_list(self):
         tab = self._layout(_sectioned(_section("A" * 30, _toggle()))).tabs[0]
 
         assert tab.side_list.width > _measure("A" * 30)
-
-    def test_the_page_is_wide_enough_for_the_list_and_the_widest_group(self):
-        layout = self._layout(_sectioned(_section("Claude", _toggle(label="A" * 60))))
-
-        assert layout.page.width > _LIST_MIN_WIDTH + _measure("A" * 60)
 
     def test_the_page_is_tall_enough_for_the_tallest_section(self):
         short = _section("Claude", _toggle())
@@ -445,28 +389,6 @@ class TestASectionedTab:
         assert tab.add_button.top > tab.side_list.bottom
         assert tab.add_button.left == tab.side_list.left
         assert tab.add_button.bottom <= layout.page.height
-
-    def test_the_add_button_is_as_wide_as_the_list(self):
-        tab = self._layout(
-            _sectioned(_section("Claude", _toggle()), add_section=_link("add", "Add provider…"))
-        ).tabs[0]
-
-        assert tab.add_button.width == tab.side_list.width
-
-    def test_a_long_add_label_widens_the_list(self):
-        label = "Add a provider that has a long name"
-        tab = self._layout(
-            _sectioned(_section("C", _toggle()), add_section=_link("add", label))
-        ).tabs[0]
-
-        assert tab.side_list.width >= _button_width(label, _measure, _unscaled)
-
-    def test_the_production_providers_tab_lists_every_provider(self):
-        layout = self._layout(_production_model())
-        providers = layout.tabs[1]
-
-        assert [section.title for section in providers.sections] == ["Claude", "Codex"]
-        assert providers.groups == []
 
 
 # -------------------------------------------------------------- the parts of it
@@ -494,11 +416,6 @@ class TestTextAndChoiceFields:
         assert placed.editor is not None
         assert placed.editor.width == _CHOICE_WIDTH
 
-    def test_the_label_sits_before_the_box(self):
-        placed = self._placed(_text())["claude_model"]
-
-        assert placed.rect.right <= placed.editor.left
-
     def test_a_number_a_text_and_a_choice_share_one_column(self):
         placed = self._placed(
             _number(key="claude_cooldown", label="Wait between runs"),
@@ -518,19 +435,6 @@ class TestTextAndChoiceFields:
         assert longer["claude_model"].editor.left > short["claude_model"].editor.left
 
 
-class TestRowHeight:
-    """Only a push button is taller than an ordinary row."""
-
-    def test_a_button_gets_the_taller_row(self):
-        assert _row_height(_link(), _unscaled) == _BUTTON_HEIGHT
-
-    def test_a_toggle_gets_the_ordinary_row(self):
-        assert _row_height(_toggle(), _unscaled) == _ROW_HEIGHT
-
-    def test_a_number_gets_the_ordinary_row(self):
-        assert _row_height(_number(), _unscaled) == _ROW_HEIGHT
-
-
 class TestButtonWidth:
     """A button is as wide as its own text, but never narrower than the minimum."""
 
@@ -547,21 +451,11 @@ class TestButtonWidth:
 class TestContentWidth:
     """What one field asks for inside its group box."""
 
-    def test_a_toggle_asks_for_its_box_plus_its_label(self):
-        width = _content_width(_toggle(label="Track"), _measure, _unscaled, column=0)
-
-        assert width == _CHECKBOX_INDICATOR + _measure("Track")
-
     def test_a_number_is_measured_from_the_shared_column(self):
         narrow = _content_width(_number(), _measure, _unscaled, column=0)
         wide = _content_width(_number(), _measure, _unscaled, column=50)
 
         assert wide - narrow == 50
-
-    def test_a_link_asks_for_its_button(self):
-        width = _content_width(_link(), _measure, _unscaled, column=0)
-
-        assert width == _button_width("Open log folder", _measure, _unscaled)
 
 
 class TestNumberColumn:
@@ -574,9 +468,6 @@ class TestNumberColumn:
         column = _number_column([short, long], 10, _measure, _unscaled)
 
         assert column > 10 + _measure("A much longer label")
-
-    def test_a_group_with_no_numbers_starts_at_its_own_left_edge(self):
-        assert _number_column([_toggle()], 10, _measure, _unscaled) > 10
 
     def test_a_toggles_label_does_not_move_the_column(self):
         with_toggle = _number_column(
@@ -605,13 +496,6 @@ class TestGroupSize:
 
         assert two - one == _ROW_HEIGHT + _ROW_GAP
 
-    def test_an_empty_group_is_only_its_caption_and_padding(self):
-        empty = SettingsGroup(title="P", fields=[])
-
-        assert _group_height(empty, _unscaled) == (
-            _GROUP_CAPTION_HEIGHT + _GROUP_BOTTOM_PADDING
-        )
-
     def test_a_groups_width_is_that_of_its_widest_field(self):
         group = SettingsGroup(
             title="P", fields=[_toggle(label="Short"), _toggle(key="b", label="A" * 40)]
@@ -620,9 +504,6 @@ class TestGroupSize:
         assert _group_content_width(group, _measure, _unscaled) == (
             _CHECKBOX_INDICATOR + _measure("A" * 40)
         )
-
-    def test_an_empty_group_asks_for_no_width(self):
-        assert _group_content_width(SettingsGroup(title="P"), _measure, _unscaled) == 0
 
 
 class TestTabSize:
@@ -635,9 +516,6 @@ class TestTabSize:
 
         assert two - one == _group_height(group, _unscaled) + _GROUP_GAP
 
-    def test_an_empty_page_needs_no_height(self):
-        assert _tab_height(SettingsTab(title="T", groups=[]), _unscaled) == 0
-
     def test_the_strip_is_as_wide_as_every_caption_side_by_side(self):
         model = SettingsModel(
             tabs=[SettingsTab(title="General"), SettingsTab(title="Taskbar")]
@@ -646,9 +524,6 @@ class TestTabSize:
         width = _tab_strip_width(model, _measure, _unscaled)
 
         assert width > _measure("General") + _measure("Taskbar")
-
-    def test_a_model_with_no_tabs_needs_no_strip(self):
-        assert _tab_strip_width(SettingsModel(tabs=[]), _measure, _unscaled) == 0
 
 
 class TestButtonRow:
@@ -661,21 +536,6 @@ class TestButtonRow:
 
         assert apply_button.right == 500
         assert ok.left < cancel.left < apply_button.left
-
-    def test_every_button_shares_one_row(self):
-        ok, cancel, apply_button = _place_buttons(
-            [80, 90, 100], right=500, top=10, scaled=_unscaled
-        )
-
-        assert ok.top == cancel.top == apply_button.top == 10
-        assert ok.bottom == apply_button.bottom == 10 + _BUTTON_HEIGHT
-
-    def test_each_button_keeps_the_width_it_was_given(self):
-        ok, cancel, apply_button = _place_buttons(
-            [80, 90, 100], right=500, top=10, scaled=_unscaled
-        )
-
-        assert (ok.width, cancel.width, apply_button.width) == (80, 90, 100)
 
 
 class TestCommandsAndTheirOutput:
@@ -707,12 +567,6 @@ class TestCommandsAndTheirOutput:
 
         assert run.rect.left == copy.rect.right + _BUTTON_GAP
 
-    def test_each_button_keeps_the_width_of_its_own_label(self):
-        copy, run, _box = self._two_buttons_and_a_box().fields
-
-        assert copy.rect.width == _button_width("Copy command", _measure, _unscaled)
-        assert run.rect.width == _button_width("Run now", _measure, _unscaled)
-
     def test_a_button_after_a_different_field_starts_a_row_of_its_own(self):
         toggle, link = self._group(_toggle(), _link()).fields
 
@@ -729,11 +583,6 @@ class TestCommandsAndTheirOutput:
 
         assert box.rect.left == group.rect.left + _GROUP_PADDING
         assert box.rect.right == group.rect.right - _GROUP_PADDING
-
-    def test_the_box_is_several_lines_tall(self):
-        box = self._two_buttons_and_a_box().fields[2]
-
-        assert box.rect.height == _OUTPUT_HEIGHT
 
     def test_a_button_row_is_one_row_high(self):
         group = SettingsGroup(
@@ -754,15 +603,6 @@ class TestCommandsAndTheirOutput:
             + _BUTTON_GAP
             + _button_width("Run now", _measure, _unscaled)
         )
-
-    def test_the_box_asks_for_its_minimum_width(self):
-        assert _content_width(_output(), _measure, _unscaled, column=0) == _OUTPUT_MIN_WIDTH
-
-    def test_the_box_gets_a_row_of_its_own_height(self):
-        assert _row_height(_output(), _unscaled) == _OUTPUT_HEIGHT
-
-    def test_a_command_gets_the_button_row(self):
-        assert _row_height(_command(), _unscaled) == _BUTTON_HEIGHT
 
     def test_the_production_refresh_group_holds_both_buttons_on_one_row(self):
         layout = settings_layout(

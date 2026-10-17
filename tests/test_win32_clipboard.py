@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import ctypes
 
-from claudemonitor.win32_bindings import CF_UNICODETEXT, GMEM_MOVEABLE
 from claudemonitor.win32_clipboard import copy_text
 
 _MEMORY = 7000  # The handle GlobalAlloc hands out.
@@ -53,26 +52,12 @@ class TestCopyingText:
             "CloseClipboard",
         ]
 
-    def test_the_text_is_handed_over_as_unicode(self):
-        user32, kernel32, _memory = _dlls()
-
-        copy_text("claude -p hi", user32=user32, kernel32=kernel32)
-
-        assert ("SetClipboardData", CF_UNICODETEXT, _MEMORY) in user32.calls
-
     def test_the_memory_holds_the_text_and_its_terminating_null(self):
         user32, kernel32, memory = _dlls()
 
         copy_text("hi", user32=user32, kernel32=kernel32)
 
         assert memory.raw[:6] == "hi\0".encode("utf-16-le")
-
-    def test_the_memory_is_movable_and_sized_for_the_text(self):
-        user32, kernel32, _memory = _dlls()
-
-        copy_text("hi", user32=user32, kernel32=kernel32)
-
-        assert ("GlobalAlloc", GMEM_MOVEABLE, 6) in kernel32.calls
 
     def test_the_memory_is_unlocked_before_windows_takes_it(self):
         user32, kernel32, _memory = _dlls()

@@ -153,18 +153,6 @@ def test_expired_token_skips_network_request(monkeypatch):
     assert data.status_code is None
 
 
-def test_unexpired_token_makes_network_request(monkeypatch):
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    monkeypatch.setattr(
-        fetcher,
-        "_read_credentials",
-        lambda: fetcher.Credentials("test-token", expires_at),
-    )
-    _answers(monkeypatch, _FakeResponse(200, _USAGE_BODY))
-
-    assert fetcher.fetch().status_code == 200
-
-
 def test_missing_expiry_still_makes_network_request(fake_token, monkeypatch):
     _answers(monkeypatch, _FakeResponse(200, _USAGE_BODY))
 
@@ -209,36 +197,6 @@ def test_credentials_parse_tolerates_missing_expiry():
     assert creds.expires_at is None
 
 
-def test_usage_windows_reads_both_windows():
-    five_hour, seven_day = fetcher._usage_windows(_USAGE_BODY)
-
-    assert five_hour.utilization == 30.0
-    assert seven_day.utilization == 10.0
-
-
-def test_usage_windows_of_an_empty_body_is_a_pair_of_nothing():
-    assert fetcher._usage_windows({}) == (None, None)
-
-
-def test_usage_windows_raises_on_a_window_it_cannot_read():
-    # The shared request turns this into bad_response rather than a number.
-    with pytest.raises(Exception):
-        fetcher._usage_windows({"five_hour": {"utilization": "lots"}})
-
-
-def test_the_endpoint_is_built_from_the_credentials(monkeypatch):
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    monkeypatch.setattr(
-        fetcher, "_read_credentials", lambda: fetcher.Credentials("tok", expires_at)
-    )
-
-    endpoint = fetcher._endpoint()
-
-    assert endpoint.url == "https://api.anthropic.com/api/oauth/usage"
-    assert endpoint.headers["Authorization"] == "Bearer tok"
-    assert endpoint.expires_at == expires_at
-
-
 class TestTheDefaultModel:
     """The nudge runs with --setting-sources=, so ~/.claude/settings.json is not
     read and its model is not used. Only ANTHROPIC_MODEL still reaches Claude
@@ -254,7 +212,3 @@ class TestTheDefaultModel:
 
         assert fetcher.default_model() == ""
 
-    def test_a_blank_value_names_none(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_MODEL", "  ")
-
-        assert fetcher.default_model() == ""

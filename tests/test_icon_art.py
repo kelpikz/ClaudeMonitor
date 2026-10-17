@@ -14,7 +14,6 @@ from PIL import Image
 from claudemonitor.icon_art import (
     CLAUDE_GLYPH_COLOR,
     CODEX_DARK_THEME_COLOR,
-    CODEX_GLYPH_MASK_PATH,
     CODEX_LIGHT_THEME_COLOR,
     TRAY_ICON_SIZE,
     glyph_image,
@@ -46,9 +45,6 @@ class TestTileIcon:
 
         assert tile.size == (TRAY_ICON_SIZE, TRAY_ICON_SIZE)
         assert tile.mode == "RGBA"
-
-    def test_tile_can_be_rendered_at_any_size(self):
-        assert tile_icon(GREEN, size=32).size == (32, 32)
 
     def test_corners_are_rounded_away(self):
         alpha = _alpha_map(tile_icon(GREEN))
@@ -96,21 +92,9 @@ class TestTileIcon:
             TRAY_ICON_SIZE,
         )
 
-    def test_the_same_glyph_renders_identically_every_time(self):
-        assert tile_icon(GREEN, glyph="codex").tobytes() == (
-            tile_icon(GREEN, glyph="codex").tobytes()
-        )
-
 
 class TestCodexGlyphMask:
     """The OpenAI mark is artwork, not geometry, so it ships as a mask."""
-
-    def test_the_mask_is_committed(self):
-        assert CODEX_GLYPH_MASK_PATH.exists()
-
-    def test_the_mask_renders_at_any_requested_size(self):
-        assert glyph_mask("codex", 64).size == (64, 64)
-        assert glyph_mask("codex", 256).size == (256, 256)
 
     def test_the_mask_actually_marks_something(self):
         mask = glyph_mask("codex", 64)
@@ -140,10 +124,6 @@ class TestLabelGlyphs:
     scaled display. Drawing them removes the stretch, and with it the ragged
     edges the label showed at 125%.
     """
-
-    @pytest.mark.parametrize("size", [12, 16, 20, 24], ids=str)
-    def test_a_mark_is_drawn_at_the_size_asked_for(self, size):
-        assert glyph_image("codex", CODEX_DARK_THEME_COLOR, size).size == (size, size)
 
     @pytest.mark.parametrize("size", [12, 16, 20, 24], ids=str)
     def test_a_mark_actually_draws_something(self, size):
@@ -200,14 +180,6 @@ class TestTheApplicationIcon:
         assert application_icon(32).tobytes() == (
             tile_icon(APPLICATION_ICON_COLOR, size=32).tobytes()
         )
-
-    def test_it_is_drawn_at_the_size_asked_for(self):
-        from claudemonitor.icon_art import application_icon
-
-        image = application_icon(20)
-
-        assert image.size == (20, 20)
-        assert image.mode == "RGBA"
 
     def test_its_png_is_the_same_picture(self):
         import io

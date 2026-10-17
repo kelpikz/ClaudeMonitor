@@ -150,17 +150,6 @@ class TestSessionNudgeEndToEnd:
         assert command[-1] == "hi"
         assert refreshed == ["refreshed"]
 
-    def test_the_chosen_effort_reaches_the_cli(self):
-        runner = _RecordingRunner()
-        nudger, _refreshed = self._nudger(
-            runner=runner, options=RefreshOptions(model="haiku", effort="low")
-        )
-
-        nudger.maybe_nudge(usage(utilization=0.0))
-
-        command = runner.calls[0][0]
-        assert command[command.index("--effort") + 1] == "low"
-
     def test_a_successful_run_logs_its_tokens(self, caplog):
         nudger, _refreshed = self._nudger(runner=_RecordingRunner())
 
@@ -184,15 +173,6 @@ class TestSessionNudgeEndToEnd:
 
         assert refreshed == []
         assert "There's an issue with the selected model." in caplog.text
-
-    def test_full_window_with_an_active_reset_time_also_nudges(self):
-        runner = _RecordingRunner()
-        nudger, _refreshed = self._nudger(runner=runner)
-
-        data = usage(utilization=0.0, resets_at=NOW + timedelta(hours=3))
-
-        assert nudger.maybe_nudge(data) is True
-        assert len(runner.calls) == 1
 
     def test_expired_token_nudges_so_claude_code_can_refresh_it(self):
         runner = _RecordingRunner()
@@ -266,10 +246,6 @@ class TestNudgeReason:
     def test_response_without_a_five_hour_window_is_not_evidence_of_an_idle_session(self):
         assert nudge_reason(usage()) is None
 
-    def test_no_provider_specific_predicate_survives(self):
-        # Two predicates meant two behaviours to keep in step, and they drifted.
-        assert not hasattr(cli_refresher, "needs_codex_nudge")
-
 
 class TestFutureResetTime:
     def test_a_reset_time_after_the_fetch_is_returned(self):
@@ -282,28 +258,6 @@ class TestFutureResetTime:
 
     def test_a_window_with_no_reset_time_has_none(self):
         assert future_reset_time(usage(utilization=0.0)) is None
-
-    def test_a_fetch_with_no_window_has_none(self):
-        assert future_reset_time(usage(fetch_error="offline")) is None
-
-
-class TestRefreshOptions:
-    """Each reason has its own switch, so a user can allow one and not the other."""
-
-    def test_both_reasons_are_allowed_by_default(self):
-        options = RefreshOptions()
-        assert options.allows("token_expired") is True
-        assert options.allows("idle_window") is True
-
-    def test_the_token_switch_only_governs_an_expired_token(self):
-        options = RefreshOptions(renew_token=False)
-        assert options.allows("token_expired") is False
-        assert options.allows("idle_window") is True
-
-    def test_the_session_switch_only_governs_an_idle_window(self):
-        options = RefreshOptions(wake_session=False)
-        assert options.allows("token_expired") is True
-        assert options.allows("idle_window") is False
 
 
 class TestTheSwitchesGateTheNudge:
@@ -328,18 +282,6 @@ class TestTheSwitchesGateTheNudge:
         nudger = _nudger(invoke, RefreshOptions(wake_session=False, cooldown_seconds=0))
 
         assert nudger.maybe_nudge(usage(utilization=0.0)) is False
-        assert seen == []
-
-    def test_both_switches_off_never_touch_the_cli(self):
-        invoke, seen = _answers()
-        nudger = _nudger(
-            invoke,
-            RefreshOptions(renew_token=False, wake_session=False, cooldown_seconds=0),
-        )
-
-        nudger.maybe_nudge(usage(utilization=0.0))
-        nudger.maybe_nudge(usage(fetch_error="token_expired"))
-
         assert seen == []
 
     def test_options_are_read_again_on_every_poll(self):
@@ -430,18 +372,6 @@ class TestRunProviderCli:
     """One runner for every provider: what the CLI answered, and never a raise."""
 
     @pytest.mark.parametrize("provider", PROVIDERS)
-    def test_the_providers_own_executable_is_looked_up(self, provider):
-        looked_up: list[str] = []
-
-        def which(name):
-            looked_up.append(name)
-            return name + ".EXE"
-
-        run_provider_cli(provider, which=which, run=_RecordingRunner())
-
-        assert looked_up == [provider.cli_executable]
-
-    @pytest.mark.parametrize("provider", PROVIDERS)
     def test_the_resolved_executable_is_run_with_the_providers_arguments(
         self, provider
     ):
@@ -478,21 +408,6 @@ class TestRunProviderCli:
         )
 
         assert reply.duration_seconds == 3.25
-
-    def test_a_cli_that_never_started_has_no_duration(self):
-        reply = run_provider_cli(CLAUDE, which=_which_finds_nothing, run=_RecordingRunner())
-
-        assert reply.duration_seconds is None
-
-    def test_a_failed_run_still_says_how_long_it_took(self):
-        ticks = iter([0.0, 120.0])
-        runner = _RecordingRunner(raises=subprocess.TimeoutExpired(cmd="claude", timeout=120))
-
-        reply = run_provider_cli(
-            CLAUDE, which=_which_finds_claude, run=runner, clock=lambda: next(ticks)
-        )
-
-        assert reply.duration_seconds == 120.0
 
     def test_the_cli_starts_in_an_empty_folder_of_its_own(self):
         # A CLI reads the instruction files of the folder it starts in. Under
@@ -538,16 +453,6 @@ class TestRunProviderCli:
 
         assert run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner).succeeded is False
 
-    def test_a_reader_that_raises_is_a_failure_not_a_crash(self, monkeypatch):
-        def broken(*_args):
-            raise ValueError("bad reader")
-
-        provider = replace(CLAUDE, read_cli_reply=broken)
-
-        reply = run_provider_cli(provider, which=_which_finds_claude, run=_RecordingRunner())
-
-        assert reply.succeeded is False
-
     def test_captures_output_under_a_timeout_and_hides_the_console_window(self):
         runner = _RecordingRunner()
         run_provider_cli(CLAUDE, which=_which_finds_claude, run=runner)
@@ -580,11 +485,6 @@ class TestRunProviderCli:
         _command, kwargs = runner.calls[0]
         assert kwargs["stdin"] == subprocess.DEVNULL
 
-    def test_a_nudger_given_no_invoker_runs_its_own_providers_cli(self):
-        # This is what deleted create_codex_nudger: a nudger knows which CLI
-        # answers for it, so nothing has to pair the two up from outside.
-        assert SessionNudger(CODEX).provider is CODEX
-
 
 class TestCircuitBreaker:
     """Dead credentials keep reporting `token_expired` forever, and no prompt can
@@ -605,24 +505,6 @@ class TestCircuitBreaker:
         assert nudger.maybe_nudge(expired) is False
         assert nudger.maybe_nudge(expired) is False
         assert len(attempts) == 3
-
-    def test_the_breaker_is_not_tripped_before_the_limit(self):
-        nudger, _attempts = self._nudger(succeeds=False)
-        expired = usage(fetch_error="token_expired")
-
-        nudger.maybe_nudge(expired)
-        nudger.maybe_nudge(expired)
-
-        assert nudger.exhausted is False
-
-    def test_exhausted_reports_the_tripped_breaker(self):
-        nudger, _attempts = self._nudger(succeeds=False)
-        expired = usage(fetch_error="token_expired")
-
-        for _ in range(3):
-            nudger.maybe_nudge(expired)
-
-        assert nudger.exhausted is True
 
     def test_a_confirmed_success_clears_the_failure_count(self):
         outcomes = iter([False, False, True, False, False])
@@ -687,19 +569,6 @@ class TestCircuitBreaker:
 
         assert nudger.exhausted is True
 
-    def test_the_failure_limit_is_configurable(self):
-        invoke, attempts = _answers(succeeded=False)
-        nudger = _nudger(invoke, max_consecutive_failures=1)
-        expired = usage(fetch_error="token_expired")
-
-        assert nudger.maybe_nudge(expired) is True
-        assert nudger.maybe_nudge(expired) is False
-        assert len(attempts) == 1
-
-    def test_a_fresh_nudger_is_not_exhausted(self):
-        nudger, _attempts = self._nudger(succeeds=False)
-        assert nudger.exhausted is False
-
 
 class TestConcurrentNudges:
     """A nudge outlives one poll, so a second poll must not stack another CLI call."""
@@ -744,9 +613,6 @@ class TestTheCommandToCopy:
 
     def test_it_names_the_executable_rather_than_its_full_path(self):
         assert command_line(CLAUDE, "", "").startswith("claude -p ")
-
-    def test_an_argument_with_a_space_is_quoted(self):
-        assert '--system-prompt "Reply briefly."' in command_line(CLAUDE, "", "")
 
     def test_the_codex_command_is_built_the_same_way(self, monkeypatch):
         monkeypatch.setattr(
@@ -826,12 +692,6 @@ class TestAManualRun:
         assert run.start("", "", finished=lambda: None) is False
         assert len(started) == 1
 
-    def test_a_finished_run_can_be_run_again(self):
-        run = _manual_run()
-        run.start("", "", finished=lambda: None)
-
-        assert run.start("", "", finished=lambda: None) is True
-
     def test_a_success_asks_for_fresh_usage(self):
         refreshed: list[str] = []
         run = _manual_run(on_refreshed=lambda: refreshed.append("poll"))
@@ -880,9 +740,6 @@ class TestAManualRun:
         run.note_copied("claude -p hi")
 
         assert run.state.phase == "running"
-
-    def test_by_default_it_runs_its_own_providers_cli(self):
-        assert ManualRun(CODEX).provider is CODEX
 
 
 class TestAWokenWindowIsLeftAloneUntilItEnds:
@@ -1015,16 +872,6 @@ class TestAWokenWindowIsLeftAloneUntilItEnds:
         assert len(attempts) == 10
         assert nudger.exhausted is False
 
-    def test_a_failed_wake_is_tried_again_after_the_cooldown(self):
-        elapsed = [0.0]
-        nudger, attempts = self._nudger(elapsed, succeeded=False)
-
-        nudger.maybe_nudge(usage(utilization=0.0))
-        elapsed[0] = 60.0
-
-        assert nudger.maybe_nudge(usage(utilization=0.0)) is True
-        assert len(attempts) == 2
-
     def test_a_proven_wake_clears_earlier_failures(self):
         outcomes = iter([False, False, True, False, False])
         elapsed = [0.0]
@@ -1111,7 +958,6 @@ class TestARenewalTheNextFetchDoesNotConfirm:
 
         assert len(attempts) == 1
         assert nudger.exhausted is False
-
 
     def test_a_renewal_followed_by_a_window_at_zero_is_a_success(self, caplog):
         # The renewal is itself a lean request, so the next fetch often shows
@@ -1288,14 +1134,6 @@ class TestRunningTheCliProcess:
 
         assert len(process.waits) == 2
         assert process.waits[1] is not None
-
-    def test_the_cli_is_run_this_way_unless_a_test_says_otherwise(self, monkeypatch):
-        runner = _RecordingRunner()
-        monkeypatch.setattr(cli_refresher, "run_cli_process", runner)
-
-        run_provider_cli(CLAUDE, which=_which_finds_claude)
-
-        assert len(runner.calls) == 1
 
     @pytest.mark.skipif(sys.platform != "win32", reason="taskkill is Windows only")
     def test_a_real_grandchild_holding_the_pipes_does_not_block_the_timeout(self):

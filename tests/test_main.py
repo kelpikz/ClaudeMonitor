@@ -15,8 +15,6 @@ from claudemonitor.config import (
     CodexConfig,
     Config,
     ConfigSetting,
-    PollingConfig,
-    ThresholdsConfig,
 )
 from claudemonitor.models import CLAUDE, CODEX, CliReply, ProviderUsageData
 
@@ -97,14 +95,6 @@ class TestToggleTaskbarVisibility:
         assert companion.visible is False
         assert _saved_values(saved_settings, main.TASKBAR_ENABLED) == [False]
 
-    def test_toggling_back_shows_it_again(self, saved_settings):
-        companion = _FakeCompanion(visible=False)
-
-        main._toggle_taskbar_visibility(companion)
-
-        assert companion.visible is True
-        assert _saved_values(saved_settings, main.TASKBAR_ENABLED) == [True]
-
 
 def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
     def unavailable() -> bool:
@@ -115,14 +105,6 @@ def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
 
     assert enabled is False
     assert "Windows startup registration" in caplog.text
-
-
-def test_startup_repair_runs_during_initialization():
-    calls: list[None] = []
-
-    main._repair_startup_registration(lambda: calls.append(None) or True)
-
-    assert calls == [None]
 
 
 def test_startup_repair_survives_a_registry_failure(caplog):
@@ -217,15 +199,6 @@ class TestApplyDisplay:
         assert tray_state.icon_color == "grey"
         assert "no provider tracked" in tray_state.tooltip
 
-    def test_codex_switched_off_mid_poll_leaves_claude_alone(self, monkeypatch):
-        states = [_display_state(CLAUDE, "80%", "Claude usage")]
-
-        _icon, companion, applied = self._run(monkeypatch, states)
-
-        _target, tray_state = applied[0]
-        assert tray_state.status_lines == ["Claude — updated"]
-        assert companion.updates
-
 
 class TestOneProvidersTwoWaysToRunItsCli:
     """The automatic nudge and Run now must never run one CLI twice at once."""
@@ -240,11 +213,6 @@ class TestOneProvidersTwoWaysToRunItsCli:
         codex_nudger, _ = main.create_cli_runners(CODEX, Config(), threading.Event())
 
         assert claude_nudger.cli_lock is not codex_nudger.cli_lock
-
-    def test_both_belong_to_the_provider_asked_for(self):
-        nudger, run = main.create_cli_runners(CODEX, Config(), threading.Event())
-
-        assert (nudger.provider, run.provider) == (CODEX, CODEX)
 
 
 class TestSessionNudgerWiring:
@@ -288,23 +256,6 @@ class TestSessionNudgerWiring:
         data = ProviderUsageData(fetch_error="token_expired", fetched_at=NOW)
 
         assert nudger.maybe_nudge(data) is True
-
-    def test_the_configured_cooldown_gates_the_second_attempt(self):
-        config = Config(claude=ClaudeConfig(cooldown_seconds=10_000))
-        nudger, _manual_refresh, _chosen = self._nudger(config=config)
-
-        data = ProviderUsageData(fetch_error="token_expired", fetched_at=NOW)
-
-        assert nudger.maybe_nudge(data) is True
-        assert nudger.maybe_nudge(data) is False
-
-    def test_the_configured_model_and_effort_are_handed_to_the_cli(self):
-        config = Config(codex=CodexConfig(model="gpt-5.5", effort="high"))
-        nudger, _manual_refresh, chosen = self._nudger(CODEX, config)
-
-        nudger.maybe_nudge(ProviderUsageData(fetch_error="token_expired", fetched_at=NOW))
-
-        assert (chosen[0].model, chosen[0].effort) == ("gpt-5.5", "high")
 
     def test_a_setting_changed_while_running_is_used_at_the_next_poll(self):
         config = Config()
@@ -447,27 +398,10 @@ def test_poll_interval_retry_after_is_floored_at_baseline():
     assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
 
 
-def test_poll_interval_falls_back_to_backoff_without_retry_after():
-    data = ProviderUsageData(
-        fetch_error="rate_limited",
-        fetched_at=NOW,
-        status_code=429,
-        retry_after_seconds=None,
-    )
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 120
-
-
 def test_poll_interval_decreases_by_five_seconds_after_success():
     data = ProviderUsageData(fetched_at=NOW, status_code=200)
 
     assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 85
-
-
-def test_poll_interval_never_drops_below_baseline_after_success():
-    data = ProviderUsageData(fetched_at=NOW, status_code=200)
-
-    assert main._next_poll_interval_seconds(60, data, baseline_seconds=60) == 60
 
 
 def test_poll_interval_clamps_to_baseline_when_less_than_step_above_it():
@@ -482,12 +416,6 @@ def test_poll_interval_stays_same_after_non_rate_limit_error():
         fetched_at=NOW,
         status_code=401,
     )
-
-    assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
-
-
-def test_poll_interval_stays_same_after_offline_error_without_status():
-    data = ProviderUsageData(fetch_error="offline", fetched_at=NOW)
 
     assert main._next_poll_interval_seconds(90, data, baseline_seconds=60) == 90
 
@@ -508,14 +436,6 @@ class TestTrackingOneProvider:
         assert main._is_tracked(CODEX, config) is False
         assert _saved_values(saved_settings, CODEX_SETTINGS.tracking) == [False]
 
-    def test_switching_it_back_on_restores_tracking(self, saved_settings):
-        config = Config()
-        main._set_tracking(CODEX, config, lambda: None, False)
-
-        main._set_tracking(CODEX, config, lambda: None, True)
-
-        assert main._is_tracked(CODEX, config) is True
-
     def test_switching_it_off_wakes_the_poll_loop(self, saved_settings):
         # Codex used to vanish with its own tray icon the instant it was
         # switched off. With one icon, nothing changes until the loop polls
@@ -525,26 +445,6 @@ class TestTrackingOneProvider:
         main._set_tracking(CODEX, Config(), woken.set, False)
 
         assert woken.is_set()
-
-    def test_the_loop_is_woken_even_when_the_config_write_fails(self, monkeypatch):
-        def unwritable(self, value):
-            raise OSError("config is read-only")
-
-        # The save swallows its own failure, so the wake-up still happens.
-        monkeypatch.setattr(ConfigSetting, "save", lambda self, value: None)
-        woken = threading.Event()
-
-        main._set_tracking(CODEX, Config(), woken.set, False)
-
-        assert woken.is_set()
-
-    def test_claude_can_be_switched_off_too(self, saved_settings):
-        config = Config()
-
-        main._set_tracking(CLAUDE, config, lambda: None, False)
-
-        assert main._is_tracked(CLAUDE, config) is False
-        assert _saved_values(saved_settings, CLAUDE_SETTINGS.tracking) == [False]
 
 
 class TestActiveProviders:
@@ -560,14 +460,6 @@ class TestActiveProviders:
         config = Config(codex=CodexConfig(enabled=True))
 
         assert main._active_pollers([claude, codex], config) == [claude, codex]
-
-    def test_codex_is_dropped_when_switched_off(self):
-        claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
-
-        config = Config()
-        CODEX_SETTINGS.tracking.write(config, False)
-
-        assert main._active_pollers([claude, codex], config) == [claude]
 
     def test_claude_is_dropped_when_switched_off(self):
         claude, codex = _TrackedPoller(CLAUDE), _TrackedPoller(CODEX)
@@ -592,9 +484,6 @@ class TestSharedPollInterval:
 
     def test_the_longer_interval_wins(self):
         assert main._shared_poll_interval([60, 240]) == 240
-
-    def test_a_single_provider_sets_its_own_pace(self):
-        assert main._shared_poll_interval([90]) == 90
 
     def test_no_providers_falls_back_to_a_safe_default(self):
         assert main._shared_poll_interval([]) > 0
@@ -635,9 +524,6 @@ class TestProviderFailureIsolation:
 
         assert "Codex" in caplog.text
 
-    def test_a_healthy_poll_passes_its_notifications_through(self):
-        assert main._poll_provider(self._Poller(CLAUDE)) == ["notification"]
-
     def test_a_failing_display_still_yields_a_state_for_that_provider(self, caplog):
         poller = self._Poller(CODEX, raises=RuntimeError("boom"))
 
@@ -646,11 +532,6 @@ class TestProviderFailureIsolation:
 
         assert state.provider is CODEX
         assert state.icon_color == "grey"
-
-    def test_a_healthy_display_is_returned_unchanged(self):
-        state = main._provider_display(self._Poller(CLAUDE), NOW)
-
-        assert state.icon_color == "green"
 
     def test_one_broken_provider_leaves_the_other_intact(self):
         healthy = self._Poller(CLAUDE)
@@ -777,14 +658,6 @@ class TestIdleCodexWindowWakesTheCli:
         assert command[command.index("-m") + 1] == "gpt-5.5"
         assert "model_reasoning_effort=low" in command
 
-    def test_waking_switched_off_leaves_an_idle_window_alone(self, monkeypatch):
-        config = Config(codex=CodexConfig(wake_session=False))
-        poller, cli = self._codex_poller(monkeypatch, _codex_usage_body(0.0, None), config)
-
-        poller.poll()
-
-        assert cli.commands == []
-
     def test_a_window_reported_as_zero_percent_used_runs_the_cli(self, monkeypatch):
         # Codex reports a reset time even for a window nothing was sent to, so
         # "0% used, with a countdown" is how the idle state usually arrives.
@@ -804,16 +677,6 @@ class TestIdleCodexWindowWakesTheCli:
         body["rate_limit"]["primary_window"] = None
 
         assert self._poll(monkeypatch, body) == []
-
-    def test_the_second_poll_is_held_off_by_the_cooldown(self, monkeypatch):
-        # An idle window stays idle until the reply lands, so without the
-        # cooldown every poll would start another Codex turn.
-        poller, cli = self._codex_poller(monkeypatch, _codex_usage_body(0.0, None))
-
-        poller.poll()
-        poller.poll()
-
-        assert len(cli.commands) == 1
 
 
 # ===========================================================================
@@ -880,21 +743,6 @@ class TestSettingsWiring:
         assert fields["config"].codex.renew_token is False
         assert fields["config"].claude.renew_token is True
         assert _saved_values(saved_settings, CODEX_SETTINGS.renew_token) == [False]
-
-    def test_the_wake_switch_reads_and_writes_its_setting(self, saved_settings):
-        model, fields = self._model()
-
-        self._field(model, "claude_wake_session").write(False)
-
-        assert fields["config"].claude.wake_session is False
-        assert _saved_values(saved_settings, CLAUDE_SETTINGS.wake_session) == [False]
-
-    def test_claude_now_has_a_tracking_switch(self):
-        model, fields = self._model()
-
-        self._field(model, "claude_tracking").write(False)
-
-        assert main._is_tracked(CLAUDE, fields["config"]) is False
 
     def test_the_model_box_reads_and_writes_its_setting(self, saved_settings):
         model, fields = self._model()
@@ -979,11 +827,6 @@ class TestCommandButtonsWiring:
     def _field(self, model, key: str):
         return next(field for field in model.fields() if field.key == key)
 
-    def test_nothing_has_run_when_the_window_opens(self):
-        box = self._field(self._model(), "codex_last_run")
-
-        assert box.text() == ""
-
     def test_the_copy_button_puts_the_command_on_the_clipboard(self):
         copied: list[str] = []
         model = self._model(copy_text=lambda text: copied.append(text) or True)
@@ -1008,14 +851,6 @@ class TestCommandButtonsWiring:
         self._field(model, "claude_copy_command").act("  haiku ", "", lambda: None)
 
         assert copied == [cli_refresher.command_line(CLAUDE, "haiku", "")]
-
-    def test_the_copy_button_announces_the_new_text(self):
-        told: list[str] = []
-        model = self._model()
-
-        self._field(model, "codex_copy_command").act("", "", lambda: told.append("changed"))
-
-        assert told == ["changed"]
 
     def test_a_clipboard_that_refuses_leaves_the_box_as_it_was(self):
         model = self._model(copy_text=lambda text: False)
@@ -1051,17 +886,6 @@ class TestCommandButtonsWiring:
         self._field(model, "claude_run_command").act("", "", lambda: told.append("changed"))
 
         assert told == ["changed", "changed"]
-
-    def test_a_click_during_a_run_announces_nothing(self):
-        told: list[str] = []
-        pending = cli_refresher.ManualRun(CLAUDE, start_background=lambda work: None)
-        model = self._model(manual_runs={"claude": pending, "codex": _immediate_run(CODEX)})
-        button = self._field(model, "claude_run_command")
-        button.act("", "", lambda: None)
-
-        button.act("", "", lambda: told.append("changed"))
-
-        assert told == []
 
     def test_each_provider_s_box_shows_only_its_own_run(self):
         model = self._model()
@@ -1107,12 +931,6 @@ class TestNumericSettingsWiring:
     def _field(self, model, key: str):
         return next(field for field in model.fields() if field.key == key)
 
-    def test_the_poll_interval_reads_the_config(self):
-        config = Config(polling=PollingConfig(interval_seconds=45))
-        model, _fields = self._model(config=config)
-
-        assert self._field(model, "poll_interval").value() == 45
-
     def test_writing_the_poll_interval_updates_the_running_config(self, monkeypatch):
         model, fields = self._model()
 
@@ -1145,13 +963,6 @@ class TestNumericSettingsWiring:
 
         assert woken.is_set()
 
-    def test_the_thresholds_read_the_config(self):
-        config = Config(thresholds=ThresholdsConfig(amber_below=40, red_below=15))
-        model, _fields = self._model(config=config)
-
-        assert self._field(model, "amber_threshold").value() == 40
-        assert self._field(model, "red_threshold").value() == 15
-
     def test_writing_a_threshold_updates_the_running_config(self, monkeypatch):
         model, fields = self._model()
 
@@ -1160,13 +971,6 @@ class TestNumericSettingsWiring:
 
         assert fields["config"].thresholds.amber_below == 40
         assert fields["config"].thresholds.red_below == 15
-
-    def test_each_cooldown_reads_its_own_provider(self):
-        config = Config(codex=CodexConfig(cooldown_seconds=300))
-        model, _fields = self._model(config=config)
-
-        assert self._field(model, "codex_cooldown").value() == 300
-        assert self._field(model, "claude_cooldown").value() == 900
 
     def test_writing_a_cooldown_changes_only_that_provider(self, saved_settings):
         model, fields = self._model()

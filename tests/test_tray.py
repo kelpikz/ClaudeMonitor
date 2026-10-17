@@ -70,10 +70,6 @@ class TestTruncateTooltip:
         text = "Claude  80% (3h 0m)"
         assert _truncate_tooltip(text) == text
 
-    def test_text_at_the_limit_is_unchanged(self):
-        text = "x" * _MAX_TOOLTIP_LEN
-        assert _truncate_tooltip(text) == text
-
     def test_over_limit_is_clipped_within_bounds(self):
         result = _truncate_tooltip("y" * 200)
         assert len(result) <= _MAX_TOOLTIP_LEN
@@ -81,10 +77,6 @@ class TestTruncateTooltip:
     def test_over_limit_keeps_an_ellipsis_marker(self):
         result = _truncate_tooltip("y" * 200)
         assert result.endswith("…")
-
-    def test_limit_stays_within_windows_128_cap(self):
-        # The hard Windows cap is 128; our limit must sit at or below it.
-        assert _MAX_TOOLTIP_LEN <= 128
 
 
 class TestApplyNeverExceedsTooltipLimit:

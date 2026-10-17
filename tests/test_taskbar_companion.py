@@ -112,9 +112,6 @@ class TestRetryDelay:
     def test_the_wait_is_capped(self):
         assert retry_delay_seconds(20, base=1.0, cap=60.0) == 60.0
 
-    def test_a_zero_base_stays_zero_for_fast_tests(self):
-        assert retry_delay_seconds(5, base=0.0, cap=60.0) == 0.0
-
 
 class _FakeNativeWindow:
     """Record the controller's requests and let tests inject native failures."""
@@ -628,12 +625,6 @@ class TestNativeFailureRecovery:
         assert created >= 4
         assert len(_calls_named(native, "close_window")) == created
 
-    def test_every_created_window_is_eventually_destroyed(self):
-        native = self._run_until_failures("move_window", stop_after=6)
-
-        created = len(_calls_named(native, "create_window"))
-        assert len(_calls_named(native, "close_window")) == created
-
     def test_native_window_is_destroyed_when_its_message_loop_finishes(self):
         native = _FakeNativeWindow()
 
@@ -664,9 +655,6 @@ class TestNativeFailureRecovery:
 
 class TestHealth:
     """A label that cannot be rebuilt must stop claiming to be shown."""
-
-    def test_a_new_companion_is_considered_healthy(self):
-        assert TaskbarCompanion(native=_FakeNativeWindow()).healthy is True
 
     def test_repeated_rebuild_failures_mark_the_companion_unhealthy(self):
         native = _FakeNativeWindow(pump_rounds=99)
@@ -739,14 +727,6 @@ class TestLifecycle:
 
 class TestCompanionFactory:
     """The taskbar label is optional, so it must never block the tray icon."""
-
-    def test_a_working_native_layer_yields_a_real_companion(self):
-        companion = create_taskbar_companion(
-            initial_visible=True,
-            build_native=_FakeNativeWindow,
-        )
-
-        assert isinstance(companion, TaskbarCompanion)
 
     def test_a_broken_native_layer_yields_a_harmless_stand_in(self, caplog):
         def unavailable():

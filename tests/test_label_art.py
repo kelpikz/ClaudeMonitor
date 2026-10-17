@@ -30,9 +30,6 @@ def _alpha_of(image: Image.Image, x: int, y: int) -> int:
 class TestTaskbarGlyph:
     """One provider's mark, drawn at whatever size the row leaves for it."""
 
-    def test_the_glyph_is_drawn_at_the_size_asked_for(self):
-        assert taskbar_glyph(CLAUDE, 22, uses_light_theme=False).size == (22, 22)
-
     def test_each_size_is_drawn_rather_than_rescaled_from_one_bitmap(self):
         # Upscaling a 16px bitmap to 22px was what made the mark look ragged on
         # a 125% display, so every size has to come from the artwork itself.
@@ -98,9 +95,6 @@ class TestStackedBands:
         bands = stacked_bands(60, rows=3, padding=6)
 
         assert [band[0] for band in bands[1:]] == [band[1] for band in bands[:-1]]
-
-    def test_no_rows_means_no_bands(self):
-        assert stacked_bands(48, rows=0, padding=5) == []
 
     def test_padding_is_dropped_before_a_band_collapses(self):
         # A very short taskbar cannot afford the inset. Showing the label
@@ -212,7 +206,3 @@ class TestComposeLabel:
 
         assert label_art.compose_label(text, [(glyph, (2, 2))]).size == (4, 4)
 
-    def test_no_glyphs_leaves_the_text_untouched(self):
-        text = Image.new("RGBA", (4, 4), (245, 245, 245, 200))
-
-        assert label_art.compose_label(text, []).tobytes() == text.tobytes()

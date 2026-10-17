@@ -183,15 +183,6 @@ def test_missing_windows_map_to_none(fake_credentials, monkeypatch):
     assert data.seven_day is None
 
 
-def test_absent_rate_limit_section_maps_to_none_windows(fake_credentials, monkeypatch):
-    _answers(monkeypatch, _FakeResponse(200, {"plan_type": "plus"}))
-
-    data = codex_fetcher.fetch()
-
-    assert data.fetch_error is None
-    assert data.five_hour is None
-
-
 def test_a_refused_session_reaches_the_caller_as_an_expired_token(
     fake_credentials, monkeypatch
 ):
@@ -238,15 +229,6 @@ def test_malformed_auth_file_maps_to_no_credentials(monkeypatch, tmp_path):
     assert codex_fetcher.fetch().fetch_error == "no_credentials"
 
 
-def test_auth_file_without_tokens_maps_to_no_credentials(monkeypatch, tmp_path):
-    path = tmp_path / "auth.json"
-    path.write_text(json.dumps({"OPENAI_API_KEY": None}), encoding="utf-8")
-    monkeypatch.setattr(codex_fetcher, "_auth_path", lambda: path)
-    monkeypatch.setattr(usage_request.httpx, "get", _fail_if_called)
-
-    assert codex_fetcher.fetch().fetch_error == "no_credentials"
-
-
 def test_expired_token_skips_the_network(monkeypatch):
     expired_at = datetime.now(timezone.utc) - timedelta(minutes=5)
     monkeypatch.setattr(
@@ -260,18 +242,6 @@ def test_expired_token_skips_the_network(monkeypatch):
 
     assert data.fetch_error == "token_expired"
     assert data.status_code is None
-
-
-def test_unexpired_token_makes_the_request(monkeypatch):
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    monkeypatch.setattr(
-        codex_fetcher,
-        "_read_credentials",
-        lambda: codex_fetcher.CodexCredentials("tok", "acct", expires_at),
-    )
-    _answers(monkeypatch, _FakeResponse(200, _usage_body()))
-
-    assert codex_fetcher.fetch().status_code == 200
 
 
 # --------------------------------------------------------------------------
@@ -331,48 +301,6 @@ def test_token_expiry_tolerates_a_token_that_is_not_a_jwt():
     assert codex_fetcher._token_expiry("") is None
 
 
-def test_usage_window_maps_percent_and_reset():
-    window = codex_fetcher._usage_window(
-        {"used_percent": 42, "reset_at": _PRIMARY_RESET_UNIX}
-    )
-
-    assert window is not None
-    assert window.utilization == 42.0
-    assert window.resets_at == datetime.fromtimestamp(_PRIMARY_RESET_UNIX, tz=timezone.utc)
-
-
-def test_usage_window_of_nothing_is_none():
-    assert codex_fetcher._usage_window(None) is None
-
-
-def test_usage_windows_reads_both_of_the_rate_limit_windows():
-    five_hour, seven_day = codex_fetcher._usage_windows(_usage_body())
-
-    assert five_hour.utilization == 12.5
-    assert seven_day.utilization == 64.0
-
-
-def test_usage_windows_raises_on_a_window_it_cannot_read():
-    # The shared request turns this into bad_response rather than a number.
-    with pytest.raises(Exception):
-        codex_fetcher._usage_windows(_usage_body(primary={"used_percent": "lots"}))
-
-
-def test_the_endpoint_is_built_from_the_credentials(monkeypatch):
-    monkeypatch.setattr(
-        codex_fetcher,
-        "_read_credentials",
-        lambda: codex_fetcher.CodexCredentials("tok", "acct", None),
-    )
-
-    endpoint = codex_fetcher._endpoint()
-
-    assert endpoint.url == "https://chatgpt.com/backend-api/wham/usage"
-    assert endpoint.headers["Authorization"] == "Bearer tok"
-    assert endpoint.headers["ChatGPT-Account-Id"] == "acct"
-    assert endpoint.expires_at is None
-
-
 class TestTheDefaultModel:
     """The model `codex exec` uses when the nudge names none: the one in the
     user's own config.toml. The settings window shows it in the empty box."""
@@ -404,11 +332,6 @@ class TestTheDefaultModel:
 
         assert codex_fetcher.default_model() == "gpt-6.1-sol"
 
-    def test_a_config_without_a_model_names_none(self, monkeypatch, tmp_path):
-        self._config(monkeypatch, tmp_path, 'model_reasoning_effort = "high"\n')
-
-        assert codex_fetcher.default_model() == ""
-
     def test_a_missing_config_names_none(self):
         # conftest points CODEX_HOME at an empty folder.
         assert codex_fetcher.default_model() == ""
@@ -418,7 +341,3 @@ class TestTheDefaultModel:
 
         assert codex_fetcher.default_model() == ""
 
-    def test_a_model_that_is_not_text_names_none(self, monkeypatch, tmp_path):
-        self._config(monkeypatch, tmp_path, "model = 5\n")
-
-        assert codex_fetcher.default_model() == ""

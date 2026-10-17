@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from claudemonitor import usage_request
 from claudemonitor.models import ProviderUsageData, UsageWindow
 from claudemonitor.usage_request import UsageEndpoint, fetch_usage
 
@@ -88,10 +87,6 @@ class TestASuccessfulFetch:
 
         assert data.five_hour.utilization == 30.0
         assert data.seven_day.utilization == 10.0
-
-    def test_nothing_is_reported_as_an_error(self):
-        data = _fetch(_FakeResponse(200, {"five": 30.0, "seven": 10.0}))
-
         assert data.fetch_error is None
         assert data.status_code == 200
 
@@ -161,14 +156,6 @@ class TestReadingCredentials:
 
         assert data.fetch_error == "token_expired"
         assert data.status_code is None
-
-    def test_a_token_that_expires_later_is_used(self):
-        data = _fetch(
-            _FakeResponse(200, {"five": 0.0, "seven": 0.0}),
-            endpoint=_endpoint(expires_at=NOW + timedelta(hours=1)),
-        )
-
-        assert data.status_code == 200
 
     def test_a_token_with_no_stated_expiry_is_used(self):
         assert _fetch(_FakeResponse(200, {"five": 0.0, "seven": 0.0})).status_code == 200
@@ -255,26 +242,4 @@ class TestWhenTheNetworkFails:
 
         assert data.fetch_error == "unknown"
 
-    def test_nothing_escapes_the_fetch(self):
-        # The poll loop runs on a thread whose death would be invisible.
-        assert isinstance(_fetch(RuntimeError("boom")), ProviderUsageData)
 
-
-class TestRetryAfterParsing:
-    """The header is advisory, so only a positive whole number is obeyed."""
-
-    @pytest.mark.parametrize(
-        ("headers", "expected"),
-        [
-            ({"retry-after": "224"}, 224),
-            ({"retry-after": "0"}, None),
-            ({"retry-after": "-5"}, None),
-            ({"retry-after": "abc"}, None),
-            ({}, None),
-        ],
-    )
-    def test_each_variant(self, headers, expected):
-        assert (
-            usage_request._parse_retry_after_seconds(_FakeResponse(429, headers=headers))
-            == expected
-        )

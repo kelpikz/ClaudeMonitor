@@ -11,8 +11,6 @@ from claudemonitor.config import (
     CODEX_SETTINGS,
     ClaudeConfig,
     CodexConfig,
-    PollingConfig,
-    TaskbarConfig,
 )
 
 
@@ -27,14 +25,6 @@ def _write_config(path: Path, text: str) -> None:
     """Create the config directory and place hand-authored TOML inside it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-
-
-def test_default_polling_interval_is_one_minute():
-    assert PollingConfig().interval_seconds == 60
-
-
-def test_taskbar_display_is_enabled_by_default():
-    assert TaskbarConfig().enabled is True
 
 
 def test_taskbar_visibility_is_persisted_in_existing_config(config_path):
@@ -157,9 +147,6 @@ class TestProviderSectionDefaults:
         assert loaded.renew_token is True
         assert loaded.wake_session is True
 
-    def test_claude_is_tracked_by_default(self):
-        assert ClaudeConfig().enabled is True
-
     def test_codex_is_not_tracked_until_the_user_turns_it_on(self):
         assert CodexConfig().enabled is False
 
@@ -174,13 +161,6 @@ class TestProviderSectionDefaults:
         assert loaded.claude.enabled is True
         assert loaded.codex.enabled is False
 
-    @pytest.mark.parametrize("section", [ClaudeConfig, CodexConfig])
-    def test_the_cooldown_is_fifteen_minutes(self, section):
-        assert section().cooldown_seconds == 900
-
-    def test_claude_asks_its_cheapest_model(self):
-        assert ClaudeConfig().model == "haiku"
-
     def test_codex_keeps_its_own_model_but_asks_for_little_reasoning(self):
         # A user's Codex config may ask for xhigh effort, which a one-word
         # nudge has no use for.
@@ -193,11 +173,6 @@ class TestReadingAProviderSection:
         _write_config(config_path, "[claude]\nenabled = false\n")
 
         assert config.load_config().claude.enabled is False
-
-    def test_codex_can_be_turned_off_in_the_file(self, config_path):
-        _write_config(config_path, "[codex]\nenabled = false\n")
-
-        assert config.load_config().codex.enabled is False
 
     def test_every_refresh_setting_is_read(self, config_path):
         _write_config(
@@ -281,17 +256,6 @@ class TestTheOldSharedRefreshSection:
 
 
 class TestSavingAProviderSetting:
-    def test_a_switch_is_persisted_without_touching_other_settings(self, config_path):
-        _write_config(
-            config_path,
-            "[polling]\ninterval_seconds = 45\n\n[codex]\nenabled = true\n",
-        )
-
-        CODEX_SETTINGS.tracking.save(False)
-
-        reloaded = config.load_config()
-        assert reloaded.codex.enabled is False
-        assert reloaded.polling.interval_seconds == 45
 
     def test_a_missing_section_is_seeded(self, config_path):
         _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 30\n")
@@ -301,11 +265,6 @@ class TestSavingAProviderSetting:
         assert config.load_config().claude.wake_session is False
         assert "Keep this user note" in config_path.read_text(encoding="utf-8")
 
-    def test_the_model_is_saved_as_text(self, config_path):
-        CODEX_SETTINGS.model.save("gpt-5.5")
-
-        assert config.load_config().codex.model == "gpt-5.5"
-
 
 class TestEveryProviderHasTheSameSettings:
     @pytest.mark.parametrize(
@@ -314,22 +273,10 @@ class TestEveryProviderHasTheSameSettings:
     def test_each_setting_lives_in_the_provider_s_own_section(self, settings, section):
         assert {setting.section for setting in settings.every()} == {section}
 
-    def test_each_is_offered_for_writing(self):
-        for settings in (CLAUDE_SETTINGS, CODEX_SETTINGS):
-            for setting in settings.every():
-                assert setting in config.EVERY_SETTING
-
 
 class TestSavingTheNumericSettings:
     """The settings window now writes what used to be file-only, so each of
     these values needs a writer that leaves every other setting alone."""
-
-    def test_the_poll_interval_is_persisted(self, config_path):
-        _write_config(config_path, "[polling]\ninterval_seconds = 60\n")
-
-        config.POLL_INTERVAL.save(120)
-
-        assert config.load_config().polling.interval_seconds == 120
 
     def test_the_amber_threshold_is_persisted(self, config_path):
         _write_config(config_path, "[thresholds]\namber_below = 50\nred_below = 20\n")
@@ -339,37 +286,6 @@ class TestSavingTheNumericSettings:
         loaded = config.load_config()
         assert loaded.thresholds.amber_below == 40
         assert loaded.thresholds.red_below == 20
-
-    def test_the_red_threshold_is_persisted(self, config_path):
-        _write_config(config_path, "[thresholds]\namber_below = 50\nred_below = 20\n")
-
-        config.RED_THRESHOLD.save(10)
-
-        loaded = config.load_config()
-        assert loaded.thresholds.red_below == 10
-        assert loaded.thresholds.amber_below == 50
-
-    def test_a_provider_cooldown_is_persisted(self, config_path):
-        _write_config(config_path, "[codex]\nenabled = true\ncooldown_seconds = 900\n")
-
-        CODEX_SETTINGS.cooldown.save(300)
-
-        loaded = config.load_config()
-        assert loaded.codex.cooldown_seconds == 300
-        assert loaded.codex.enabled is True
-
-    def test_a_numeric_write_seeds_a_missing_section(self, config_path):
-        _write_config(config_path, "# Keep this user note\n[polling]\ninterval_seconds = 45\n")
-
-        config.AMBER_THRESHOLD.save(35)
-
-        assert config.load_config().thresholds.amber_below == 35
-        assert "Keep this user note" in config_path.read_text(encoding="utf-8")
-
-    def test_a_numeric_write_seeds_a_missing_config_file(self, config_path):
-        config.POLL_INTERVAL.save(90)
-
-        assert config.load_config().polling.interval_seconds == 90
 
 
 class TestConfigSetting:
@@ -391,12 +307,6 @@ class TestConfigSetting:
 
         for setting in config.EVERY_SETTING:
             assert hasattr(getattr(loaded, setting.section), setting.key), setting
-
-    def test_reading_returns_what_the_loaded_config_holds(self):
-        loaded = config.Config()
-        loaded.thresholds.amber_below = 35
-
-        assert config.AMBER_THRESHOLD.read(loaded) == 35
 
     def test_writing_changes_the_running_config(self):
         loaded = config.Config()

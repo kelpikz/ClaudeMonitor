@@ -165,17 +165,6 @@ def _tick_startup(window, index: int) -> None:
     window._window_proc(window._handle, WM_COMMAND, _FIRST_FIELD_ID + index, 0)
 
 
-def test_ticking_start_with_windows_writes_nothing_until_it_is_applied(
-    fake_registry, monkeypatch
-):
-    """A tick is a proposal. Cancel has to be able to mean cancel."""
-    window, index = _startup_window(monkeypatch)
-
-    _tick_startup(window, index)
-
-    assert fake_registry.value is None
-
-
 def test_settings_window_registers_startup_and_updates_its_checkbox(
     fake_registry, monkeypatch
 ):

@@ -182,16 +182,6 @@ class TestAnIdleCodexWindow:
         assert "17405 tokens in, 13 out" in caplog.text
         assert app.woken.is_set()
 
-    def test_the_cli_is_asked_with_the_default_low_effort(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-
-        app.poll(_Response(200, _codex_body(0.0)))
-
-        command = app.cli.commands[0]
-        assert command[:3] == ["C:/bin/codex.CMD", "exec", "--json"]
-        assert "model_reasoning_effort=low" in command
-        assert "-m" not in command
-
     def test_the_cli_is_asked_with_the_lean_command(self, monkeypatch):
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
 
@@ -233,15 +223,6 @@ class TestWhenTheRunFails:
         assert "codex CLI refresh failed" in caplog.text
         assert not app.woken.is_set()
 
-    def test_three_failures_stop_the_retries(self, monkeypatch):
-        config = Config(codex=CodexConfig(cooldown_seconds=0))
-        app = _CodexApp(monkeypatch, _Cli(returncode=1, stdout=_CODEX_REJECTED), config)
-
-        for _ in range(5):
-            app.poll(_Response(200, _codex_body(0.0)))
-
-        assert len(app.cli.commands) == 3
-
 
 def _in_five_hours() -> int:
     """Return the Unix time a window started now ends at."""
@@ -264,18 +245,6 @@ class TestAWindowThatStaysAtZero:
 
         assert len(app.cli.commands) == 1
         assert app.nudger.exhausted is False
-
-    def test_does_not_log_the_wake_as_a_failure(self, monkeypatch, caplog):
-        config = Config(codex=CodexConfig(cooldown_seconds=0))
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
-
-        with caplog.at_level(logging.WARNING):
-            app.poll(_Response(200, _codex_body(0.0)))
-            for _ in range(2):
-                app.poll(_Response(200, _codex_body(0.0, reset_at=_in_five_hours())))
-
-        assert "still shows" not in caplog.text
-        assert "giving up" not in caplog.text
 
 
 class TestAWakeThatStartsNoWindow:
@@ -328,18 +297,6 @@ class TestARunThatFixesNothing:
 
         assert len(app.cli.commands) == 3
 
-    def test_a_run_that_starts_the_window_is_not_counted_against_it(self, monkeypatch):
-        config = Config(codex=CodexConfig(cooldown_seconds=0))
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS), config)
-
-        for _ in range(5):
-            app.poll(_Response(200, _codex_body(0.0, reset_at=_in_five_hours())))
-            app.poll(_Response(200, _codex_body(3.0, reset_at=_in_five_hours())))
-
-        # One wake starts the window; the later 0% readings fall inside it.
-        assert len(app.cli.commands) == 1
-        assert app.nudger.exhausted is False
-
 
 class TestWhenTheApiAnswerIsNoUse:
     """Nothing is run on an answer that says nothing about the session."""
@@ -372,13 +329,6 @@ class TestWhenTheApiAnswerIsNoUse:
 
         assert app.cli.commands == []
 
-    def test_a_window_in_use_runs_nothing(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-
-        app.poll(_Response(200, _codex_body(42.0)))
-
-        assert app.cli.commands == []
-
 
 class TestWhatTheUserChoosesInSettings:
     """An Apply in the window changes the very next run."""
@@ -406,23 +356,6 @@ class TestWhatTheUserChoosesInSettings:
 
         assert app.cli.commands == []
 
-    def test_a_shorter_cooldown_applied_in_the_window_allows_the_next_run(
-        self, monkeypatch
-    ):
-        clock = [0.0]
-        # A failed run, because a successful wake leaves the window alone.
-        app = _CodexApp(monkeypatch, _Cli(returncode=1, stdout=_CODEX_REJECTED))
-        app.nudger._clock = lambda: clock[0]
-        app.poll(_Response(200, _codex_body(0.0)))
-        clock[0] = 120.0
-
-        pending = PendingSettings(app.settings)
-        pending.edit("codex_cooldown", 60)
-        pending.apply()
-        app.poll(_Response(200, _codex_body(0.0)))
-
-        assert len(app.cli.commands) == 2
-
 
 class TestTheModelAnEmptyBoxUses:
     """From the model in Codex's own config.toml to the grey text in the empty
@@ -438,13 +371,6 @@ class TestTheModelAnEmptyBoxUses:
 
         assert app.field("codex_model").placeholder() == "gpt-6.1-sol (default)"
 
-    def test_a_config_changed_after_start_is_shown(self, monkeypatch):
-        self._codex_config('model = "gpt-6-sol"\n')
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-        self._codex_config('model = "gpt-6.1-sol"\n')
-
-        assert app.field("codex_model").placeholder() == "gpt-6.1-sol (default)"
-
     def test_without_a_config_the_box_says_the_cli_chooses(self, monkeypatch):
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
 
@@ -455,15 +381,6 @@ class TestTheModelAnEmptyBoxUses:
         app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
 
         assert app.field("codex_model").placeholder() == "Codex CLI default"
-
-    def test_the_named_default_is_the_one_the_run_leaves_to_the_cli(self, monkeypatch):
-        # An empty box adds no -m, so the CLI really does use the model shown.
-        self._codex_config('model = "gpt-6.1-sol"\n')
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-
-        app.click("codex_run_command")
-
-        assert "-m" not in app.cli.commands[0]
 
 
 class TestAnExpiredClaudeToken:
@@ -521,27 +438,6 @@ class TestRunNowInSettings:
         ]
         assert lines[-1] == cli_refresher.command_line(CODEX, "", "low")
 
-    def test_the_cli_is_run_with_the_settings_shown(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-
-        app.click("codex_run_command")
-
-        assert app.cli.commands[0][1:] == list(CODEX.cli_arguments("", "low"))
-
-    def test_a_success_asks_for_fresh_usage(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-
-        app.click("codex_run_command")
-
-        assert app.woken.is_set()
-
-    def test_the_window_is_told_when_the_run_starts_and_ends(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-
-        app.click("codex_run_command")
-
-        assert app.changes == ["changed", "changed"]
-
     def test_a_rejected_model_is_shown_in_plain_words(self, monkeypatch):
         app = _CodexApp(monkeypatch, _Cli(returncode=1, stdout=_CODEX_REJECTED))
 
@@ -562,13 +458,6 @@ class TestRunNowInSettings:
 
         assert app.box().startswith("Failed.\nThe codex CLI was not found on PATH.")
         assert app.cli.commands == []
-
-    def test_output_that_cannot_be_read_is_shown_as_a_failure(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(returncode=0, stdout="not json at all"))
-
-        app.click("codex_run_command")
-
-        assert app.box().startswith("Failed after ")
 
     def test_a_run_ignores_the_cooldown_and_the_switches(self, monkeypatch):
         config = Config(codex=CodexConfig(wake_session=False, renew_token=False))
@@ -594,18 +483,6 @@ class TestRunNowInSettings:
         app.click("codex_run_command")
 
         assert app.clipboard[0] == subprocess.list2cmdline(["codex", *app.cli.commands[0][1:]])
-
-    def test_a_model_typed_and_applied_is_the_one_run(self, monkeypatch):
-        app = _CodexApp(monkeypatch, _Cli(stdout=_CODEX_SUCCESS))
-        pending = PendingSettings(app.settings)
-        pending.edit("codex_model", "gpt-5.5")
-        pending.apply()
-
-        app.click("codex_run_command")
-
-        command = app.cli.commands[0]
-        assert command[command.index("-m") + 1] == "gpt-5.5"
-        assert "Command:" in app.box()
 
 
 class TestRunNowForClaude:

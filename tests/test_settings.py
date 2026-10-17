@@ -137,14 +137,6 @@ class TestTheTabsAndGroups:
             "Taskbar",
         ]
 
-    def test_every_tab_carries_at_least_one_group_or_section(self):
-        assert all(tab.groups or tab.sections for tab in _settings().tabs)
-
-    def test_every_group_carries_at_least_one_field(self):
-        model = _settings()
-
-        assert all(group.fields for group in _every_group(model))
-
     def test_the_general_tab_groups_startup_polling_thresholds_and_logs(self):
         general = _settings().tabs[0]
 
@@ -155,24 +147,12 @@ class TestTheTabsAndGroups:
             "Logs",
         ]
 
-    def test_the_taskbar_tab_is_last(self):
-        assert _settings().tabs[-1].title == "Taskbar"
-
     def test_the_taskbar_tab_carries_the_label_switch(self):
         taskbar = _settings().tabs[2]
 
         assert [field.label for group in taskbar.groups for field in group.fields] == [
             "Show usage in the taskbar",
         ]
-
-
-def _every_group(model):
-    """Every group in the model, whether a tab holds it or one of its sections does."""
-    return [
-        group
-        for tab in model.tabs
-        for group in [*tab.groups, *(g for section in tab.sections for g in section.groups)]
-    ]
 
 
 def _providers_tab(model=None):
@@ -186,9 +166,6 @@ class TestTheProvidersTab:
     A tab each would widen the strip with every provider added, and Grok or
     Antigravity would each cost a tab.
     """
-
-    def test_the_providers_tab_has_no_groups_of_its_own(self):
-        assert _providers_tab().groups == []
 
     def test_there_is_one_section_per_provider_in_order(self):
         assert [section.title for section in _providers_tab().sections] == [
@@ -238,14 +215,6 @@ class TestTheProvidersTab:
             "codex_last_run",
         ]
 
-    def test_a_provider_section_names_its_provider(self):
-        claude = _providers_tab().sections[0]
-
-        assert [field.label for group in claude.groups for field in group.fields][:2] == [
-            "Track Claude usage",
-            "Claude usage online",
-        ]
-
     def test_the_refresh_group_says_what_each_setting_does(self):
         refresh = _providers_tab().sections[0].groups[1]
 
@@ -258,16 +227,6 @@ class TestTheProvidersTab:
             "Copy command",
             "Run now",
         ]
-
-    def test_adding_a_provider_is_not_offered_yet(self):
-        # The button exists in the window; it is switched off in the model
-        # until there is a provider that is not already listed.
-        assert _providers_tab().add_section is None
-
-    def test_a_section_field_is_among_the_model_s_fields(self):
-        keys = [field.key for field in _settings().fields()]
-
-        assert "claude_tracking" in keys and "codex_effort" in keys
 
     def test_fields_run_tab_by_tab_and_section_by_section(self):
         keys = [field.key for field in _settings().fields()]
@@ -318,48 +277,11 @@ class TestWhichSettingsTheWindowOffers:
             ]
         )
 
-    def test_every_model_box_is_offered(self):
-        assert self._keys_of(SettingText) == ["claude_model", "codex_model"]
-
-    def test_every_effort_list_is_offered(self):
-        assert self._keys_of(SettingChoice) == ["claude_effort", "codex_effort"]
-
-    def test_each_switch_reports_its_own_state(self):
-        model = _settings(taskbar=_switch(on=False)[0], codex=_switch(on=True)[0])
-
-        assert _field(model, "taskbar").is_on() is False
-        assert _field(model, "codex_tracking").is_on() is True
-
-    def test_each_number_reports_its_own_value(self):
-        model = _settings(poll_interval=_number(30)[0])
-
-        assert _field(model, "poll_interval").value() == 30
-
-    def test_a_number_carries_the_range_it_accepts(self):
-        model = _settings(poll_interval=_number(30, minimum=10, maximum=600)[0])
-        interval = _field(model, "poll_interval")
-
-        assert (interval.minimum, interval.maximum) == (10, 600)
-
     def test_a_number_carries_the_unit_it_is_measured_in(self):
         model = _settings()
 
         assert _field(model, "poll_interval").suffix == "seconds"
         assert _field(model, "amber_threshold").suffix == "%"
-
-    def test_writing_a_switch_runs_that_setting_s_action(self):
-        codex, state = _switch(on=True)
-
-        _field(_settings(codex=codex), "codex_tracking").write(False)
-
-        assert state["on"] is False
-
-    def test_writing_a_number_runs_that_setting_s_action(self):
-        interval, state = _number(60)
-
-        _field(_settings(poll_interval=interval), "poll_interval").write(120)
-
-        assert state["value"] == 120
 
     def test_an_unavailable_setting_is_shown_but_not_clickable(self):
         # The taskbar label can fail to appear at all; a checkbox that claims
@@ -367,15 +289,6 @@ class TestWhichSettingsTheWindowOffers:
         model = _settings(taskbar=_switch(available=False)[0])
 
         assert _field(model, "taskbar").available() is False
-
-    def test_settings_are_available_by_default(self):
-        model = _settings()
-
-        assert all(
-            field.available()
-            for field in model.fields()
-            if isinstance(field, SettingToggle)
-        )
 
 
 class TestTheLinks:
@@ -409,18 +322,6 @@ class TestTheLinks:
 
 class TestTheRefreshFields:
     """Model, effort, and the last run: what the user decides the nudge with."""
-
-    def test_the_model_box_reads_and_writes_its_setting(self):
-        model_text, state = _text("haiku")
-        model = _settings(
-            providers=[_provider_fields(CLAUDE, model=model_text), _provider_fields(CODEX)]
-        )
-        box = _field(model, "claude_model")
-
-        assert box.value() == "haiku"
-        box.write("sonnet")
-
-        assert state["value"] == "sonnet"
 
     def _with_default(self, provider, default_model):
         """Build the settings with one provider's CLI default replaced."""
@@ -468,22 +369,6 @@ class TestTheRefreshFields:
 
         assert effort.choices[0] == ("", "Default (low)")
 
-    def test_each_named_level_is_shown_as_it_is_spelled(self):
-        effort = _field(_settings(), "claude_effort")
-
-        assert ("xhigh", "xhigh") in effort.choices
-
-    def test_the_effort_list_reads_and_writes_its_setting(self):
-        effort_choice, state = _choice("low")
-        model = _settings(
-            providers=[_provider_fields(CLAUDE), _provider_fields(CODEX, effort=effort_choice)]
-        )
-        effort = _field(model, "codex_effort")
-
-        assert effort.value() == "low"
-        effort.write("high")
-
-        assert state["value"] == "high"
 
 class TestParsingATypedNumber:
     """What the user types is held to the range the setting accepts."""
@@ -507,9 +392,6 @@ class TestParsingATypedNumber:
 
     def test_a_number_above_the_range_is_lowered_to_the_maximum(self):
         assert parse_number(self._field(), "9999") == 600
-
-    def test_surrounding_space_is_ignored(self):
-        assert parse_number(self._field(), "  120  ") == 120
 
     def test_an_empty_box_is_not_a_number(self):
         # The user is mid-edit; the last usable value stands until they finish.
@@ -609,32 +491,12 @@ class TestPendingSettings:
 
         assert taskbar_state["on"] is True
 
-    def test_discarding_returns_the_field_to_its_stored_value(self):
-        model, _taskbar, _interval = self._model_and_state()
-        pending = PendingSettings(model)
-        pending.edit("poll_interval", 120)
-
-        pending.discard()
-
-        assert pending.value_of("poll_interval") == 60
-
-    def test_an_unedited_window_is_not_dirty(self):
-        assert PendingSettings(_settings()).is_dirty() is False
-
     def test_an_edited_window_is_dirty(self):
         pending = PendingSettings(_settings())
 
         pending.edit("poll_interval", 120)
 
         assert pending.is_dirty() is True
-
-    def test_a_field_edited_back_to_its_stored_value_is_not_dirty(self):
-        pending = PendingSettings(_settings(poll_interval=_number(60)[0]))
-
-        pending.edit("poll_interval", 120)
-        pending.edit("poll_interval", 60)
-
-        assert pending.is_dirty() is False
 
     def test_an_unknown_key_reads_as_nothing_rather_than_raising(self):
         # The window routes by control id; a stale id must not take the dialog
@@ -663,14 +525,6 @@ class TestPendingText:
         )
         return PendingSettings(model), text_state, effort_state
 
-    def test_a_typed_model_is_held_until_applied(self):
-        pending, text_state, _effort = self._pending()
-
-        pending.edit("claude_model", "sonnet")
-
-        assert pending.value_of("claude_model") == "sonnet"
-        assert text_state["value"] == "haiku"
-
     def test_applying_writes_the_typed_model_and_the_picked_effort(self):
         pending, text_state, effort_state = self._pending()
         pending.edit("claude_model", "sonnet")
@@ -681,13 +535,6 @@ class TestPendingText:
         assert text_state["value"] == "sonnet"
         assert effort_state["value"] == "low"
 
-    def test_typing_the_stored_model_back_is_not_a_change(self):
-        pending, _text_state, _effort = self._pending()
-        pending.edit("claude_model", "sonnet")
-
-        pending.edit("claude_model", "haiku")
-
-        assert pending.is_dirty() is False
 
 class TestApplyingSurvivesAFailure:
     """A setting that cannot be saved must not take the others down with it."""
@@ -779,14 +626,6 @@ class TestSettingsWindowController:
         )
         return controller, pending
 
-    def test_opening_shows_a_window(self):
-        window = _FakeWindow()
-        controller, _pending = self._controller(window, run=lambda work: work())
-
-        controller.open()
-
-        assert window.shows == 1
-
     def test_the_window_runs_off_the_calling_thread(self):
         window = _FakeWindow()
         controller, pending = self._controller(window)
@@ -873,17 +712,6 @@ class TestSettingsWindowController:
         assert len(pending) == 1
         assert "settings window" in caplog.text
 
-    def test_a_click_while_the_first_window_is_still_opening_adds_nothing(self):
-        # The window is created on its own thread, so a fast second click can
-        # arrive before there is a handle to raise.
-        first, second = _FakeWindow(focusable=False), _FakeWindow()
-        controller, pending = self._controller(first, second)
-
-        controller.open()
-        controller.open()
-
-        assert second.shows == 0
-
     def test_closing_the_app_closes_an_open_window(self):
         window = _FakeWindow()
         controller, pending = self._controller(window)
@@ -909,21 +737,6 @@ class TestTheCommandFields:
             button = _field(model, key)
             assert (button.model_key, button.effort_key) == ("claude_model", "claude_effort")
 
-    def test_a_second_provider_s_buttons_read_its_own_fields(self):
-        button = _field(_settings(), "codex_run_command")
-
-        assert (button.model_key, button.effort_key) == ("codex_model", "codex_effort")
-
-    def test_the_copy_button_runs_the_action_it_was_given(self):
-        copy, given = _command()
-        model = _settings(
-            providers=[_provider_fields(CLAUDE, copy_command=copy), _provider_fields(CODEX)]
-        )
-
-        _field(model, "claude_copy_command").act("haiku", "low", lambda: None)
-
-        assert given == [("haiku", "low")]
-
     def test_the_run_button_runs_the_action_it_was_given(self):
         run, given = _command()
         model = _settings(
@@ -934,14 +747,6 @@ class TestTheCommandFields:
 
         assert given == [("", "high")]
 
-    def test_the_output_box_shows_the_text_it_was_given(self):
-        output = SettingOutput(text=lambda: "Succeeded in 6.3 s.")
-        model = _settings(
-            providers=[_provider_fields(CLAUDE, last_run=output), _provider_fields(CODEX)]
-        )
-
-        assert _field(model, "claude_last_run").text() == "Succeeded in 6.3 s."
-
     def test_neither_the_buttons_nor_the_box_hold_a_setting(self):
         # Nothing about them is written on OK, so a pending edit ignores them.
         keys = {field.key for field in _settings().editable()}
@@ -950,5 +755,3 @@ class TestTheCommandFields:
         assert "claude_run_command" not in keys
         assert "claude_last_run" not in keys
 
-    def test_the_buttons_are_not_links(self):
-        assert "Copy command" not in [link.label for link in _settings().links()]

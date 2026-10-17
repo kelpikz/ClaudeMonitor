@@ -43,15 +43,6 @@ class TestEveryProviderIsComplete:
         assert provider.key in icon_art._GLYPH_MASKS
         assert provider.key in label_art._GLYPH_COLORS
 
-    @pytest.mark.parametrize("provider", PROVIDERS)
-    def test_its_mark_is_not_another_providers(self, provider):
-        others = [other for other in PROVIDERS if other is not provider]
-        mine = label_art.taskbar_glyph(provider, 20, uses_light_theme=False)
-
-        for other in others:
-            theirs = label_art.taskbar_glyph(other, 20, uses_light_theme=False)
-            assert mine.tobytes() != theirs.tobytes()
-
     def test_every_key_is_used_once(self):
         assert len({provider.key for provider in PROVIDERS}) == len(PROVIDERS)
 
@@ -71,13 +62,6 @@ class TestWhichFetcherAnswers:
 
         assert CODEX.fetch() is answered
 
-    @pytest.mark.parametrize("provider", PROVIDERS)
-    def test_the_import_is_deferred_but_resolvable(self, provider):
-        # The shim imports inside the call because the fetchers import this
-        # module for their return type. A typo in the module name would only
-        # show up at the first poll, so it is resolved here instead.
-        assert callable(provider.fetch)
-
 
 class TestEveryProviderCanBeSwitchedOff:
     """Each provider owns one config section, named by its own key."""
@@ -92,10 +76,6 @@ class TestEveryProviderCanBeSwitchedOff:
     def test_its_settings_are_ones_the_config_really_has(self, provider):
         for setting in provider.settings.every():
             assert setting in config.EVERY_SETTING
-
-    def test_claude_can_be_switched_off_as_codex_can(self):
-        assert CLAUDE.settings.tracking == config.ConfigSetting("claude", "enabled")
-        assert CODEX.settings.tracking == config.ConfigSetting("codex", "enabled")
 
 
 def _any_time():

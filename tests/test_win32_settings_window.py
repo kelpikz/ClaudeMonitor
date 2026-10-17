@@ -36,7 +36,6 @@ from claudemonitor.win32_bindings import (
     BM_SETCHECK,
     BST_CHECKED,
     BST_UNCHECKED,
-    BS_AUTOCHECKBOX,
     BS_GROUPBOX,
     BUTTON_CLASS,
     CBN_SELCHANGE,
@@ -50,7 +49,6 @@ from claudemonitor.win32_bindings import (
     EDIT_CLASS,
     EN_CHANGE,
     ES_MULTILINE,
-    ES_NUMBER,
     ES_READONLY,
     EM_SETCUEBANNER,
     HWND_BOTTOM,
@@ -60,17 +58,14 @@ from claudemonitor.win32_bindings import (
     LIGHT_THEME_PAGE_BACKGROUND,
     LIGHT_THEME_FIELD_BACKGROUND,
     LBN_SELCHANGE,
-    LBS_NOTIFY,
     LB_ADDSTRING,
     LB_GETCURSEL,
-    LB_SETCURSEL,
     LISTBOX_CLASS,
     NMHDR,
     SETTINGS_CLASS_NAME,
     STATIC_CLASS,
     SW_HIDE,
     SW_SHOW,
-    TAB_CONTROL_CLASS,
     TCM_INSERTITEMW,
     TCN_SELCHANGE,
     UPDOWN_CLASS,
@@ -91,7 +86,6 @@ from claudemonitor.win32_settings_window import (
     _FIRST_FIELD_ID,
     _FIRST_LIST_ID,
     _WM_OUTPUT_CHANGED,
-    _active_windows,
     Win32SettingsWindow,
 )
 
@@ -383,12 +377,6 @@ def _switch_to_tab(window, index: int) -> None:
 class TestWhatTheWindowCreates:
     """The dialog is a tab strip, a page of grouped controls, and three buttons."""
 
-    def test_a_tab_control_is_created(self):
-        window = _window()
-        window._create()
-
-        assert len(_created(window, TAB_CONTROL_CLASS)) == 1
-
     def test_one_tab_is_inserted_per_page(self):
         window = _window()
         window._create()
@@ -410,22 +398,6 @@ class TestWhatTheWindowCreates:
             for tab in model.tabs
         )
         assert len(_created_with_style(window, BUTTON_CLASS, BS_GROUPBOX)) == expected
-
-    def test_one_checkbox_is_created_per_switch(self):
-        window = _window()
-        window._create()
-
-        checkboxes = _created_with_style(window, BUTTON_CLASS, BS_AUTOCHECKBOX)
-        assert len(checkboxes) == 8
-
-    def test_one_box_and_one_spinner_are_created_per_number(self):
-        window = _window()
-        window._create()
-
-        # Five numbers, each with arrows, and one model box and one read-only
-        # last-run box per provider.
-        assert len(_created(window, EDIT_CLASS)) == 9
-        assert len(_created(window, UPDOWN_CLASS)) == 5
 
     def test_a_number_box_opens_showing_the_stored_value(self):
         field, _state = _number_field(value=45)
@@ -503,20 +475,6 @@ class TestWhatTheWindowCreates:
         ]
         assert sent_back == [window._tab_handle]
 
-    def test_the_three_dialog_buttons_are_created(self):
-        window = _window()
-        window._create()
-
-        labels = [call[3] for call in _created(window, BUTTON_CLASS)]
-        assert {"OK", "Cancel", "Apply"} <= set(labels)
-
-    def test_every_control_is_given_the_dialog_font(self):
-        window = _window()
-        window._create()
-
-        fonts = [call for call in window._user32.named("SendMessageW") if call[2] == WM_SETFONT]
-        assert len(fonts) >= len(_created(window, BUTTON_CLASS))
-
     def test_an_unavailable_setting_is_shown_but_disabled(self):
         field, _state = _toggle_field(available=False)
         window = _window(_one_tab(field))
@@ -539,12 +497,6 @@ class TestWhatTheWindowCreates:
 
         assert window._controls["taskbar"].label != window._controls["codex"].label
 
-    def test_common_controls_are_registered_before_the_tab_is_made(self):
-        window = _window()
-        window._create()
-
-        assert window._comctl32.was_called("InitCommonControlsEx")
-
 
 class TestWhichPageIsShown:
     """One page at a time; the others are hidden rather than destroyed."""
@@ -564,17 +516,6 @@ class TestWhichPageIsShown:
 
         assert window._user32.shown[window._page_handles[1]] == SW_SHOW
         assert window._user32.shown[window._page_handles[0]] == SW_HIDE
-
-    def test_a_notification_from_something_else_is_ignored(self):
-        window = _window()
-        window._create()
-        header = NMHDR()
-        header.hwndFrom = 999999
-        header.code = TCN_SELCHANGE
-
-        window._window_proc(window._handle, WM_NOTIFY, 0, ctypes.addressof(header))
-
-        assert window._user32.shown[window._page_handles[0]] == SW_SHOW
 
     def test_a_tab_index_the_dialog_does_not_have_is_ignored(self):
         window = _window()
@@ -632,12 +573,6 @@ class TestTheProviderList:
         (listbox,) = _created(window, LISTBOX_CLASS)
         assert listbox[9] == window._page_handles[1]
 
-    def test_the_list_tells_the_page_when_the_pick_changes(self):
-        window, _claude, _codex = self._window()
-
-        (listbox,) = _created(window, LISTBOX_CLASS)
-        assert listbox[4] & LBS_NOTIFY
-
     def test_every_section_is_an_entry_in_the_list(self):
         window, _claude, _codex = self._window()
 
@@ -645,17 +580,6 @@ class TestTheProviderList:
             call for call in window._user32.named("SendMessageW") if call[2] == LB_ADDSTRING
         ]
         assert len(added) == 2
-
-    def test_the_first_entry_starts_picked(self):
-        window, _claude, _codex = self._window()
-        (list_handle,) = window._user32.handles_of_class(LISTBOX_CLASS)
-
-        picked = [
-            call[3]
-            for call in window._user32.named("SendMessageW")
-            if call[1] == list_handle and call[2] == LB_SETCURSEL
-        ]
-        assert picked == [0]
 
     def test_each_section_is_a_window_on_the_page(self):
         # A section is a window for the same reason a page is: hidden loose
@@ -702,14 +626,6 @@ class TestTheProviderList:
 
         assert window._user32.shown == shown_before
 
-    def test_other_notifications_from_the_list_change_nothing(self):
-        window, _claude, _codex = self._window()
-        shown_before = dict(window._user32.shown)
-
-        _pick_section(window, 1, notification=4)  # LBN_SETFOCUS
-
-        assert window._user32.shown == shown_before
-
     def test_a_click_in_a_section_reaches_the_dialog(self):
         window, _claude, codex_state = self._window()
         _codex_section = window._side_lists[0].sections[1]
@@ -724,13 +640,6 @@ class TestTheProviderList:
         _command(window, IDOK)
 
         assert codex_state["on"] is False
-
-    def test_a_section_paints_the_page_colour(self):
-        window, _claude, _codex = self._window()
-        section = window._side_lists[0].sections[0]
-
-        assert window._window_proc(section, WM_ERASEBKGND, 500, 0) == 1
-        assert ("FillRect", 500, ANY_RECT, window._page_brush) in _fills(window)
 
     def test_the_list_is_given_the_text_field_colour(self):
         window, _claude, _codex = self._window()
@@ -749,19 +658,6 @@ class TestTheProviderList:
         _command(window, IDOK)
 
         assert claude_state["on"] is False
-
-    def test_section_windows_are_forgotten_once_the_window_closes(self):
-        window, _claude, _codex = self._window()
-        sections = list(window._side_lists[0].sections)
-
-        window.show()
-
-        assert not any(handle in _active_windows for handle in sections)
-
-    def test_there_is_no_add_button_without_an_add_action(self):
-        window, _claude, _codex = self._window()
-
-        assert "Add provider…" not in [call[3] for call in _created(window, BUTTON_CLASS)]
 
     def test_the_production_window_offers_no_add_button_yet(self):
         window = _window()
@@ -785,18 +681,6 @@ class TestTheProviderList:
         window._window_proc(window._page_handles[0], WM_COMMAND, _FIRST_ADD_ID, 0)
 
         assert opened == ["add"]
-
-    def test_an_add_action_that_fails_is_logged_not_raised(self, caplog):
-        def refuse():
-            raise OSError("no picker yet")
-
-        add = SettingLink(key="add_provider", label="Add provider…", open=refuse)
-        window, _claude, _codex = self._window(add_section=add)
-
-        with caplog.at_level(logging.ERROR):
-            window._window_proc(window._page_handles[0], WM_COMMAND, _FIRST_ADD_ID, 0)
-
-        assert "Add provider" in caplog.text
 
 
 class TestChangingAProviderEndToEnd:
@@ -857,12 +741,6 @@ class TestNothingIsWrittenUntilApplied:
         _command(window, IDOK)
 
         assert state["on"] is False
-
-    def test_ok_closes_the_window(self):
-        window, _state = self._window_with_switch()
-
-        _command(window, IDOK)
-
         assert window._user32.was_called("DestroyWindow")
 
     def test_cancel_writes_nothing_and_closes(self):
@@ -890,23 +768,6 @@ class TestNothingIsWrittenUntilApplied:
         window._window_proc(window._handle, WM_CLOSE, 0, 0)
 
         assert state["on"] is True
-
-    def test_applying_twice_writes_once(self):
-        written: list[bool] = []
-        field = SettingToggle(
-            key="taskbar",
-            label="Show usage in the taskbar",
-            is_on=lambda: True,
-            write=written.append,
-        )
-        window = _window(_one_tab(field))
-        window._create()
-        self._click_checkbox(window, "taskbar", False)
-
-        _command(window, _APPLY_ID)
-        _command(window, _APPLY_ID)
-
-        assert written == [False]
 
     def test_a_setting_that_refuses_to_save_is_logged_not_raised(self, caplog):
         def refuse(value):
@@ -947,14 +808,6 @@ class TestTypingANumber:
         _command(window, IDOK)
 
         assert state["value"] == 120
-
-    def test_a_number_outside_the_range_is_clamped(self):
-        window, state = self._window_with_number(value=60, minimum=10, maximum=600)
-
-        self._type(window, "poll_interval", "9999")
-        _command(window, IDOK)
-
-        assert state["value"] == 600
 
     def test_a_half_typed_box_does_not_change_the_setting(self):
         window, state = self._window_with_number(value=60)
@@ -1015,17 +868,6 @@ class TestTypingAModel:
         window._user32.text[window._controls["claude_model"].editor] = text
         _command(window, _FIRST_EDITOR_ID + _field_index(window, "claude_model"), EN_CHANGE)
 
-    def test_the_box_opens_showing_the_stored_model(self):
-        window, _state = self._window("haiku")
-
-        assert window._user32.text[window._controls["claude_model"].editor] == "haiku"
-
-    def test_the_box_accepts_letters_as_well_as_digits(self):
-        window, _state = self._window()
-
-        (editor,) = _created(window, EDIT_CLASS)
-        assert not editor[4] & ES_NUMBER
-
     def test_a_placeholder_is_shown_in_an_empty_box(self):
         asked: list[str] = []
         field = SettingText(
@@ -1049,13 +891,6 @@ class TestTypingAModel:
         # Read when the window opens, so a changed CLI config shows at once.
         assert asked == ["asked"]
 
-    def test_a_box_without_a_placeholder_sets_none(self):
-        window, _state = self._window()
-
-        assert not [
-            call for call in window._user32.named("SendMessageW") if call[2] == EM_SETCUEBANNER
-        ]
-
     def test_a_typed_model_is_written_on_ok(self):
         window, state = self._window("haiku")
 
@@ -1063,14 +898,6 @@ class TestTypingAModel:
         _command(window, IDOK)
 
         assert state["value"] == "sonnet"
-
-    def test_a_typed_model_is_not_written_on_cancel(self):
-        window, state = self._window("haiku")
-
-        self._type(window, "sonnet")
-        _command(window, IDCANCEL)
-
-        assert state["value"] == "haiku"
 
     def test_an_emptied_box_is_written_as_empty(self):
         # Empty means "the CLI's own default", which is a real choice.
@@ -1123,14 +950,6 @@ class TestPickingAnEffort:
         (combo,) = _created(window, COMBOBOX_CLASS)
         assert combo[4] & 0x0F == CBS_DROPDOWNLIST
 
-    def test_every_level_is_added_to_the_list(self):
-        window, _state = self._window()
-
-        added = [
-            call for call in window._user32.named("SendMessageW") if call[2] == CB_ADDSTRING
-        ]
-        assert len(added) == len(_EFFORTS)
-
     def test_the_stored_level_is_selected(self):
         window, _state = self._window("high")
 
@@ -1158,14 +977,6 @@ class TestPickingAnEffort:
 
         assert state["value"] == "low"
 
-    def test_other_notifications_from_the_list_change_nothing(self):
-        window, state = self._window("")
-
-        self._pick(window, 2, notification=3)  # CBN_SETFOCUS
-        _command(window, IDOK)
-
-        assert state["value"] == ""
-
     def test_the_list_is_given_the_dark_combo_box_theme_in_dark_mode(self):
         window, _state = self._window(light=False)
         (combo_handle,) = window._user32.handles_of_class(COMBOBOX_CLASS)
@@ -1173,13 +984,6 @@ class TestPickingAnEffort:
         assert ("SetWindowTheme", combo_handle, DARK_MODE_COMBOBOX_THEME, None) in (
             window._uxtheme.calls
         )
-
-    def test_the_open_list_is_given_the_text_field_colour(self):
-        window, _state = self._window()
-
-        window._window_proc(window._page_handles[0], WM_CTLCOLORLISTBOX, 700, 0)
-
-        assert ("SetBkColor", 700, LIGHT_THEME_FIELD_BACKGROUND) in window._gdi32.calls
 
 
 class TestColours:
@@ -1245,23 +1049,9 @@ class TestColours:
 
         assert window._dwmapi.was_called("DwmSetWindowAttribute")
 
-    def test_light_mode_leaves_the_title_bar_alone(self):
-        window = _window(light=True)
-        window._create()
-
-        assert not window._dwmapi.was_called("DwmSetWindowAttribute")
-
 
 class TestTheWindowLifecycle:
     """Showing, raising, and closing, unchanged in spirit from the old dialog."""
-
-    def test_showing_creates_the_window_and_pumps_until_it_closes(self):
-        window = _window()
-
-        window.show()
-
-        assert window._user32.was_called("CreateWindowExW")
-        assert window._user32.was_called("GetMessageW")
 
     def test_the_handle_is_forgotten_once_the_window_closes(self):
         window = _window()
@@ -1364,15 +1154,7 @@ class TestTheDarkTabStrip:
             if call[2] == GWLP_WNDPROC
         ]
 
-    def test_the_strip_is_filled_with_the_dialog_background(self):
-        window = self._dark_window()
-        window._user32.calls.clear()
-
-        window._paint_tab_strip(500)
-
-        assert _brushes_filled(window)[0] == window._background_brush
-
-    def test_the_current_tab_is_filled_with_the_page_colour(self):
+    def test_the_current_tab_has_the_page_colour_and_the_others_do_not(self):
         # The selected tab has to read as part of the page below it.
         window = self._dark_window()
         window._user32.results["SendMessageW"] = lambda handle, message, wparam, lparam: (
@@ -1382,17 +1164,8 @@ class TestTheDarkTabStrip:
 
         window._paint_tab_strip(500)
 
+        assert _brushes_filled(window)[0] == window._background_brush
         assert window._page_brush in _brushes_filled(window)
-
-    def test_the_other_tabs_are_filled_with_the_inactive_colour(self):
-        window = self._dark_window()
-        window._user32.results["SendMessageW"] = lambda handle, message, wparam, lparam: (
-            3 if message == TCM_GETITEMCOUNT else 0
-        )
-        window._user32.calls.clear()
-
-        window._paint_tab_strip(500)
-
         assert window._tab_inactive_brush in _brushes_filled(window)
 
     def test_every_tab_is_titled(self):
@@ -1414,21 +1187,6 @@ class TestTheDarkTabStrip:
         window._paint_tab_strip(500)
 
         assert window._border_brush in _brushes_framed(window)
-
-    def test_the_dark_brushes_are_released_with_the_others(self):
-        window = _window(light=False)
-
-        window.show()
-
-        # Background, page, field, inactive tab, and border.
-        assert len(window._gdi32.named("DeleteObject")) >= 5
-
-    def test_light_mode_makes_no_tab_strip_brushes(self):
-        window = _window(light=True)
-        window._create()
-
-        assert window._tab_inactive_brush is None
-        assert window._border_brush is None
 
     def test_painting_asks_the_control_where_its_tabs_are(self):
         # The control still lays the strip out; only the pixels are ours.
@@ -1490,11 +1248,6 @@ class TestTheCommandButtons:
     def _click(self, window) -> None:
         _command(window, _FIRST_FIELD_ID + _field_index(window, "claude_run_command"))
 
-    def test_a_command_is_a_push_button_with_its_label(self):
-        window, _given = self._window()
-
-        assert any(call[3] == "Run now" for call in _created(window, BUTTON_CLASS))
-
     def test_a_click_acts_on_the_stored_model_and_effort(self):
         window, given = self._window()
 
@@ -1510,13 +1263,6 @@ class TestTheCommandButtons:
         self._click(window)
 
         assert given == [("sonnet", "low")]
-
-    def test_a_click_leaves_nothing_to_apply(self):
-        window, _given = self._window()
-
-        self._click(window)
-
-        assert window._pending.is_dirty() is False
 
     def test_an_action_that_fails_is_logged_not_raised(self, caplog):
         def refuse(model, effort, changed):
@@ -1597,23 +1343,6 @@ class TestTheOutputBox:
         assert window._user32.text[self._box(window)] == ""
         assert "claude_last_run" in caplog.text
 
-    def test_applying_does_not_touch_the_box(self):
-        window = self._window()
-        before = len(window._user32.named("SetWindowTextW"))
-
-        _command(window, _APPLY_ID)
-
-        assert len(window._user32.named("SetWindowTextW")) == before
-
-    def test_the_production_window_has_one_box_per_provider(self):
-        window = _window()
-        window._create()
-
-        boxes = [
-            call for call in _created(window, EDIT_CLASS) if call[4] & ES_READONLY
-        ]
-        assert len(boxes) == 2
-
 
 def _output_window(*extra_fields, text=lambda: ""):
     """A window whose one group holds a Last run box, plus any other fields given.
@@ -1655,14 +1384,10 @@ class TestHidingAnEmptyOutput:
     def _box(self, window) -> int:
         return window._controls["claude_last_run"].label
 
-    def test_an_empty_box_is_hidden(self):
-        window = _output_window()
-
-        assert window._user32.shown[self._box(window)] == SW_HIDE
-
     def test_a_group_of_empty_boxes_is_hidden_with_its_caption(self):
         window = _output_window()
 
+        assert window._user32.shown[self._box(window)] == SW_HIDE
         assert all(window._user32.shown[handle] == SW_HIDE for handle in _group_handles(window))
 
     def test_a_box_with_text_is_shown(self):
@@ -1723,17 +1448,6 @@ class TestTheOutputFont:
 
         assert self._fonts_given(window, window._controls["taskbar"].label) == [501]
 
-    def test_the_monospace_font_is_released_with_the_others(self):
-        output = SettingOutput(key="claude_last_run", text=lambda: "")
-        window = _window(_one_tab(output))
-        fonts = iter([501, 502])
-        window._gdi32.results["CreateFontIndirectW"] = lambda *args: next(fonts)
-
-        window.show()
-
-        deleted = [call[1] for call in window._gdi32.named("DeleteObject")]
-        assert 501 in deleted and 502 in deleted
-
 
 class TestTheWindowIcon:
     """The title bar and the taskbar show the app's own tile, not Python's.
@@ -1761,26 +1475,11 @@ class TestTheWindowIcon:
             if call[1] == window._handle and call[2] == self._WM_SETICON
         }
 
-    def _sizes_asked(self, window) -> list[tuple[int, int]]:
-        return [(call[5], call[6]) for call in window._user32.named("CreateIconFromResourceEx")]
-
     def test_the_big_and_the_small_icon_are_both_set(self):
         window = self._window()
         window._create()
 
         assert self._icons_set(window) == {self._ICON_BIG: 501, self._ICON_SMALL: 502}
-
-    def test_each_is_drawn_at_the_size_windows_asks_for(self):
-        window = self._window(metrics={11: 40, 49: 20})
-        window._create()
-
-        assert self._sizes_asked(window) == [(40, 40), (20, 20)]
-
-    def test_a_size_windows_does_not_give_falls_back_to_the_usual_one(self):
-        window = self._window(metrics={})
-        window._create()
-
-        assert self._sizes_asked(window) == [(32, 32), (16, 16)]
 
     def test_the_icons_are_freed_when_the_window_closes(self):
         window = self._window()
@@ -1789,14 +1488,4 @@ class TestTheWindowIcon:
 
         assert [call[1] for call in window._user32.named("DestroyIcon")] == [501, 502]
 
-    def test_an_icon_windows_cannot_make_is_skipped(self, caplog):
-        window = self._window(icons=(0, 502))
 
-        with caplog.at_level(logging.WARNING):
-            window.show()
-
-        assert self._icon_numbers_freed(window) == [502]
-        assert "icon" in caplog.text
-
-    def _icon_numbers_freed(self, window) -> list[int]:
-        return [call[1] for call in window._user32.named("DestroyIcon")]

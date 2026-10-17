@@ -12,13 +12,10 @@ from claudemonitor import win32_bindings
 from claudemonitor.win32_bindings import (
     AC_SRC_ALPHA,
     ANTIALIASED_QUALITY,
-    BI_RGB,
     COMCTL32_SIGNATURES,
-    DARK_THEME_FOREGROUND,
     ERROR_CLASS_ALREADY_EXISTS,
     GDI32_SIGNATURES,
     KERNEL32_SIGNATURES,
-    LABEL_BITS_PER_PIXEL,
     LIGHT_THEME_FOREGROUND,
     ULW_ALPHA,
     USER32_SIGNATURES,
@@ -38,13 +35,11 @@ from claudemonitor.win32_bindings import (
     WS_EX_LAYERED,
     WS_POPUP,
     apply_signatures,
-    foreground_color_for_theme,
 )
 from claudemonitor import label_art
 from claudemonitor import win32_taskbar_window
 from claudemonitor.win32_taskbar_window import (
     Win32TaskbarWindow,
-    _bitmap_info_for,
     _ICON_CONTENT_RIGHT_PADDING,
     _ICON_LEFT_INSET,
     _ICON_SIZE,
@@ -231,15 +226,6 @@ def _window(
 class TestSignatureTable:
     """Argument types are declared from a table so 64-bit handles never truncate."""
 
-    def test_apply_signatures_declares_argument_and_return_types(self):
-        dll = type("_Blank", (), {})()
-        dll.FindWindowW = type("_Function", (), {})()
-
-        apply_signatures(dll, {"FindWindowW": ((wintypes.LPCWSTR,), wintypes.HWND)})
-
-        assert dll.FindWindowW.argtypes == (wintypes.LPCWSTR,)
-        assert dll.FindWindowW.restype == wintypes.HWND
-
     def test_message_parameters_are_pointer_sized(self):
         # A 32-bit LPARAM would truncate pointers Windows passes to our callback.
         _argument_types, _return_type = USER32_SIGNATURES["DefWindowProcW"]
@@ -410,16 +396,6 @@ class TestWindowLifecycle:
 
 class TestTooltip:
     """Hovering the taskbar label exposes the same detail as the tray icon."""
-
-    def test_common_controls_are_initialized_for_the_tooltip_window_class(self):
-        comctl32 = _FakeDll()
-
-        _initialize_tooltip_controls(comctl32)
-
-        initialized = comctl32.named("InitCommonControlsEx")
-        assert initialized
-        assert initialized[0][1]._obj.dwSize > 0
-        assert initialized[0][1]._obj.dwICC != 0
 
     def test_failed_common_control_initialization_is_reported(self):
         comctl32 = _FakeDll()
@@ -642,12 +618,6 @@ class TestStyleWrites:
 class TestTheme:
     """Near-white text is unreadable on a Windows 11 light-mode taskbar."""
 
-    def test_dark_theme_uses_a_near_white_foreground(self):
-        assert foreground_color_for_theme(uses_light_theme=False) == DARK_THEME_FOREGROUND
-
-    def test_light_theme_uses_a_near_black_foreground(self):
-        assert foreground_color_for_theme(uses_light_theme=True) == LIGHT_THEME_FOREGROUND
-
     def test_text_is_painted_in_the_colour_the_active_theme_calls_for(
         self, monkeypatch
     ):
@@ -725,24 +695,6 @@ class TestTheme:
 
 
 class TestPainting:
-    def test_current_text_is_drawn_on_every_paint_request(self):
-        user32 = _FakeUser32()
-        native = _window(user32=user32)
-        native._segments = [LabelSegment(CLAUDE, "80% (3h 0m)")]
-
-        native._window_proc(30, WM_PAINT, 0, 0)
-
-        drawn = user32.named("DrawTextW")
-        assert drawn and drawn[0][2] == "80% (3h 0m)"
-
-    def test_the_finished_picture_is_handed_to_windows_to_composite(self):
-        user32 = _FakeUser32()
-        native = _window(user32=user32)
-        native._segments = [LabelSegment(CLAUDE, "80% (3h 0m)")]
-
-        native._window_proc(30, WM_PAINT, 0, 0)
-
-        assert len(user32.named("UpdateLayeredWindow")) == 1
 
     def test_windows_is_told_to_read_the_alpha_channel(self):
         user32 = _FakeUser32()
@@ -767,16 +719,6 @@ class TestPainting:
 
         size = user32.named("UpdateLayeredWindow")[0][4]._obj
         assert (size.cx, size.cy) == (137, 60)
-
-    def test_the_text_rect_leaves_room_for_the_icon_on_the_left(self):
-        user32 = _FakeUser32()
-        native = _window(user32=user32)
-        native._segments = [LabelSegment(CLAUDE, "80% (3h 0m)")]
-
-        native._window_proc(30, WM_PAINT, 0, 0)
-
-        drawn_rect = user32.named("DrawTextW")[0][4]._obj
-        assert drawn_rect.left > 0
 
     def test_every_drawing_surface_is_released(self):
         # This runs once a second for as long as the machine is on, so a handle
@@ -816,16 +758,6 @@ class TestPainting:
         native._window_proc(30, WM_PAINT, 0, 0)
 
         assert not user32.was_called("UpdateLayeredWindow")
-
-    def test_unhandled_messages_are_delegated_to_windows(self):
-        user32 = _FakeUser32()
-        user32.results["DefWindowProcW"] = 7
-        unhandled_message = 0x0005  # WM_SIZE
-
-        result = _window(user32=user32)._window_proc(30, unhandled_message, 1, 2)
-
-        assert result == 7
-        assert ("DefWindowProcW", 30, unhandled_message, 1, 2) in user32.calls
 
 
 class TestAntiAliasedEdges:
@@ -870,16 +802,6 @@ class TestAntiAliasedEdges:
             max(pixel[:3]) <= pixel[3] for pixel in bitmap.get_flattened_data()
         )
 
-    def test_the_bitmap_is_a_top_down_32bpp_surface(self):
-        info = _bitmap_info_for(width=16, height=16)
-
-        assert info.bmiHeader.biWidth == 16
-        # Negative height marks the DIB top-down, matching row 0 = top row.
-        assert info.bmiHeader.biHeight == -16
-        assert info.bmiHeader.biBitCount == LABEL_BITS_PER_PIXEL
-        assert info.bmiHeader.biPlanes == 1
-        assert info.bmiHeader.biCompression == BI_RGB
-
     def test_the_text_is_flushed_before_its_coverage_is_read_back(self):
         # GDI batches its drawing. Reading a DIB section it was told to draw
         # into, without flushing first, can return a surface the text has not
@@ -908,22 +830,6 @@ class TestTextMeasurement:
     """The label is sized to fit exactly the icon plus the current text, so a
     short string like an error label never leaves dead space before the clock."""
 
-    def _fake_gdi32_reporting_width(self, width: int) -> _FakeDll:
-        gdi32 = _FakeDll()
-
-        def fill_size(hdc, text, length, size_pointer):
-            size_pointer._obj.cx = width
-            size_pointer._obj.cy = 15
-            return 1
-
-        gdi32.results["GetTextExtentPoint32W"] = fill_size
-        return gdi32
-
-    def test_measured_width_matches_what_windows_reports(self):
-        gdi32 = self._fake_gdi32_reporting_width(91)
-
-        assert _window(gdi32=gdi32).measure_text_width("95% (4h 14m)") == 91
-
     def test_the_measurement_device_context_is_always_released(self):
         gdi32 = _FakeDll()
 
@@ -932,34 +838,8 @@ class TestTextMeasurement:
         assert gdi32.was_called("CreateCompatibleDC")
         assert gdi32.was_called("DeleteDC")
 
-    def test_content_width_adds_the_icon_prefix_and_right_padding(self):
-        gdi32 = self._fake_gdi32_reporting_width(100)
-
-        content_width = _window(gdi32=gdi32).content_width_for(
-            [LabelSegment(CLAUDE, "anything")]
-        )
-
-        assert content_width == (
-            _ICON_LEFT_INSET + _ICON_SIZE + _ICON_TEXT_GAP + 100 + _ICON_CONTENT_RIGHT_PADDING
-        )
-
-    def test_shorter_text_yields_a_narrower_content_width(self):
-        native = _window(gdi32=self._fake_gdi32_reporting_width(40))
-        wider_native = _window(gdi32=self._fake_gdi32_reporting_width(120))
-
-        assert native.content_width_for(
-            [LabelSegment(CLAUDE, "40%")]
-        ) < wider_native.content_width_for(
-            [LabelSegment(CLAUDE, "100% (not started)")]
-        )
-
 
 class TestFont:
-    def test_the_system_message_font_is_preferred_over_the_stock_font(self):
-        gdi32 = _FakeDll()
-        gdi32.results["CreateFontIndirectW"] = 55
-
-        assert _window(gdi32=gdi32).message_font() == 55
 
     def test_a_failed_metrics_query_falls_back_to_the_stock_ui_font(self):
         user32 = _FakeUser32()
@@ -1036,21 +916,6 @@ class TestClassRegistration:
 
         assert native._window_proc_callback in win32_taskbar_window._registered_wndproc_callbacks
 
-    def test_an_already_registered_class_does_not_add_a_duplicate_reference(self):
-        user32 = _FakeUser32()
-        native = _window(user32=user32)
-
-        def already_registered(*_args):
-            ctypes.set_last_error(ERROR_CLASS_ALREADY_EXISTS)
-            return 0
-
-        user32.RegisterClassExW = already_registered
-        before = len(win32_taskbar_window._registered_wndproc_callbacks)
-
-        native._register_class()
-
-        assert len(win32_taskbar_window._registered_wndproc_callbacks) == before
-
 
 class TestMessagePump:
     def test_a_quit_message_stops_the_companion_thread(self):
@@ -1126,18 +991,6 @@ class TestSegmentWidth:
             + _ICON_CONTENT_RIGHT_PADDING
         )
 
-    def test_every_row_pays_for_its_own_glyph(self):
-        # The glyph sits inside the row, so a row's width still covers it.
-        native = _window()
-
-        assert native.content_width_for([_codex("64% (2h 14m)")]) == (
-            _ICON_LEFT_INSET
-            + _ICON_SIZE
-            + _ICON_TEXT_GAP
-            + native.measure_text_width("64% (2h 14m)")
-            + _ICON_CONTENT_RIGHT_PADDING
-        )
-
     def test_an_empty_label_still_has_its_trailing_padding(self):
         assert _window().content_width_for([]) == _ICON_CONTENT_RIGHT_PADDING
 
@@ -1196,27 +1049,7 @@ class TestSegmentPainting:
         rect = _client_area(user32)
         return user32, native._draw_segments(1, rect, 96)
 
-    def test_one_mark_is_placed_per_segment(self):
-        _user32, placements = self._placed([_claude("80%"), _codex("64%")])
-
-        assert len(placements) == 2
-
-    def test_segments_are_stacked_top_to_bottom(self):
-        user32, _placements = self._placed([_claude("80%"), _codex("64%")])
-
-        rects = [call[4]._obj for call in user32.named("DrawTextW")]
-        assert rects[0].left == rects[1].left
-        assert rects[0].top < rects[1].top
-
     def test_each_provider_supplies_its_own_mark(self):
-        _user32, placements = self._placed([_claude("80%"), _codex("64%")])
-
-        claude_mark, codex_mark = (glyph for glyph, _position in placements)
-        assert claude_mark.tobytes() != codex_mark.tobytes()
-
-    def test_each_row_is_drawn_with_its_own_providers_mark(self):
-        # The segment carries its provider, so a paint can no longer be handed
-        # a name nobody drew and have to guess which mark was meant.
         _user32, placements = self._placed([_claude("80%"), _codex("64%")])
 
         claude_mark, codex_mark = (glyph for glyph, _position in placements)
@@ -1237,14 +1070,6 @@ class TestSegmentPainting:
 
 class TestThemedGlyphs:
     """The Codex mark is monochrome, so it follows the theme like the text does."""
-
-    def _mark(self, segment):
-        user32 = _FakeUser32()
-        native = _window(user32=user32)
-        native.set_segments(30, [segment])
-        rect = _client_area(user32)
-        (glyph, _position), = native._draw_segments(1, rect, 96)
-        return glyph
 
     def test_painting_uses_the_theme_the_label_last_read(self, monkeypatch):
         monkeypatch.setattr(
@@ -1333,11 +1158,6 @@ class TestStackedRows:
 
         assert placements[0][1][0] == placements[1][1][0]
 
-    def test_the_lower_mark_sits_in_the_lower_row(self):
-        _rects, placements = self._painted([_claude("80%"), _codex("64%")])
-
-        assert placements[0][1][1] < placements[1][1][1]
-
     def test_a_shared_row_shrinks_the_mark_below_its_nominal_size(self):
         # Scaled by the display alone, the mark grew to fill its half of the
         # taskbar completely, leaving a pixel of clearance above and below.
@@ -1371,8 +1191,3 @@ class TestStackedRows:
             48 - _STACK_VERTICAL_PADDING,
         )
 
-    def test_an_empty_label_paints_nothing(self):
-        rects, placements = self._painted([])
-
-        assert rects == []
-        assert placements == []

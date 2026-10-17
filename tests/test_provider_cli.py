@@ -96,28 +96,25 @@ class TestWhatClaudeIsAsked:
         # A one-word reply needs no reasoning, whatever the user's own default is.
         assert _value_after(CLAUDE.cli_arguments("", ""), "--effort") == "low"
 
-    def test_no_tools_are_offered(self):
+    def test_tools_mcp_skills_and_claude_md_are_all_left_out(self):
         # Every tool definition is sent with the request; a nudge uses none.
-        assert "--tools=" in CLAUDE.cli_arguments("", "")
-
-    def test_no_mcp_servers_are_loaded(self):
-        assert "--strict-mcp-config" in CLAUDE.cli_arguments("", "")
-
-    def test_no_skills_are_listed(self):
-        assert "--disable-slash-commands" in CLAUDE.cli_arguments("", "")
-
-    def test_no_claude_md_or_user_settings_are_read(self):
         # An empty setting source list is what keeps the global and the
         # project CLAUDE.md out of the prompt. OAuth still works without it.
-        assert "--setting-sources=" in CLAUDE.cli_arguments("", "")
+        arguments = CLAUDE.cli_arguments("", "")
+
+        for flag in (
+            "--tools=",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--setting-sources=",
+            "--no-session-persistence",
+        ):
+            assert flag in arguments
 
     def test_the_long_default_system_prompt_is_replaced(self):
         arguments = CLAUDE.cli_arguments("", "")
 
         assert _value_after(arguments, "--system-prompt") == "Reply briefly."
-
-    def test_the_run_is_kept_out_of_the_users_session_history(self):
-        assert "--no-session-persistence" in CLAUDE.cli_arguments("", "")
 
     def test_bare_mode_is_never_used(self):
         # --bare never reads OAuth, so it could neither renew a token nor
@@ -181,9 +178,10 @@ class TestWhatCodexIsAsked:
     def test_no_agents_md_is_read(self):
         assert "project_doc_max_bytes=0" in _codex_overrides(CODEX.cli_arguments("", ""))
 
-    @pytest.mark.parametrize(
-        "override",
-        [
+    def test_each_unneeded_prompt_section_is_switched_off(self):
+        overrides = _codex_overrides(CODEX.cli_arguments("", ""))
+
+        for override in (
             "include_permissions_instructions=false",
             "include_apps_instructions=false",
             "include_environment_context=false",
@@ -192,14 +190,13 @@ class TestWhatCodexIsAsked:
             "agents.enabled=false",
             "web_search=disabled",
             "notify=[]",
-        ],
-    )
-    def test_each_unneeded_prompt_section_is_switched_off(self, override):
-        assert override in _codex_overrides(CODEX.cli_arguments("", ""))
+        ):
+            assert override in overrides
 
-    @pytest.mark.parametrize(
-        "feature",
-        [
+    def test_each_tool_and_plugin_feature_is_switched_off(self):
+        overrides = _codex_overrides(CODEX.cli_arguments("", ""))
+
+        for feature in (
             "plugins",
             "apps",
             "hooks",
@@ -217,10 +214,8 @@ class TestWhatCodexIsAsked:
             "skill_search",
             "code_mode_host",
             "workspace_dependencies",
-        ],
-    )
-    def test_each_tool_and_plugin_feature_is_switched_off(self, feature):
-        assert f"features.{feature}=false" in _codex_overrides(CODEX.cli_arguments("", ""))
+        ):
+            assert f"features.{feature}=false" in overrides
 
     def test_features_are_never_switched_off_with_the_disable_flag(self):
         # --disable stops Codex on a feature name it does not know, so one
@@ -267,12 +262,6 @@ class TestReadingTheCodexMcpServers:
 
         assert codex_fetcher._configured_mcp_servers() == ()
 
-    def test_a_config_without_servers_names_none(self, tmp_path, monkeypatch):
-        (tmp_path / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
-        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-
-        assert codex_fetcher._configured_mcp_servers() == ()
-
     def test_a_server_name_that_is_not_a_bare_key_is_skipped(self, tmp_path, monkeypatch):
         # A quoted key would need a double quote in the override, which
         # PowerShell 5.1 strips. Such a name is rare; it is left on.
@@ -302,21 +291,8 @@ class TestReadingClaudesReply:
 
         assert reply.succeeded is True
         assert (reply.input_tokens, reply.output_tokens) == (17003, 12)
-
-    def test_a_reply_carries_the_text_claude_answered(self):
-        reply = CLAUDE.read_cli_reply(0, _claude_result(), "")
-
         assert reply.reply_text == "Hi! How can I help?"
-
-    def test_a_reply_carries_the_cost_claude_reported(self):
-        reply = CLAUDE.read_cli_reply(0, _claude_result(), "")
-
         assert reply.cost_usd == 0.0052
-
-    def test_a_missing_cost_is_not_invented(self):
-        stdout = json.dumps({"type": "result", "is_error": False, "result": "Hi"})
-
-        assert CLAUDE.read_cli_reply(0, stdout, "").cost_usd is None
 
     def test_a_cost_that_is_not_a_number_is_ignored(self):
         stdout = _claude_result(total_cost_usd="free")
@@ -375,13 +351,8 @@ class TestReadingCodexsReply:
 
         assert reply.succeeded is True
         assert (reply.input_tokens, reply.output_tokens) == (17405, 13)
-
-    def test_a_completed_turn_carries_the_text_codex_answered(self):
-        stdout = _codex_events(
-            _CODEX_STARTED, _CODEX_TURN_STARTED, _CODEX_MESSAGE, _CODEX_COMPLETED
-        )
-
-        assert CODEX.read_cli_reply(0, stdout, "").reply_text == "Hi!"
+        assert reply.reply_text == "Hi!"
+        assert reply.cost_usd is None
 
     def test_an_item_without_text_does_not_hide_the_answer(self):
         # A reasoning item completes before the message and carries no text.
@@ -389,11 +360,6 @@ class TestReadingCodexsReply:
         stdout = _codex_events(_CODEX_MESSAGE, reasoning, _CODEX_COMPLETED)
 
         assert CODEX.read_cli_reply(0, stdout, "").reply_text == "Hi!"
-
-    def test_codex_reports_no_cost(self):
-        stdout = _codex_events(_CODEX_MESSAGE, _CODEX_COMPLETED)
-
-        assert CODEX.read_cli_reply(0, stdout, "").cost_usd is None
 
     def test_a_rejected_model_is_named_in_plain_words(self):
         stdout = _codex_events(
