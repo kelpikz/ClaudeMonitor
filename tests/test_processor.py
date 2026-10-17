@@ -38,7 +38,7 @@ from claudemonitor.processor import (
     _updated_at_line,
     _usage_lines,
     internal_error_state,
-    process,
+    getDataToDisplay,
 )
 
 # The 5h rolling window only begins once the user sends their first message;
@@ -73,7 +73,7 @@ def make_data(
 # ===========================================================================
 # process — the public entry point.
 #
-# These tests drive the module through its real surface. Because process()
+# These tests drive the module through its real surface. Because getDataToDisplay()
 # delegates all formatting to the private helpers, exercising every branch
 # here also exercises _menu_label, _format_time_left, _format_elapsed,
 # _error_tooltip and _updated_at_line in their natural context. The focused
@@ -105,10 +105,10 @@ class TestProcessHappyPath:
             ),
             fetched_at=NOW - timedelta(seconds=15),
         )
-        return process(data, NOW, Config(), CLAUDE)
+        return getDataToDisplay(data, NOW, Config(), CLAUDE)
 
     def test_icon_is_green_with_plenty_remaining(self):
-        # 70% remaining > amber_below (50) -> green branch of process().
+        # 70% remaining > amber_below (50) -> green branch of getDataToDisplay().
         assert self._state().icon_color == "green"
 
     def test_taskbar_text_shows_remaining_usage_and_reset_time(self):
@@ -119,7 +119,7 @@ class TestProcessHappyPath:
             )
         )
 
-        assert process(data, NOW, Config(), CLAUDE).taskbar_text == "80% (3h 0m)"
+        assert getDataToDisplay(data, NOW, Config(), CLAUDE).taskbar_text == "80% (3h 0m)"
 
     def test_tooltip_has_full_three_line_body_plus_timestamp(self):
         # Verifies the exact assembled tooltip: header, 5h line, week line,
@@ -138,7 +138,7 @@ class TestProcessHappyPath:
 
 
 class TestProcessColors:
-    """The color threshold logic lives in process() itself, so these cases
+    """The color threshold logic lives in getDataToDisplay() itself, so these cases
     are not redundant with any helper. Defaults: amber_below=50, red_below=20.
     Note the asymmetric comparisons in the source:
         remaining > amber_below      -> green
@@ -162,16 +162,16 @@ class TestProcessColors:
         data = make_data(
             five_hour=UsageWindow(utilization=utilization, resets_at=NOW + timedelta(hours=1))
         )
-        assert process(data, NOW, Config(), CLAUDE).icon_color == expected
+        assert getDataToDisplay(data, NOW, Config(), CLAUDE).icon_color == expected
 
     def test_custom_thresholds_are_respected(self):
         # With amber_below=80/red_below=40, 30% remaining falls below 40 -> red,
-        # proving process() reads the config rather than hardcoding 50/20.
+        # proving getDataToDisplay() reads the config rather than hardcoding 50/20.
         config = Config(thresholds=ThresholdsConfig(amber_below=80, red_below=40))
         data = make_data(
             five_hour=UsageWindow(utilization=70.0, resets_at=NOW + timedelta(hours=1))
         )
-        assert process(data, NOW, config, CLAUDE).icon_color == "red"
+        assert getDataToDisplay(data, NOW, config, CLAUDE).icon_color == "red"
 
 
 class TestProcessTooltipDetails:
@@ -181,7 +181,7 @@ class TestProcessTooltipDetails:
         # A window with no reset timestamp should surface "unknown" (from
         # _format_time_left) rather than crashing or showing a bogus duration.
         data = make_data(five_hour=UsageWindow(utilization=10.0, resets_at=None))
-        assert "resets in unknown" in process(data, NOW, Config(), CLAUDE).tooltip
+        assert "resets in unknown" in getDataToDisplay(data, NOW, Config(), CLAUDE).tooltip
 
 
 class TestProcessFiveHourNotStarted:
@@ -203,13 +203,13 @@ class TestProcessFiveHourNotStarted:
         )
 
     def test_five_hour_line_explains_countdown_not_started(self):
-        lines = process(self._data(), NOW, Config(), CLAUDE).tooltip.split("\n")
+        lines = getDataToDisplay(self._data(), NOW, Config(), CLAUDE).tooltip.split("\n")
         assert lines[0] == "Claude usage"
         assert lines[1] == FIVE_HOUR_NOT_STARTED_LINE
 
     def test_weekly_window_still_shown_normally(self):
         # Only the 5h line changes; the live weekly window renders as usual.
-        lines = process(self._data(), NOW, Config(), CLAUDE).tooltip.split("\n")
+        lines = getDataToDisplay(self._data(), NOW, Config(), CLAUDE).tooltip.split("\n")
         assert lines[2] == "Week: 95% left · resets in 4d 3h"
 
     def test_week_line_explains_when_weekly_session_has_not_started(self):
@@ -217,16 +217,16 @@ class TestProcessFiveHourNotStarted:
             five_hour=UsageWindow(utilization=0.0, resets_at=None),
             seven_day=UsageWindow(utilization=0.0, resets_at=None),
         )
-        lines = process(data, NOW, Config(), CLAUDE).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config(), CLAUDE).tooltip.split("\n")
         assert lines[1] == WEEK_NOT_STARTED_LINE
         assert not any(line.startswith("5h:") for line in lines)
 
     def test_icon_is_green_because_full_usage_is_available(self):
         # Nothing has been spent yet, so the user has their whole 5h budget.
-        assert process(self._data(), NOW, Config(), CLAUDE).icon_color == "green"
+        assert getDataToDisplay(self._data(), NOW, Config(), CLAUDE).icon_color == "green"
 
     def test_tooltip_fits_windows_tooltip_limit(self):
-        assert len(process(self._data(), NOW, Config(), CLAUDE).tooltip) <= 128
+        assert len(getDataToDisplay(self._data(), NOW, Config(), CLAUDE).tooltip) <= 128
 
 
 class TestProcessNoData:
@@ -235,26 +235,26 @@ class TestProcessNoData:
 
     def test_missing_five_hour_is_grey_with_explanatory_tooltip(self):
         data = make_data(five_hour=None)
-        state = process(data, NOW, Config(), CLAUDE)
+        state = getDataToDisplay(data, NOW, Config(), CLAUDE)
         assert state.icon_color == "grey"
         assert "No usage data available" in state.tooltip
 
 
 class TestProcessErrors:
-    """When fetch_error is set, process() short-circuits to a grey icon and an
+    """When fetch_error is set, getDataToDisplay() short-circuits to a grey icon and an
     error tooltip before ever looking at the usage windows. These cases drive
     _error_tooltip and the error branches of _menu_label."""
 
     def test_error_tooltip_is_message_then_updated_line(self):
         # First line is the human-readable error, last line is the timestamp.
         data = make_data(fetch_error="token_expired", fetched_at=NOW)
-        lines = process(data, NOW, Config(), CLAUDE).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config(), CLAUDE).tooltip.split("\n")
         assert lines[0] == "Claude token expired — start Claude Code to refresh"
         assert lines[-1] == "Updated (0 seconds ago)"
 
     def test_error_sets_matching_menu_label(self):
         data = make_data(fetch_error="no_credentials", fetched_at=NOW - timedelta(minutes=2))
-        assert process(data, NOW, Config(), CLAUDE).menu_status_label == "Not logged in — last update 2m ago"
+        assert getDataToDisplay(data, NOW, Config(), CLAUDE).menu_status_label == "Not logged in — last update 2m ago"
 
     def test_error_takes_precedence_over_present_usage_data(self):
         # Even with a perfectly good five_hour window, an error must win and
@@ -263,14 +263,14 @@ class TestProcessErrors:
             five_hour=UsageWindow(utilization=10.0, resets_at=NOW + timedelta(hours=1)),
             fetch_error="bad_response",
         )
-        assert process(data, NOW, Config(), CLAUDE).icon_color == "grey"
+        assert getDataToDisplay(data, NOW, Config(), CLAUDE).icon_color == "grey"
 
 
 class TestProcessRateLimited:
     """HTTP 429 handling (fetch_error == "rate_limited").
 
     Unlike other errors, a rate-limit does not mean our data is wrong — just
-    that we couldn't refresh it. So instead of going grey, process() falls back
+    that we couldn't refresh it. So instead of going grey, getDataToDisplay() falls back
     to the last successful result and flags it as stale. Without any prior good
     data it degrades to the same grey treatment as other errors."""
 
@@ -289,12 +289,12 @@ class TestProcessRateLimited:
     def test_shows_last_good_usage_color(self):
         # 70% remaining -> green, computed from last_good rather than greyed out.
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        state = process(data, NOW, Config(), CLAUDE, last_good=self._last_good())
+        state = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=self._last_good())
         assert state.icon_color == "green"
 
     def test_tooltip_shows_last_good_usage_lines(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        lines = process(data, NOW, Config(), CLAUDE, last_good=self._last_good()).tooltip.split("\n")
+        lines = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=self._last_good()).tooltip.split("\n")
         assert lines[0] == "Claude usage"
         assert lines[1] == "5h:   70% left · resets in 2h 15m"
         assert lines[2] == "Week: 90% left · resets in 3d 4h"
@@ -306,7 +306,7 @@ class TestProcessRateLimited:
         # tray-tooltip limit.
         last_good = self._last_good()  # fetched 2 minutes before NOW
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        last_line = process(data, NOW, Config(), CLAUDE, last_good=last_good).tooltip.split("\n")[-1]
+        last_line = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=last_good).tooltip.split("\n")[-1]
         assert last_line == "Unable to fetch recent data (2m ago)"
 
     def test_stale_tooltip_fits_windows_tooltip_limit(self):
@@ -318,17 +318,17 @@ class TestProcessRateLimited:
             fetched_at=NOW - timedelta(minutes=2),
         )
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        tooltip = process(data, NOW, Config(), CLAUDE, last_good=last_good).tooltip
+        tooltip = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=last_good).tooltip
         assert len(tooltip) <= 128
 
     def test_menu_label_reports_rate_limited_since_last_good(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        state = process(data, NOW, Config(), CLAUDE, last_good=self._last_good())
+        state = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=self._last_good())
         assert state.menu_status_label == "Rate limited — last update 2m ago"
 
     def test_without_last_good_uses_rate_limited_messaging(self):
         data = make_data(fetch_error="rate_limited", fetched_at=NOW - timedelta(seconds=5))
-        state = process(data, NOW, Config(), CLAUDE, last_good=None)
+        state = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=None)
         assert state.menu_status_label == "Rate limited — last update 5s ago"
         assert state.tooltip.split("\n")[0] == "Rate limited — too many requests, will retry"
 
@@ -337,11 +337,11 @@ class TestProcessRateLimited:
         # enough to display, so we treat it as if we had nothing.
         last_good = make_data(five_hour=None, fetched_at=NOW - timedelta(minutes=1))
         data = make_data(fetch_error="rate_limited", fetched_at=NOW)
-        assert process(data, NOW, Config(), CLAUDE, last_good=last_good).icon_color == "grey"
+        assert getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=last_good).icon_color == "grey"
 
 
 # ===========================================================================
-# internal_error_state — the hard-coded fallback used when process() itself
+# internal_error_state — the hard-coded fallback used when getDataToDisplay() itself
 # (or its caller) blows up. No inputs beyond `now`, so just two assertions.
 # ===========================================================================
 
@@ -362,7 +362,7 @@ class TestInternalErrorState:
 #
 # Everything below isolates one private helper. The value here is pinning the
 # arithmetic-heavy edge cases (unit boundaries, clamping, None handling) that
-# would be tedious and noisy to enumerate through process().
+# would be tedious and noisy to enumerate through getDataToDisplay().
 # ===========================================================================
 
 
@@ -560,7 +560,7 @@ class TestTaskbarText:
     short message rather than one undifferentiated placeholder."""
 
     def _taskbar_text(self, **kwargs) -> str:
-        return process(make_data(**kwargs), NOW, Config(), CLAUDE).taskbar_text
+        return getDataToDisplay(make_data(**kwargs), NOW, Config(), CLAUDE).taskbar_text
 
     def test_remaining_usage_is_floored_so_full_only_means_untouched(self):
         # 99.6% remaining must not round up to a reassuring "100%".
@@ -632,7 +632,7 @@ class TestTaskbarText:
         )
         data = make_data(fetch_error="rate_limited")
 
-        state = process(data, NOW, Config(), CLAUDE, last_good=last_good)
+        state = getDataToDisplay(data, NOW, Config(), CLAUDE, last_good=last_good)
 
         assert state.taskbar_text == "75% (2h 0m)"
 
@@ -643,7 +643,7 @@ class TestSignInNeededWording:
 
     def _state(self, *, exhausted: bool, fetched_at: datetime = NOW):
         data = make_data(fetch_error="token_expired", fetched_at=fetched_at)
-        return process(data, NOW, Config(), CLAUDE, session_refresh_exhausted=exhausted)
+        return getDataToDisplay(data, NOW, Config(), CLAUDE, session_refresh_exhausted=exhausted)
 
     def test_tooltip_asks_the_user_to_sign_in(self):
         lines = self._state(exhausted=True).tooltip.split("\n")
@@ -674,7 +674,7 @@ class TestSignInNeededWording:
 
 
 class TestCodexProvider:
-    """process() must speak about Codex in Codex's own words."""
+    """getDataToDisplay() must speak about Codex in Codex's own words."""
 
     def _usage(self) -> ProviderUsageData:
         return make_data(
@@ -685,13 +685,13 @@ class TestCodexProvider:
         )
 
     def test_tooltip_heading_names_codex(self):
-        tooltip = process(self._usage(), NOW, Config(), CODEX).tooltip
+        tooltip = getDataToDisplay(self._usage(), NOW, Config(), CODEX).tooltip
 
         assert tooltip.split("\n")[0] == "Codex usage"
 
     def test_percentages_are_formatted_the_same_as_claude(self):
-        codex = process(self._usage(), NOW, Config(), CODEX)
-        claude = process(self._usage(), NOW, Config(), CLAUDE)
+        codex = getDataToDisplay(self._usage(), NOW, Config(), CODEX)
+        claude = getDataToDisplay(self._usage(), NOW, Config(), CLAUDE)
 
         assert codex.taskbar_text == claude.taskbar_text
         assert codex.icon_color == claude.icon_color
@@ -704,12 +704,12 @@ class TestCodexProvider:
         ],
     )
     def test_error_tooltips_name_codex(self, error, expected):
-        state = process(make_data(fetch_error=error), NOW, Config(), CODEX)
+        state = getDataToDisplay(make_data(fetch_error=error), NOW, Config(), CODEX)
 
         assert state.tooltip.split("\n")[0] == expected
 
     def test_exhausted_refresh_asks_for_the_codex_login_command(self):
-        state = process(
+        state = getDataToDisplay(
             make_data(fetch_error="token_expired"),
             NOW,
             Config(),
@@ -889,7 +889,7 @@ class TestTrayText:
     """The one-line summary the shared tooltip stacks, built with the rest."""
 
     def test_it_carries_the_five_hour_reading_and_the_week(self):
-        state = process(
+        state = getDataToDisplay(
             make_data(
                 five_hour=UsageWindow(
                     utilization=20.0, resets_at=NOW + timedelta(hours=3)
@@ -906,7 +906,7 @@ class TestTrayText:
         assert state.tray_text == "80% (3h 0m) · week 64%"
 
     def test_a_provider_without_a_weekly_window_shows_only_the_five_hour(self):
-        state = process(
+        state = getDataToDisplay(
             make_data(
                 five_hour=UsageWindow(
                     utilization=20.0, resets_at=NOW + timedelta(hours=3)
@@ -920,7 +920,7 @@ class TestTrayText:
         assert state.tray_text == "80% (3h 0m)"
 
     def test_an_unstarted_week_is_not_reported_as_a_number(self):
-        state = process(
+        state = getDataToDisplay(
             make_data(
                 five_hour=UsageWindow(
                     utilization=20.0, resets_at=NOW + timedelta(hours=3)
@@ -935,7 +935,7 @@ class TestTrayText:
         assert state.tray_text == "80% (3h 0m)"
 
     def test_an_error_says_what_went_wrong(self):
-        state = process(make_data(fetch_error="offline"), NOW, Config(), CLAUDE)
+        state = getDataToDisplay(make_data(fetch_error="offline"), NOW, Config(), CLAUDE)
 
         assert state.tray_text == "offline"
 
@@ -946,7 +946,7 @@ class TestTrayText:
             fetched_at=NOW - timedelta(minutes=2),
         )
 
-        state = process(
+        state = getDataToDisplay(
             make_data(fetch_error="rate_limited"),
             NOW,
             Config(),

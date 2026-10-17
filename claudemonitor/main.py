@@ -6,14 +6,13 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
 
 import pystray
 
-from . import autostart, cli_refresher, processor, tray, win32_clipboard
+from . import autostart, cli_refresher, processor, win32_clipboard
 from .config import (
     AMBER_THRESHOLD,
     POLL_INTERVAL,
@@ -23,8 +22,8 @@ from .config import (
     ConfigSetting,
     load_config,
 )
-from .models import PROVIDERS, DisplayState, Provider, ProviderUsageData
-from .notifications import ThresholdNotifier, UsageNotification
+from .models import PROVIDERS, DisplayState, Provider
+from .poll_cycle import PollCycle, ProviderPoller, active_pollers, is_tracked
 from .settings import (
     ProviderFields,
     SettingChoice,
@@ -38,6 +37,7 @@ from .settings import (
     SettingsWindowController,
     build_settings,
 )
+from .tray import TrayActions, TrayPresenter
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 from .win32_settings_window import create_settings_window
 from .win32_bindings import SHELL32_SIGNATURES, apply_signatures
@@ -49,36 +49,37 @@ log = logging.getLogger(__name__)
 # The identity Windows groups this process's taskbar buttons under.
 APPLICATION_ID = "ClaudeMonitor.ClaudeMonitor"
 
-_POLL_INTERVAL_RECOVERY_STEP_SECONDS = 5
-_POLL_INTERVAL_BACKOFF_FACTOR = 2
-_POLL_INTERVAL_CAP_SECONDS = 600
 _DISPLAY_REFRESH_INTERVAL_SECONDS = 1
 _CTRL_C_EVENT = 0
 _CTRL_BREAK_EVENT = 1
 
-# Used when the user has switched every provider off. It keeps the loop's
-# wait from collapsing to zero while it waits for one to be switched on.
-_FALLBACK_POLL_INTERVAL_SECONDS = 60
 
-
-def _apply_display(
-    icon: pystray.Icon,
-    states: list[DisplayState],
-    companion: TaskbarDisplay,
-) -> None:
+class TrayAndTaskbarDisplay:
     """Show every tracked provider on the one tray icon and the one label.
 
     Both surfaces take the whole list: the icon condenses it into a colour and
     a hover summary, the label draws a row per provider.
     """
-    tray.apply(icon, processor.tray_status(states))
-    label = processor.taskbar_label(states)
-    companion.update(label.segments, label.tooltip)
 
+    def __init__(
+        self,
+        presenter: TrayPresenter,
+        icon: pystray.Icon,
+        companion: TaskbarDisplay,
+    ) -> None:
+        self._presenter = presenter
+        self._icon = icon
+        self._companion = companion
 
-def _toggle_taskbar_visibility(companion: TaskbarDisplay) -> None:
-    """Flip the taskbar label, for the tray menu entry that still offers it."""
-    _set_taskbar_visibility(companion, not companion.visible)
+    def apply(self, states: list[DisplayState]) -> None:
+        """Push one state per provider to the tray icon and the taskbar label."""
+        self._presenter.apply(self._icon, processor.tray_status(states))
+        label = processor.taskbar_label(states)
+        self._companion.update(label.segments, label.tooltip)
+
+    def notify(self, title: str, message: str) -> None:
+        """Show a desktop notification through the tray icon."""
+        self._presenter.notify(self._icon, title=title, message=message)
 
 
 def _set_taskbar_visibility(companion: TaskbarDisplay, visible: bool) -> None:
@@ -87,9 +88,13 @@ def _set_taskbar_visibility(companion: TaskbarDisplay, visible: bool) -> None:
     TASKBAR_ENABLED.save(visible)
 
 
-def _is_tracked(provider: Provider, config: Config) -> bool:
-    """Return whether the user is tracking this provider at all."""
-    return bool(provider.settings.tracking.read(config))
+def taskbar_toggle(companion: TaskbarDisplay) -> SettingToggle:
+    """Build the one switch the tray menu and the settings window both flip."""
+    return SettingToggle(
+        is_on=lambda: companion.visible,
+        write=lambda visible: _set_taskbar_visibility(companion, visible),
+        available=lambda: companion.healthy,
+    )
 
 
 def _set_tracking(
@@ -132,7 +137,7 @@ def refresh_options(provider: Provider, config: Config) -> cli_refresher.Refresh
 
 def _set_poll_interval(
     config: Config,
-    pollers: list["ProviderPoller"],
+    pollers: list[ProviderPoller],
     wake_poll_loop: Callable[[], None],
     seconds: int,
 ) -> None:
@@ -218,7 +223,7 @@ def _provider_fields(
     return ProviderFields(
         provider=provider,
         tracking=SettingToggle(
-            is_on=lambda: _is_tracked(provider, config),
+            is_on=lambda: is_tracked(provider, config),
             write=lambda enabled: _set_tracking(provider, config, wake_poll_loop, enabled),
         ),
         renew_token=_provider_toggle(config, settings.renew_token),
@@ -255,7 +260,7 @@ def _provider_fields(
 def build_settings_model(
     *,
     companion: TaskbarDisplay,
-    pollers: list["ProviderPoller"],
+    pollers: list[ProviderPoller],
     config: Config,
     log_dir: Path,
     providers: tuple[Provider, ...] = PROVIDERS,
@@ -278,11 +283,7 @@ def build_settings_model(
         for provider in providers
     }
     return build_settings(
-        taskbar=SettingToggle(
-            is_on=lambda: companion.visible,
-            write=lambda visible: _set_taskbar_visibility(companion, visible),
-            available=lambda: companion.healthy,
-        ),
+        taskbar=taskbar_toggle(companion),
         providers=[
             _provider_fields(
                 provider, config, wake_poll_loop, runs[provider.key], copy_text
@@ -478,128 +479,6 @@ def create_cli_runners(
     return nudger, manual_run
 
 
-def _next_poll_interval_seconds(
-    current_interval_seconds: int,
-    data: ProviderUsageData,
-    *,
-    baseline_seconds: int,
-) -> int:
-    """Honor a server Retry-After on rate-limit, else double the interval (capped); recover toward the configured baseline after a success."""
-    if data.status_code == 429 or data.fetch_error == "rate_limited":
-        if data.retry_after_seconds is not None:
-            return max(baseline_seconds, data.retry_after_seconds)
-        return min(
-            _POLL_INTERVAL_CAP_SECONDS,
-            current_interval_seconds * _POLL_INTERVAL_BACKOFF_FACTOR,
-        )
-    if _is_successful_fetch(data):
-        return max(
-            baseline_seconds,
-            current_interval_seconds - _POLL_INTERVAL_RECOVERY_STEP_SECONDS,
-        )
-    return current_interval_seconds
-
-
-def _is_successful_fetch(data: ProviderUsageData) -> bool:
-    """Return whether a fetch completed successfully enough to update freshness."""
-    return data.fetch_error is None and data.status_code == 200
-
-
-def _active_pollers(pollers: list["ProviderPoller"], config: Config) -> list:
-    """Return the pollers to run this tick, in the order they are displayed."""
-    return [poller for poller in pollers if _is_tracked(poller.provider, config)]
-
-
-def _shared_poll_interval(intervals: list[int]) -> int:
-    """Return one wait that satisfies every provider.
-
-    A single loop serves both, so the provider asking for the longest gap —
-    a rate-limited one, typically — sets the pace for the tick.
-    """
-    return max(intervals, default=_FALLBACK_POLL_INTERVAL_SECONDS)
-
-
-class ProviderPoller:
-    """Own one provider's fetching, its backoff, and its last good reading.
-
-    Each provider fails independently — Codex can be rate-limited while
-    Claude is fine — so every piece of per-provider state lives in here
-    rather than in the loop that drives them.
-    """
-
-    def __init__(
-        self,
-        provider: Provider,
-        config: Config,
-        nudger: cli_refresher.SessionNudger,
-    ) -> None:
-        self.provider = provider
-        self._config = config
-        self._nudger = nudger
-        self._notifier = ThresholdNotifier(provider_label=provider.label)
-        self.interval_seconds = config.polling.interval_seconds
-        # Remember the most recent successful fetch so a later rate-limit
-        # (429) can keep showing real usage instead of a grey "offline" icon.
-        self._last_good: ProviderUsageData | None = None
-        self._latest = ProviderUsageData(
-            fetch_error="no_data",
-            fetched_at=datetime.now(timezone.utc),
-        )
-
-    def poll(self) -> list[UsageNotification]:
-        """Fetch once, updating freshness, backoff, and the CLI nudge."""
-        data = self.provider.fetch()
-        self._latest = data
-        notifications = self._notifier.check(data)
-        self._nudger.maybe_nudge(data)
-        if data.fetch_error is None and data.five_hour is not None:
-            self._last_good = data
-        self.interval_seconds = _next_poll_interval_seconds(
-            self.interval_seconds,
-            data,
-            baseline_seconds=self._config.polling.interval_seconds,
-        )
-        return notifications
-
-    def display(self, now: datetime) -> DisplayState:
-        """Format the most recent fetch for the tray and the taskbar.
-
-        The nudger's ``exhausted`` flag is read per call, not per poll: the
-        nudge runs on its own thread, so the breaker can trip mid-wait and
-        the tooltip should say so without waiting for the next fetch.
-        """
-        return processor.process(
-            self._latest,
-            now,
-            self._config,
-            self.provider,
-            last_good=self._last_good,
-            session_refresh_exhausted=self._nudger.exhausted,
-        )
-
-
-def _poll_provider(poller: "ProviderPoller") -> list[UsageNotification]:
-    """Poll one provider, keeping its failure away from the others.
-
-    A fetcher never raises by contract, but a bug anywhere on one provider's
-    path must not cost the user the other provider's numbers as well.
-    """
-    try:
-        return poller.poll()
-    except Exception:
-        log.exception("poll failed for %s", poller.provider.label)
-        return []
-
-
-def _provider_display(poller: "ProviderPoller", now: datetime) -> DisplayState:
-    """Format one provider, falling back to its own error tile if that fails."""
-    try:
-        return poller.display(now)
-    except Exception:
-        log.exception("display failed for %s", poller.provider.label)
-        return processor.internal_error_state(now, poller.provider)
-
-
 def set_application_identity(shell32=None) -> None:
     """Give this process a taskbar identity of its own.
 
@@ -674,65 +553,40 @@ def main() -> None:
         )
     )
 
-    tray.init(
-        manual_refresh,
-        shutdown_requested,
-        taskbar_visible=lambda: companion.visible,
-        toggle_taskbar=lambda: _toggle_taskbar_visibility(companion),
-        taskbar_healthy=lambda: companion.healthy,
-        open_settings=settings_window.open,
+    presenter = TrayPresenter(
+        TrayActions(
+            manual_refresh=manual_refresh,
+            shutdown_requested=shutdown_requested,
+            taskbar=taskbar_toggle(companion),
+            open_settings=settings_window.open,
+        )
     )
 
     # Seed a placeholder for every tracked provider before the label appears,
     # so it does not visibly grow from one segment to two on the first fetch.
     initial_label = processor.loading_label(
-        [poller.provider for poller in _active_pollers(pollers, cfg)]
+        [poller.provider for poller in active_pollers(pollers, cfg)]
     )
     companion.update(initial_label.segments, initial_label.tooltip)
     companion.start()
 
     def setup(icon: pystray.Icon) -> None:
         icon.visible = True
-        while not shutdown_requested.is_set():
-            notifications: list[UsageNotification] = []
-            try:
-                active = _active_pollers(pollers, cfg)
-                for poller in active:
-                    notifications += _poll_provider(poller)
-                poll_interval_seconds = _shared_poll_interval(
-                    [poller.interval_seconds for poller in active]
-                )
-
-                def build_states() -> list[DisplayState]:
-                    now = datetime.now(timezone.utc)
-                    return [_provider_display(poller, now) for poller in active]
-            except Exception:
-                log.exception("unhandled error in poll loop")
-                poll_interval_seconds = cfg.polling.interval_seconds
-
-                def build_states() -> list[DisplayState]:
-                    return [
-                        processor.internal_error_state(
-                            datetime.now(timezone.utc), PROVIDERS[0]
-                        )
-                    ]
-
-            _apply_display(icon, build_states(), companion)
-            for notification in notifications:
-                tray.notify(icon, title=notification.title, message=notification.message)
-            manual_refresh.clear()
-            if shutdown_requested.is_set():
-                break
-            _wait_with_display_refresh(
+        cycle = PollCycle(pollers, cfg, TrayAndTaskbarDisplay(presenter, icon, companion))
+        cycle.run_until(
+            shutdown_requested,
+            manual_refresh,
+            wait=lambda seconds, refresh: _wait_with_display_refresh(
                 manual_refresh,
-                interval_seconds=poll_interval_seconds,
-                refresh_display=lambda: _apply_display(icon, build_states(), companion),
+                interval_seconds=seconds,
+                refresh_display=refresh,
                 shutdown_requested=shutdown_requested,
-            )
+            ),
+        )
 
     icon = pystray.Icon(
         "ClaudeMonitor",
-        icon=tray.loading_icon(),
+        icon=presenter.loading_icon(),
         title="Claude Monitor — loading…",
         menu=pystray.Menu(),
     )

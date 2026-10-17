@@ -322,7 +322,7 @@ def _stale_state(
     )
 
 
-def process(
+def getDataToDisplay(
     data: ProviderUsageData,
     now: datetime,
     config: Config,

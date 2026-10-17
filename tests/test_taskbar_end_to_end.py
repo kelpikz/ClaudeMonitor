@@ -79,13 +79,11 @@ class _RecordingNativeWindow:
         pass
 
 
-class _StubIcon:
+class _StubPresenter:
     """Absorb the tray half of the display update so only the taskbar is asserted."""
 
-    def __init__(self) -> None:
-        self.icon = None
-        self.title = None
-        self.menu = None
+    def apply(self, icon, state) -> None:
+        pass
 
 
 def _respond_with(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> None:
@@ -113,10 +111,9 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     companion = TaskbarCompanion(native=native)
     data = fetcher.fetch()
     # Freeze the clock so reset countdowns are deterministic.
-    state = processor.process(data, NOW, Config(), CLAUDE)
+    state = processor.getDataToDisplay(data, NOW, Config(), CLAUDE)
 
-    monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
-    main._apply_display({"claude": _StubIcon()}, [state], companion)
+    main.TrayAndTaskbarDisplay(_StubPresenter(), None, companion).apply([state])
 
     companion._run()
     # Every response case below proves the tray's processed detail reaches the
@@ -243,16 +240,13 @@ class TestBothProvidersOnOneLabel:
         codex_data = codex_fetcher.fetch()
 
         states = [
-            processor.process(claude_data, NOW, Config(), CLAUDE),
-            processor.process(codex_data, NOW, Config(), CODEX),
+            processor.getDataToDisplay(claude_data, NOW, Config(), CLAUDE),
+            processor.getDataToDisplay(codex_data, NOW, Config(), CODEX),
         ]
 
         native = _RecordingNativeWindow()
         companion = TaskbarCompanion(native=native)
-        monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
-        main._apply_display(
-            {"claude": _StubIcon(), "codex": _StubIcon()}, states, companion
-        )
+        main.TrayAndTaskbarDisplay(_StubPresenter(), None, companion).apply(states)
         companion._run()
 
         label = processor.taskbar_label(states)

@@ -5,14 +5,16 @@ app-wide setting had to be given to one of them and withheld from the other.
 One icon, coloured by whichever provider is worst off, replaces both — and the
 settings that once crowded its menu now live in the settings window.
 
-``init()`` must be called before ``apply()``: the status tiles are drawn once
-at startup so a poll only ever swaps an already-rendered image.
+A ``TrayPresenter`` is given everything its menu can reach when it is built,
+so there is no call that must come first and no module state for one tray to
+leak into the next.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Protocol
 
 import pystray
 from PIL import Image
@@ -33,60 +35,34 @@ _COLORS: dict[str, tuple[int, int, int]] = {
 # crashing.
 _MAX_TOOLTIP_LEN = 127
 
-# One tile per status colour, keyed by colour name.
-_icons: dict[str, Image.Image] = {}
-_manual_refresh: threading.Event | None = None
-_shutdown_requested: threading.Event | None = None
-_taskbar_visible: Callable[[], bool] | None = None
-_toggle_taskbar: Callable[[], None] | None = None
-_taskbar_healthy: Callable[[], bool] | None = None
-_open_settings: Callable[[], None] | None = None
-
 _TASKBAR_MENU_LABEL = "Show taskbar usage"
 _TASKBAR_UNAVAILABLE_MENU_LABEL = "Show taskbar usage (unavailable — see log)"
 _SETTINGS_MENU_LABEL = "Settings…"
 
 
-def init(
-    manual_refresh: threading.Event,
-    shutdown_requested: threading.Event | None = None,
-    taskbar_visible: Callable[[], bool] | None = None,
-    toggle_taskbar: Callable[[], None] | None = None,
-    taskbar_healthy: Callable[[], bool] | None = None,
-    open_settings: Callable[[], None] | None = None,
-) -> None:
-    """Prepare tray dependencies, including the event that ends the poll loop."""
-    global _manual_refresh, _shutdown_requested
-    global _taskbar_visible, _toggle_taskbar, _taskbar_healthy, _open_settings
-    _manual_refresh = manual_refresh
-    _shutdown_requested = shutdown_requested
-    _taskbar_visible = taskbar_visible
-    _toggle_taskbar = toggle_taskbar
-    _taskbar_healthy = taskbar_healthy
-    _open_settings = open_settings
-    _build_icons()
+class TaskbarSwitch(Protocol):
+    """The taskbar label's on/off switch, as the menu entry needs to see it.
 
-
-def loading_icon() -> Image.Image:
-    """Return the grey placeholder tile shown before the first fetch lands."""
-    if not _icons:
-        raise RuntimeError("tray.init() must be called before loading_icon()")
-    return _icons["grey"]
-
-
-def _build_icons() -> None:
-    """Render every status tile once, so a poll only swaps images."""
-    for name, fill in _COLORS.items():
-        _icons[name] = tile_icon(fill)
-
-
-def _tile(color: str) -> Image.Image:
-    """Return one rendered tile, falling back to grey for an unknown colour.
-
-    A colour nobody drew must not raise inside the poll loop; grey at least
-    says the reading cannot be trusted.
+    ``settings.SettingToggle`` satisfies this, so the menu and the settings
+    window flip the label through one object.
     """
-    return _icons.get(color) or _icons["grey"]
+
+    @property
+    def is_on(self) -> Callable[[], bool]: ...
+    @property
+    def write(self) -> Callable[[bool], None]: ...
+    @property
+    def available(self) -> Callable[[], bool]: ...
+
+
+@dataclass(frozen=True)
+class TrayActions:
+    """Everything the tray menu can reach, gathered into one value."""
+
+    manual_refresh: threading.Event
+    shutdown_requested: threading.Event | None = None
+    taskbar: TaskbarSwitch | None = None
+    open_settings: Callable[[], None] | None = None
 
 
 def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
@@ -97,80 +73,100 @@ def _truncate_tooltip(text: str, limit: int = _MAX_TOOLTIP_LEN) -> str:
     return text[: limit - 1] + "…"
 
 
-def apply(icon: pystray.Icon, state: TrayState) -> None:
-    """Show the combined state of every tracked provider on the tray icon."""
-    icon.icon = _tile(state.icon_color)
-    icon.title = _truncate_tooltip(state.tooltip)
-    icon.menu = _build_menu(state.status_lines)
+class TrayPresenter:
+    """Show the combined state of every provider on one pystray icon."""
 
+    def __init__(self, actions: TrayActions) -> None:
+        self._actions = actions
+        # Drawn once so a poll only swaps images, and held per presenter so
+        # two presenters cannot see each other's tiles.
+        self._icons: dict[str, Image.Image] = {
+            name: tile_icon(fill) for name, fill in _COLORS.items()
+        }
 
-def notify(icon: pystray.Icon, title: str, message: str) -> None:
-    """Show a desktop notification through the active tray icon."""
-    icon.notify(message, title=title)
+    def loading_icon(self) -> Image.Image:
+        """Return the grey placeholder tile shown before the first fetch lands."""
+        return self._icons["grey"]
 
+    def apply(self, icon: pystray.Icon, state: TrayState) -> None:
+        """Show the combined state of every tracked provider on the tray icon."""
+        icon.icon = self._tile(state.icon_color)
+        icon.title = _truncate_tooltip(state.tooltip)
+        icon.menu = self._build_menu(state.status_lines)
 
-def _build_menu(status_lines: list[str]) -> pystray.Menu:
-    """Build the menu: what every provider is doing, then the few live actions.
+    def notify(self, icon: pystray.Icon, title: str, message: str) -> None:
+        """Show a desktop notification through the active tray icon."""
+        icon.notify(message, title=title)
 
-    Only what a user reaches for mid-task stays here. Everything else — the
-    other switches, the log folder, the usage pages — is in the settings window,
-    because a menu that scrolls is a menu nobody reads.
-    """
-    return pystray.Menu(
-        *(pystray.MenuItem(line, None, enabled=False) for line in status_lines),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Refresh now", _on_refresh),
-        _taskbar_menu_item(),
-        pystray.MenuItem(_SETTINGS_MENU_LABEL, _on_open_settings),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", _on_quit),
-    )
+    def _tile(self, color: str) -> Image.Image:
+        """Return one rendered tile, falling back to grey for an unknown colour.
 
+        A colour nobody drew must not raise inside the poll loop; grey at least
+        says the reading cannot be trusted.
+        """
+        return self._icons.get(color) or self._icons["grey"]
 
-def _taskbar_is_available() -> bool:
-    """Return whether a native taskbar label is actually being shown."""
-    return _taskbar_healthy is None or _taskbar_healthy()
+    def _build_menu(self, status_lines: list[str]) -> pystray.Menu:
+        """Build the menu: what every provider is doing, then the few live actions.
 
+        Only what a user reaches for mid-task stays here. Everything else — the
+        other switches, the log folder, the usage pages — is in the settings
+        window, because a menu that scrolls is a menu nobody reads.
+        """
+        return pystray.Menu(
+            *(pystray.MenuItem(line, None, enabled=False) for line in status_lines),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Refresh now", self._on_refresh),
+            self._taskbar_menu_item(),
+            pystray.MenuItem(_SETTINGS_MENU_LABEL, self._on_open_settings),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._on_quit),
+        )
 
-def _taskbar_menu_item() -> pystray.MenuItem:
-    """Build the taskbar toggle, disabled when no label can be displayed.
+    def _taskbar_is_available(self) -> bool:
+        """Return whether a native taskbar label is actually being shown."""
+        taskbar = self._actions.taskbar
+        return taskbar is None or taskbar.available()
 
-    Leaving a checked, clickable entry in place while the native window is gone
-    would tell the user the feature is working when it is not.
-    """
-    available = _taskbar_is_available()
-    return pystray.MenuItem(
-        _TASKBAR_MENU_LABEL if available else _TASKBAR_UNAVAILABLE_MENU_LABEL,
-        _on_toggle_taskbar,
-        checked=lambda item: bool(
-            available and _taskbar_visible and _taskbar_visible()
-        ),
-        enabled=available,
-    )
+    def _taskbar_menu_item(self) -> pystray.MenuItem:
+        """Build the taskbar toggle, disabled when no label can be displayed.
 
+        Leaving a checked, clickable entry in place while the native window is
+        gone would tell the user the feature is working when it is not.
+        """
+        available = self._taskbar_is_available()
+        taskbar = self._actions.taskbar
+        return pystray.MenuItem(
+            _TASKBAR_MENU_LABEL if available else _TASKBAR_UNAVAILABLE_MENU_LABEL,
+            self._on_toggle_taskbar,
+            checked=lambda item: bool(
+                available and taskbar is not None and taskbar.is_on()
+            ),
+            enabled=available,
+        )
 
-def _on_refresh(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    if _manual_refresh is not None:
-        _manual_refresh.set()
+    def _on_refresh(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self._actions.manual_refresh.set()
 
+    def _on_open_settings(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """Open the settings window, or raise the one already on screen."""
+        if self._actions.open_settings is not None:
+            self._actions.open_settings()
 
-def _on_open_settings(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Open the settings window, or raise the one already on screen."""
-    if _open_settings is not None:
-        _open_settings()
+    def _on_toggle_taskbar(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """Flip the taskbar label, then redraw the menu so its checkmark agrees.
 
+        The menu is redrawn even with no switch wired up, because pystray keeps
+        showing the old checkmark until it is asked to update.
+        """
+        taskbar = self._actions.taskbar
+        if taskbar is not None:
+            taskbar.write(not taskbar.is_on())
+        icon.update_menu()
 
-def _on_toggle_taskbar(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """Toggle the companion and refresh the menu checkmark."""
-    if _toggle_taskbar is not None:
-        _toggle_taskbar()
-    icon.update_menu()
-
-
-def _on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-    """End the poll loop before asking pystray to join its setup thread."""
-    if _shutdown_requested is not None:
-        _shutdown_requested.set()
-    if _manual_refresh is not None:
-        _manual_refresh.set()
-    icon.stop()
+    def _on_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """End the poll loop before asking pystray to join its setup thread."""
+        if self._actions.shutdown_requested is not None:
+            self._actions.shutdown_requested.set()
+        self._actions.manual_refresh.set()
+        icon.stop()
