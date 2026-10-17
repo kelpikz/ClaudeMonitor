@@ -1,7 +1,9 @@
 """End-to-end coverage for the taskbar label.
 
-Every test here starts at the Anthropic API response and finishes at the exact
+Every test here starts at a provider's API response and finishes at the exact
 string the native window is asked to paint, so no layer can drift from another.
+The final class does it for both providers at once, which is what the label
+actually shows.
 """
 
 from __future__ import annotations
@@ -12,9 +14,9 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from claudemonitor import fetcher, main, processor
+from claudemonitor import codex_fetcher, fetcher, main, processor, usage_request
 from claudemonitor.config import Config
-from claudemonitor.models import Rect
+from claudemonitor.models import CLAUDE, CODEX, Rect
 from claudemonitor.taskbar_companion import TaskbarCompanion
 
 
@@ -39,7 +41,7 @@ class _RecordingNativeWindow:
     def get_rect(self, handle: int) -> Rect:
         return TASKBAR if handle == 10 else NOTIFICATION
 
-    def content_width_for(self, text: str) -> int:
+    def content_width_for(self, segments) -> int:
         return 180
 
     def create_window(self, *, text: str) -> int:
@@ -52,7 +54,7 @@ class _RecordingNativeWindow:
     def list_sibling_rects(self, taskbar: int, exclude_handle: int) -> list[Rect]:
         return []
 
-    def set_colorkey_transparency(self, handle: int) -> None:
+    def enable_per_pixel_alpha(self, handle: int) -> None:
         pass
 
     def refresh_theme(self, handle: int) -> None:
@@ -61,8 +63,8 @@ class _RecordingNativeWindow:
     def move_window(self, handle: int, rect: Rect, *, topmost: bool) -> None:
         pass
 
-    def set_text(self, handle: int, text: str) -> None:
-        self.painted.append(text)
+    def set_segments(self, handle: int, segments) -> None:
+        self.painted.append("  ".join(segment.text for segment in segments))
 
     def set_tooltip(self, handle: int, tooltip: str) -> None:
         self.tooltips.append(tooltip)
@@ -111,10 +113,10 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     companion = TaskbarCompanion(native=native)
     data = fetcher.fetch()
     # Freeze the clock so reset countdowns are deterministic.
-    state = processor.process(data, now=NOW, config=Config())
+    state = processor.process(data, NOW, Config(), CLAUDE)
 
     monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
-    main._apply_display(_StubIcon(), state, companion)
+    main._apply_display({"claude": _StubIcon()}, [state], companion)
 
     companion._run()
     # Every response case below proves the tray's processed detail reaches the
@@ -205,3 +207,121 @@ class TestErrorPaths:
         _respond_with(monkeypatch, _usage_response(None))
 
         assert _painted_label(monkeypatch) == "no data"
+
+
+class TestBothProvidersOnOneLabel:
+    """The whole point of the feature: one label, both providers, in order."""
+
+    def _codex_body(self, used_percent: float, reset_at: int | None) -> dict:
+        return {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": used_percent,
+                    "limit_window_seconds": 18000,
+                    "reset_at": reset_at,
+                }
+            },
+        }
+
+    def _painted(self, monkeypatch, claude_response, codex_response) -> tuple[list, str]:
+        """Run both fetchers through to the segments the native window paints."""
+        monkeypatch.setattr(
+            fetcher,
+            "_read_credentials",
+            lambda: fetcher.Credentials(access_token="token", expires_at=None),
+        )
+        monkeypatch.setattr(
+            codex_fetcher,
+            "_read_credentials",
+            lambda: codex_fetcher.CodexCredentials("tok", "acct", None),
+        )
+        monkeypatch.setattr(httpx, "get", lambda *a, **k: claude_response)
+        claude_data = fetcher.fetch()
+
+        monkeypatch.setattr(usage_request.httpx, "get", lambda *a, **k: codex_response)
+        codex_data = codex_fetcher.fetch()
+
+        states = [
+            processor.process(claude_data, NOW, Config(), CLAUDE),
+            processor.process(codex_data, NOW, Config(), CODEX),
+        ]
+
+        native = _RecordingNativeWindow()
+        companion = TaskbarCompanion(native=native)
+        monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
+        main._apply_display(
+            {"claude": _StubIcon(), "codex": _StubIcon()}, states, companion
+        )
+        companion._run()
+
+        label = processor.taskbar_label(states)
+        assert native.tooltips[-1] == label.tooltip
+        return label.segments, native.painted[-1]
+
+    def test_both_readings_reach_the_native_label(self, monkeypatch):
+        segments, painted = self._painted(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 20.0, "resets_at": (NOW + timedelta(hours=3)).isoformat()}
+            ),
+            httpx.Response(
+                200,
+                json=self._codex_body(
+                    36.0, int((NOW + timedelta(hours=2)).timestamp())
+                ),
+                request=httpx.Request("GET", "https://example.test"),
+            ),
+        )
+
+        assert [(s.provider, s.text) for s in segments] == [
+            (CLAUDE, "80% (3h 0m)"),
+            (CODEX, "64% (2h 0m)"),
+        ]
+        assert painted == "80% (3h 0m)  64% (2h 0m)"
+
+    def test_the_tooltip_stacks_both_providers(self, monkeypatch):
+        segments, _painted = self._painted(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 20.0, "resets_at": (NOW + timedelta(hours=3)).isoformat()}
+            ),
+            httpx.Response(
+                200,
+                json=self._codex_body(
+                    36.0, int((NOW + timedelta(hours=2)).timestamp())
+                ),
+                request=httpx.Request("GET", "https://example.test"),
+            ),
+        )
+
+        assert len(segments) == 2
+
+    def test_one_provider_failing_does_not_blank_the_other(self, monkeypatch):
+        # Codex 401s while Claude is perfectly healthy: the label must still
+        # carry Claude's real numbers beside Codex's error.
+        segments, painted = self._painted(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 20.0, "resets_at": (NOW + timedelta(hours=3)).isoformat()}
+            ),
+            httpx.Response(401, request=httpx.Request("GET", "https://example.test")),
+        )
+
+        assert [s.text for s in segments] == ["80% (3h 0m)", "token expired"]
+        assert "80% (3h 0m)" in painted
+
+    def test_an_unstarted_codex_window_reads_honestly(self, monkeypatch):
+        segments, _painted = self._painted(
+            monkeypatch,
+            _usage_response(
+                {"utilization": 20.0, "resets_at": (NOW + timedelta(hours=3)).isoformat()}
+            ),
+            httpx.Response(
+                200,
+                json=self._codex_body(0, None),
+                request=httpx.Request("GET", "https://example.test"),
+            ),
+        )
+
+        assert segments[1].text == "100% (not started)"

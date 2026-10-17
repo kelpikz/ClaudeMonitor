@@ -11,3 +11,5 @@ venv/
 .claude
 docs/
 .artifacts
+.coverage
+unused*.png

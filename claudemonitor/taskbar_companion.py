@@ -14,8 +14,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .models import Rect
-from .processor import LOADING_TASKBAR_TEXT
+from .models import CLAUDE, LabelSegment, Rect
+from .processor import LOADING_TASKBAR_TEXT, LOADING_TOOLTIP
 
 
 log = logging.getLogger(__name__)
@@ -51,6 +51,11 @@ _MAX_REBUILDS_BEFORE_UNHEALTHY = 2
 # on the next and the retries themselves fill the log.
 _FAILURE_BACKOFF_SECONDS = 1.0
 _FAILURE_BACKOFF_CAP_SECONDS = 60.0
+
+
+def _window_title(segments: list[LabelSegment]) -> str:
+    """Flatten the label into the plain string Windows keeps as the title."""
+    return "  ".join(segment.text for segment in segments)
 
 
 def retry_delay_seconds(consecutive_failures: int, base: float, cap: float) -> float:
@@ -133,14 +138,14 @@ class NativeWindow(Protocol):
     def find_taskbar(self) -> int: ...
     def find_notification_area(self, taskbar: int) -> int: ...
     def get_rect(self, handle: int) -> Rect: ...
-    def content_width_for(self, text: str) -> int: ...
+    def content_width_for(self, segments: list[LabelSegment]) -> int: ...
     def create_window(self, *, text: str) -> int: ...
     def attach_to_taskbar(self, handle: int, taskbar: int) -> bool: ...
     def list_sibling_rects(self, taskbar: int, exclude_handle: int) -> list[Rect]: ...
-    def set_colorkey_transparency(self, handle: int) -> None: ...
+    def enable_per_pixel_alpha(self, handle: int) -> None: ...
     def refresh_theme(self, handle: int) -> None: ...
     def move_window(self, handle: int, rect: Rect, *, topmost: bool) -> None: ...
-    def set_text(self, handle: int, text: str) -> None: ...
+    def set_segments(self, handle: int, segments: list[LabelSegment]) -> None: ...
     def set_tooltip(self, handle: int, tooltip: str) -> None: ...
     def set_visible(self, handle: int, visible: bool) -> None: ...
     def pump_messages(self, stop_requested: threading.Event, duration_seconds: float) -> None: ...
@@ -153,7 +158,7 @@ class _NativeSession:
 
     handle: int
     attached: bool
-    rendered_text: str
+    rendered_segments: list[LabelSegment]
     rendered_tooltip: str
     rendered_visible: bool = False
     position: Rect | None = None
@@ -191,8 +196,8 @@ class TaskbarCompanion:
         self._stop_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._display_changed = threading.Condition()
-        self._text = LOADING_TASKBAR_TEXT
-        self._tooltip = "Claude Monitor — loading…"
+        self._segments = [LabelSegment(provider=CLAUDE, text=LOADING_TASKBAR_TEXT)]
+        self._tooltip = LOADING_TOOLTIP
         self._visible = initial_visible
         self._healthy = True
 
@@ -211,10 +216,14 @@ class TaskbarCompanion:
         """
         return self._healthy
 
-    def update(self, text: str, tooltip: str | None = None) -> None:
-        """Store taskbar text and hover detail for the next UI-thread pass."""
+    def update(
+        self,
+        segments: list[LabelSegment],
+        tooltip: str | None = None,
+    ) -> None:
+        """Store the label segments and hover detail for the next UI pass."""
         with self._display_changed:
-            self._text = text
+            self._segments = list(segments)
             if tooltip is not None:
                 self._tooltip = tooltip
             self._display_changed.notify_all()
@@ -255,16 +264,24 @@ class TaskbarCompanion:
                 return
         self._thread = None
 
-    def _display_state(self) -> tuple[str, str, bool]:
-        """Take one consistent snapshot of text, tooltip, and visibility."""
+    def _should_show(self) -> bool:
+        """Return whether the label is wanted and has something to draw.
+
+        An empty label means no provider is tracked. It is hidden without
+        touching ``visible``, which is the user's own choice.
+        """
+        return self._visible and bool(self._segments)
+
+    def _display_state(self) -> tuple[list[LabelSegment], str, bool]:
+        """Take one consistent snapshot of segments, tooltip, and visibility."""
         with self._display_changed:
-            return self._text, self._tooltip, self._visible
+            return list(self._segments), self._tooltip, self._should_show()
 
     def _wait_until_visible(self) -> None:
-        """Sleep without polling until the user shows the companion or quits."""
+        """Sleep without polling until the label can be shown or the app quits."""
         with self._display_changed:
             self._display_changed.wait_for(
-                lambda: self._visible or self._stop_requested.is_set()
+                lambda: self._should_show() or self._stop_requested.is_set()
             )
 
     def _run(self) -> None:
@@ -328,10 +345,13 @@ class TaskbarCompanion:
         Any failure after the window exists destroys it before propagating,
         because the caller has no handle to clean up with.
         """
-        rendered_text, rendered_tooltip, _requested_visible = self._display_state()
+        rendered_segments, rendered_tooltip, _requested_visible = self._display_state()
         taskbar = self._native.find_taskbar()
-        handle = self._native.create_window(text=rendered_text)
+        handle = self._native.create_window(text=_window_title(rendered_segments))
         try:
+            # The title given to CreateWindowExW is only what Explorer sees;
+            # the custom paint reads the segments, so hand them over too.
+            self._native.set_segments(handle, rendered_segments)
             # Prefer a true taskbar child. If Explorer rejects the attachment,
             # the native adapter leaves the window as a normal popup and the
             # controller keeps it above the taskbar as a graceful fallback.
@@ -339,9 +359,9 @@ class TaskbarCompanion:
             if not attached:
                 log.warning("taskbar parenting failed; using topmost screen popup")
 
-            # Both a child and a popup need the black background keyed out;
-            # skipping it would paint a solid rectangle over the taskbar.
-            self._native.set_colorkey_transparency(handle)
+            # Both a child and a popup need an alpha channel; without one the
+            # label paints a solid rectangle over the taskbar.
+            self._native.enable_per_pixel_alpha(handle)
             self._native.set_tooltip(handle, rendered_tooltip)
         except Exception:
             self._native.close_window(handle)
@@ -355,7 +375,7 @@ class TaskbarCompanion:
         return _NativeSession(
             handle=handle,
             attached=attached,
-            rendered_text=rendered_text,
+            rendered_segments=rendered_segments,
             rendered_tooltip=rendered_tooltip,
         )
 
@@ -366,11 +386,11 @@ class TaskbarCompanion:
 
     def _run_one_pass(self, session: _NativeSession) -> None:
         """Synchronize one round of text, placement, visibility, and messages."""
-        requested_text, requested_tooltip, requested_visible = self._display_state()
+        requested_segments, requested_tooltip, requested_visible = self._display_state()
 
-        if requested_text != session.rendered_text:
-            self._native.set_text(session.handle, requested_text)
-            session.rendered_text = requested_text
+        if requested_segments != session.rendered_segments:
+            self._native.set_segments(session.handle, requested_segments)
+            session.rendered_segments = requested_segments
 
         if requested_tooltip != session.rendered_tooltip:
             self._native.set_tooltip(session.handle, requested_tooltip)
@@ -478,7 +498,7 @@ class TaskbarCompanion:
         taskbar_rect = self._native.get_rect(taskbar)
         notification_rect = self._native.get_rect(notification)
         siblings = self._native.list_sibling_rects(taskbar, session.handle)
-        content_width = self._native.content_width_for(session.rendered_text)
+        content_width = self._native.content_width_for(session.rendered_segments)
 
         # The minimum equals the requested width: with the slot sized to fit
         # exactly, any narrower slot would clip content rather than merely
@@ -515,8 +535,12 @@ class DisabledTaskbarCompanion:
     visible = False
     healthy = False
 
-    def update(self, text: str, tooltip: str | None = None) -> None:
-        """Discard display text and hover detail; there is no window for them."""
+    def update(
+        self,
+        segments: list[LabelSegment],
+        tooltip: str | None = None,
+    ) -> None:
+        """Discard the label and hover detail; there is no window for them."""
 
     def set_visible(self, visible: bool) -> None:
         """Ignore visibility changes; the feature is unavailable."""
