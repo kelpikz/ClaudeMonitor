@@ -79,13 +79,11 @@ class _RecordingNativeWindow:
         pass
 
 
-class _StubIcon:
+class _StubPresenter:
     """Absorb the tray half of the display update so only the taskbar is asserted."""
 
-    def __init__(self) -> None:
-        self.icon = None
-        self.title = None
-        self.menu = None
+    def apply(self, icon, state) -> None:
+        pass
 
 
 def _respond_with(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> None:
@@ -115,8 +113,7 @@ def _painted_label(monkeypatch: pytest.MonkeyPatch) -> str:
     # Freeze the clock so reset countdowns are deterministic.
     state = processor.getDataToDisplay(data, NOW, Config(), CLAUDE)
 
-    monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
-    main._apply_display({"claude": _StubIcon()}, [state], companion)
+    main._apply_display(_StubPresenter(), None, [state], companion)
 
     companion._run()
     # Every response case below proves the tray's processed detail reaches the
@@ -249,10 +246,7 @@ class TestBothProvidersOnOneLabel:
 
         native = _RecordingNativeWindow()
         companion = TaskbarCompanion(native=native)
-        monkeypatch.setattr(main.tray, "apply", lambda icon, value: None)
-        main._apply_display(
-            {"claude": _StubIcon(), "codex": _StubIcon()}, states, companion
-        )
+        main._apply_display(_StubPresenter(), None, states, companion)
         companion._run()
 
         label = processor.taskbar_label(states)

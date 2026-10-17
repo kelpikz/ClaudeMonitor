@@ -13,7 +13,7 @@ from typing import Callable
 
 import pystray
 
-from . import autostart, cli_refresher, processor, tray, win32_clipboard
+from . import autostart, cli_refresher, processor, win32_clipboard
 from .config import (
     AMBER_THRESHOLD,
     POLL_INTERVAL,
@@ -38,6 +38,7 @@ from .settings import (
     SettingsWindowController,
     build_settings,
 )
+from .tray import TrayActions, TrayPresenter
 from .taskbar_companion import TaskbarDisplay, create_taskbar_companion
 from .win32_settings_window import create_settings_window
 from .win32_bindings import SHELL32_SIGNATURES, apply_signatures
@@ -62,6 +63,7 @@ _FALLBACK_POLL_INTERVAL_SECONDS = 60
 
 
 def _apply_display(
+    presenter: TrayPresenter,
     icon: pystray.Icon,
     states: list[DisplayState],
     companion: TaskbarDisplay,
@@ -71,20 +73,24 @@ def _apply_display(
     Both surfaces take the whole list: the icon condenses it into a colour and
     a hover summary, the label draws a row per provider.
     """
-    tray.apply(icon, processor.tray_status(states))
+    presenter.apply(icon, processor.tray_status(states))
     label = processor.taskbar_label(states)
     companion.update(label.segments, label.tooltip)
-
-
-def _toggle_taskbar_visibility(companion: TaskbarDisplay) -> None:
-    """Flip the taskbar label, for the tray menu entry that still offers it."""
-    _set_taskbar_visibility(companion, not companion.visible)
 
 
 def _set_taskbar_visibility(companion: TaskbarDisplay, visible: bool) -> None:
     """Show or hide the taskbar label and remember the choice for next launch."""
     companion.set_visible(visible)
     TASKBAR_ENABLED.save(visible)
+
+
+def taskbar_toggle(companion: TaskbarDisplay) -> SettingToggle:
+    """Build the one switch the tray menu and the settings window both flip."""
+    return SettingToggle(
+        is_on=lambda: companion.visible,
+        write=lambda visible: _set_taskbar_visibility(companion, visible),
+        available=lambda: companion.healthy,
+    )
 
 
 def _is_tracked(provider: Provider, config: Config) -> bool:
@@ -278,11 +284,7 @@ def build_settings_model(
         for provider in providers
     }
     return build_settings(
-        taskbar=SettingToggle(
-            is_on=lambda: companion.visible,
-            write=lambda visible: _set_taskbar_visibility(companion, visible),
-            available=lambda: companion.healthy,
-        ),
+        taskbar=taskbar_toggle(companion),
         providers=[
             _provider_fields(
                 provider, config, wake_poll_loop, runs[provider.key], copy_text
@@ -674,13 +676,13 @@ def main() -> None:
         )
     )
 
-    tray.init(
-        manual_refresh,
-        shutdown_requested,
-        taskbar_visible=lambda: companion.visible,
-        toggle_taskbar=lambda: _toggle_taskbar_visibility(companion),
-        taskbar_healthy=lambda: companion.healthy,
-        open_settings=settings_window.open,
+    presenter = TrayPresenter(
+        TrayActions(
+            manual_refresh=manual_refresh,
+            shutdown_requested=shutdown_requested,
+            taskbar=taskbar_toggle(companion),
+            open_settings=settings_window.open,
+        )
     )
 
     # Seed a placeholder for every tracked provider before the label appears,
@@ -717,22 +719,22 @@ def main() -> None:
                         )
                     ]
 
-            _apply_display(icon, build_states(), companion)
+            _apply_display(presenter, icon, build_states(), companion)
             for notification in notifications:
-                tray.notify(icon, title=notification.title, message=notification.message)
+                presenter.notify(icon, title=notification.title, message=notification.message)
             manual_refresh.clear()
             if shutdown_requested.is_set():
                 break
             _wait_with_display_refresh(
                 manual_refresh,
                 interval_seconds=poll_interval_seconds,
-                refresh_display=lambda: _apply_display(icon, build_states(), companion),
+                refresh_display=lambda: _apply_display(presenter, icon, build_states(), companion),
                 shutdown_requested=shutdown_requested,
             )
 
     icon = pystray.Icon(
         "ClaudeMonitor",
-        icon=tray.loading_icon(),
+        icon=presenter.loading_icon(),
         title="Claude Monitor — loading…",
         menu=pystray.Menu(),
     )

@@ -71,6 +71,16 @@ class _FakeIcon:
         self.stop_calls += 1
 
 
+class _RecordingPresenter:
+    """Stands in for the TrayPresenter: records each tray state it is shown."""
+
+    def __init__(self):
+        self.applied: list[tuple[object, object]] = []
+
+    def apply(self, icon, state) -> None:
+        self.applied.append((icon, state))
+
+
 class _FakeCompanion:
     def __init__(self, visible: bool = True):
         self.updates: list[tuple[list, str]] = []
@@ -83,17 +93,26 @@ class _FakeCompanion:
         self.visible = visible
 
 
-class TestToggleTaskbarVisibility:
-    """Toggling runs inside pystray's message loop, where an escaping exception
-    would surface only as an invisible stderr traceback in a windowed build."""
+class TestTaskbarToggle:
+    """The tray menu and the settings window flip the label through one switch."""
 
-    def test_toggle_flips_visibility_and_persists_the_choice(self, saved_settings):
+    def test_it_reads_the_companion_visibility(self):
+        assert main.taskbar_toggle(_FakeCompanion(visible=True)).is_on() is True
+        assert main.taskbar_toggle(_FakeCompanion(visible=False)).is_on() is False
+
+    def test_writing_it_hides_the_label_and_persists_the_choice(self, saved_settings):
         companion = _FakeCompanion(visible=True)
 
-        main._toggle_taskbar_visibility(companion)
+        main.taskbar_toggle(companion).write(False)
 
         assert companion.visible is False
         assert _saved_values(saved_settings, main.TASKBAR_ENABLED) == [False]
+
+    def test_it_is_unavailable_when_the_label_is_not_healthy(self):
+        companion = _FakeCompanion()
+        companion.healthy = False
+
+        assert main.taskbar_toggle(companion).available() is False
 
 
 def test_startup_state_falls_back_to_unchecked_when_registry_read_fails(caplog):
@@ -134,16 +153,11 @@ class TestApplyDisplay:
     def _run(self, monkeypatch, states):
         icon = _FakeIcon()
         companion = _FakeCompanion()
-        applied: list[object] = []
-        monkeypatch.setattr(
-            main.tray,
-            "apply",
-            lambda target, value: applied.append((target, value)),
-        )
+        presenter = _RecordingPresenter()
 
-        main._apply_display(icon, states, companion)
+        main._apply_display(presenter, icon, states, companion)
 
-        return icon, companion, applied
+        return icon, companion, presenter.applied
 
     def test_one_provider_reaches_the_icon_and_the_label(self, monkeypatch):
         state = _display_state(CLAUDE, "80% (3h 0m)", "usage")
