@@ -41,8 +41,6 @@ from .win32_bindings import (
     DT_VCENTER,
     ERROR_CLASS_ALREADY_EXISTS,
     GDI32_SIGNATURES,
-    GW_CHILD,
-    GW_HWNDNEXT,
     GWL_EXSTYLE,
     GWL_STYLE,
     HWND_TOPMOST,
@@ -70,6 +68,7 @@ from .win32_bindings import (
     TTM_SETTIPBKCOLOR,
     TTM_SETTIPTEXTCOLOR,
     TTM_TRACKACTIVATE,
+    TTF_ABSOLUTE,
     TTM_TRACKPOSITION,
     TTM_UPDATE,
     TTM_UPDATETIPTEXTW,
@@ -276,16 +275,17 @@ class Win32TaskbarWindow:
         # adjacent rectangles actually affect placement.
         rects: list[Rect] = []
 
-        # GetWindow(GW_CHILD) starts at the first direct taskbar child. Repeated
-        # GW_HWNDNEXT calls then walk its siblings without recursion.
-        child = self._user32.GetWindow(taskbar, GW_CHILD)
+        # FindWindowExW walks the direct taskbar children without recursion.
+        # GetWindow(GW_CHILD) is not used: it returns NULL while the Start menu
+        # is open, and the label then moved on top of its neighbour.
+        child = self._user32.FindWindowExW(taskbar, None, None, None)
         while child:
             rect = self._sibling_rect(child, exclude_handle)
             if rect is not None:
                 rects.append(rect)
 
             # Advance to the next sibling; a zero return ends enumeration.
-            child = self._user32.GetWindow(child, GW_HWNDNEXT)
+            child = self._user32.FindWindowExW(taskbar, child, None, None)
         return rects
 
     def _sibling_rect(self, child: int, exclude_handle: int) -> Rect | None:
@@ -544,7 +544,7 @@ class Win32TaskbarWindow:
         buffer = ctypes.create_unicode_buffer(tooltip)
         tool_info = TOOLINFOW()
         tool_info.cbSize = ctypes.sizeof(TOOLINFOW)
-        tool_info.uFlags = TTF_IDISHWND | TTF_TRACK
+        tool_info.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE
         tool_info.hwnd = handle
         tool_info.uId = handle
         tool_info.lpszText = ctypes.cast(buffer, wintypes.LPWSTR)
@@ -1011,15 +1011,10 @@ class Win32TaskbarWindow:
             # Tracking mode is designed for controls that supply their own
             # hover detection. It also works in the transparent gaps where the
             # layered label itself never receives ordinary mouse messages.
-            label_center = label_rect.left + (label_rect.width // 2)
-            position = (
-                ((label_rect.top & 0xFFFF) << 16) | (label_center & 0xFFFF)
-            )
-            self._user32.SendMessageW(
-                tooltip_handle,
-                TTM_TRACKPOSITION,
-                0,
-                position,
+            # The popup's last size gives the track point before it opens.
+            self._position_tooltip_above_label(
+                label_rect=label_rect,
+                tooltip_handle=tooltip_handle,
             )
             tool_info = self._tracking_tool_info(label_handle)
             info_pointer = ctypes.cast(ctypes.byref(tool_info), ctypes.c_void_p).value
@@ -1049,6 +1044,14 @@ class Win32TaskbarWindow:
 
         left = label_rect.left + ((label_rect.width - tooltip_rect.width) // 2)
         top = label_rect.top - tooltip_rect.height - _TOOLTIP_TASKBAR_GAP
+        # The control moves itself to its track point each time its text
+        # changes. A track point anywhere else made the popup flicker there.
+        self._user32.SendMessageW(
+            tooltip_handle,
+            TTM_TRACKPOSITION,
+            0,
+            ((top & 0xFFFF) << 16) | (left & 0xFFFF),
+        )
         self._user32.SetWindowPos(
             tooltip_handle,
             HWND_TOPMOST,
@@ -1079,7 +1082,7 @@ class Win32TaskbarWindow:
         """Build the matching TOOLINFO identifier used by tracking messages."""
         tool_info = TOOLINFOW()
         tool_info.cbSize = ctypes.sizeof(TOOLINFOW)
-        tool_info.uFlags = TTF_IDISHWND | TTF_TRACK
+        tool_info.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE
         tool_info.hwnd = label_handle
         tool_info.uId = label_handle
         return tool_info

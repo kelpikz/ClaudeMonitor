@@ -208,6 +208,7 @@ TTS_ALWAYSTIP = 0x0001
 TTS_NOPREFIX = 0x0002
 TTF_IDISHWND = 0x0001
 TTF_TRACK = 0x0020
+TTF_ABSOLUTE = 0x0080  # Put the popup's top-left corner on the track point.
 WM_USER = 0x0400
 # The first message number an application may give a meaning of its own.
 WM_APP = 0x8000

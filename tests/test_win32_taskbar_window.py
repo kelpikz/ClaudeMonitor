@@ -94,6 +94,9 @@ class _FakeUser32(_FakeDll):
         # a window that vanished between enumeration and measurement.
         self.windows: dict[int, tuple[Rect, bool]] = {}
         self.child_chain: list[int] = []
+        # While the Start menu is open, GetWindow(GW_CHILD) on the taskbar
+        # returns NULL, but FindWindowExW still lists every child.
+        self.start_menu_open = False
         self.queued_messages: list[int] = []
         # The taskbar the label is painted into: 200px wide, 48px tall, which
         # is the Windows 11 default at 100% scaling.
@@ -156,8 +159,22 @@ class _FakeUser32(_FakeDll):
         known = self.windows.get(handle)
         return 1 if known and known[1] else 0
 
+    def FindWindowExW(self, parent, child_after, class_name, window_name):
+        self.calls.append(("FindWindowExW", parent, child_after, class_name, window_name))
+        if class_name is not None:
+            return self.results.get("FindWindowExW", 1)
+        if not child_after:
+            return self.child_chain[0] if self.child_chain else 0
+        if child_after in self.child_chain:
+            position = self.child_chain.index(child_after) + 1
+            if position < len(self.child_chain):
+                return self.child_chain[position]
+        return 0
+
     def GetWindow(self, handle, relationship):
         self.calls.append(("GetWindow", handle, relationship))
+        if self.start_menu_open:
+            return 0
         if relationship == win32_bindings.GW_CHILD:
             return self.child_chain[0] if self.child_chain else 0
         if handle in self.child_chain:
@@ -207,6 +224,16 @@ def _client_area(user32: _FakeUser32) -> wintypes.RECT:
     """Return what GetClientRect would fill in, as the paint code receives it."""
     rect = user32.client_rect
     return wintypes.RECT(rect.left, rect.top, rect.right, rect.bottom)
+
+
+def _last_track_point(user32: _FakeUser32, tooltip_handle: int) -> tuple[int, int]:
+    """Unpack the last screen point sent to a tooltip with TTM_TRACKPOSITION."""
+    position = [
+        call[4]
+        for call in user32.named("SendMessageW")
+        if call[1:3] == (tooltip_handle, TTM_TRACKPOSITION)
+    ][-1]
+    return ctypes.c_short(position & 0xFFFF).value, ctypes.c_short(position >> 16).value
 
 
 def _window(
@@ -325,6 +352,21 @@ class TestGeometry:
 
         assert rects == [Rect(100, 0, 200, 40), Rect(300, 0, 400, 40)]
 
+    def test_siblings_are_found_while_the_start_menu_is_open(self):
+        # GetWindow(GW_CHILD) returns NULL while Start is open. Without the
+        # siblings, the label moved on top of the window next to the clock.
+        user32 = _FakeUser32()
+        user32.start_menu_open = True
+        user32.child_chain = [41, 42]
+        user32.windows = {
+            41: (Rect(100, 0, 200, 40), True),
+            42: (Rect(300, 0, 400, 40), True),
+        }
+
+        rects = _window(user32=user32).list_sibling_rects(taskbar=10, exclude_handle=30)
+
+        assert rects == [Rect(100, 0, 200, 40), Rect(300, 0, 400, 40)]
+
     def test_hidden_and_empty_siblings_are_ignored(self):
         user32 = _FakeUser32()
         user32.child_chain = [41, 42, 43]
@@ -430,6 +472,7 @@ class TestTooltip:
         )
         tooltip_position = user32.named("SetWindowPos")[-1]
         assert tooltip_position[1:7] == (41, -1, 110, 126, 0, 0)
+        assert _last_track_point(user32, 41) == (110, 126)
         assert tooltip_position[7] & win32_bindings.SWP_NOSIZE
         assert tooltip_position[7] & win32_bindings.SWP_NOACTIVATE
         assert 30 in native._active_tooltip_labels
@@ -570,6 +613,28 @@ class TestTooltip:
             call[2] == TTM_TRACKACTIVATE
             for call in user32.named("SendMessageW")
         )
+
+    def test_text_update_keeps_the_track_point_above_the_label(self):
+        # A text change makes the tooltip move itself to its track point. If
+        # that point is not the spot above the label, the popup jumps there for
+        # one frame before it is moved back, which shows as a flicker.
+        user32 = _FakeUser32()
+        user32.results["CreateWindowExW"] = 41
+        user32.windows[30] = (Rect(100, 200, 300, 240), True)
+        user32.windows[41] = (Rect(0, 0, 180, 70), True)
+        native = _window(user32=user32)
+        native.set_tooltip(30, "Updated (1 second ago)")
+        native._active_tooltip_labels.add(30)
+
+        native.set_tooltip(30, "Updated (2 seconds ago)")
+
+        assert _last_track_point(user32, 41) == (110, 126)
+
+    def test_track_point_is_the_tooltip_top_left_corner(self):
+        # Without TTF_ABSOLUTE, Windows offsets the popup from the track point.
+        tool_info = _window()._tracking_tool_info(30)
+
+        assert tool_info.uFlags & win32_bindings.TTF_ABSOLUTE
 
     def test_closing_the_label_also_destroys_its_tooltip_control(self):
         user32 = _FakeUser32()
